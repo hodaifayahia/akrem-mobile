@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Customer, Installment, Payment, Sale, Setting, User
-from app.services import auth, products as product_service
+from app.services import auth, customers as customer_service, products as product_service
 from app.services import calc, repositories, schedule
 
 _SALE_FIELDS = {
@@ -74,6 +74,46 @@ def create_sale_for_user(
     else:
         raise auth.AuthorizationError("Unsupported account role")
     return create_sale(session, **sale_values)
+
+
+def create_customer_with_sale(
+    session: Session,
+    user_id: int,
+    *,
+    customer: Mapping[str, Any],
+    sale: Mapping[str, Any],
+    allow_duplicate_phone: bool = False,
+) -> tuple[Customer, Sale]:
+    """Create a new customer and their first sale together, or neither.
+
+    ``customer`` holds ``customers.create_customer`` keyword arguments and
+    ``sale`` holds ``create_sale`` keyword arguments without ``customer_id``.
+    Sellers get catalog prices exactly as in ``create_sale_for_user``. Any
+    failure, including ``DuplicateCustomerPhoneError``, rolls back the customer.
+    """
+    _require_sale_operator(session, user_id)
+    customer_values = dict(customer)
+    sale_values = dict(sale)
+    if "customer_id" in sale_values:
+        raise ValueError("Sale values cannot include a customer_id")
+    if "allow_duplicate_phone" in customer_values:
+        raise ValueError("Pass allow_duplicate_phone as its own argument")
+    with session.begin_nested():
+        new_customer = customer_service.create_customer(
+            session, allow_duplicate_phone=allow_duplicate_phone, **customer_values
+        )
+        new_sale = create_sale_for_user(
+            session, user_id, customer_id=new_customer.id, **sale_values
+        )
+    return new_customer, new_sale
+
+
+def _require_sale_operator(session: Session, user_id: int) -> User:
+    """Return an active owner or seller allowed to record sales."""
+    user = session.get(User, user_id)
+    if user is None or user.disabled or user.role not in ("owner", "seller"):
+        raise auth.AuthorizationError("An active account is required")
+    return user
 
 
 def update_sale_for_user(

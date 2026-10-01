@@ -164,10 +164,12 @@ class AppTopBar(QFrame):
     # ------------------------------------------------------------ navigation
     def set_active_page(self, page_index: int) -> None:
         """Show the title and description of the visible page."""
+        from app.ui.widgets.sidebar import PAGE_COUNT, page_subtitle, page_title
+
         self._active_page_idx = page_index
-        if 0 <= page_index < len(ar.SIDEBAR_ITEMS):
-            self.page_title_label.setText(ar.SIDEBAR_ITEMS[page_index])
-            self.page_sub_label.setText(ar.PAGE_SUBTITLES[page_index])
+        if 0 <= page_index < PAGE_COUNT:
+            self.page_title_label.setText(page_title(page_index))
+            self.page_sub_label.setText(page_subtitle(page_index))
 
     def refresh_translations(self) -> None:
         """Refresh every label and icon after a language change."""

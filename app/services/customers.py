@@ -12,9 +12,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from app.db.models import Category, Customer, Installment, Sale, Setting
+from app.db.models import Category, Customer, Installment, Payment, Sale, Setting
 from app.services import repositories
-from app.services.status import Status, for_customer
+from app.services.settings import get_grace_days
+from app.services.status import Status, for_customer, for_month
 
 _MOBILE_RE = re.compile(r"^0[567][0-9]{8}$")
 PAYMENT_KINDS = ("cash", "installment", "credit")
@@ -73,10 +74,7 @@ class CustomerSummary:
     def payment_profile(self) -> str:
         """``"cash"`` when every purchase was paid in full, ``"facilities"`` when any
         purchase is paid over time (installment or credit), ``"none"`` without sales."""
-        kinds = self.sale_types
-        if not kinds:
-            return "none"
-        return "cash" if kinds == ("cash",) else "facilities"
+        return _payment_profile(self.sale_types)
 
     @property
     def credit_score(self) -> int:
@@ -102,6 +100,207 @@ class CustomerSummary:
         elif score >= 50:
             return "⭐⭐⭐ متوسط"
         return "⚠️ عالي المخاطر"
+
+
+def _payment_profile(sale_types: tuple[str, ...] | set[str]) -> str:
+    """Classify sale types as ``"none"``, all-``"cash"``, or ``"facilities"``."""
+    kinds = set(sale_types)
+    if not kinds:
+        return "none"
+    return "cash" if kinds == {"cash"} else "facilities"
+
+
+@dataclass(frozen=True, slots=True)
+class PurchaseRecord:
+    """One sale in a customer's purchase history, with paid and remaining amounts."""
+
+    sale_id: int
+    purchase_date: date
+    product: str
+    sale_type: str
+    cash_price: int
+    wholesale_price: int
+    rate: int
+    total: int
+    down_payment: int
+    months: int | None
+    monthly_amount: int | None
+    end_date: date | None
+    expected_pay_date: date | None
+    paid: int
+    remaining: int
+    profit: int
+    status: Status
+    overdue_installments: int
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentRecord:
+    """One received payment (installment or credit) in a customer's history."""
+
+    payment_id: int
+    payment_date: date
+    amount: int
+    method: str
+    sale_id: int
+    product: str
+    sale_type: str
+    installment_index: int | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerHistory:
+    """All purchases and payments of one customer, newest first, with totals."""
+
+    customer_id: int
+    full_name: str
+    purchases: tuple[PurchaseRecord, ...]
+    payments: tuple[PaymentRecord, ...]
+    purchase_count: int
+    total_bought: int
+    total_paid: int
+    remaining: int
+    cash_purchases: int
+    installment_purchases: int
+    credit_purchases: int
+    first_purchase: date | None
+    last_purchase: date | None
+    last_payment: date | None
+    overdue_installments: int
+
+    @property
+    def payment_profile(self) -> str:
+        """``"cash"``, ``"facilities"``, or ``"none"``, as for ``CustomerSummary``."""
+        return _payment_profile({purchase.sale_type for purchase in self.purchases})
+
+
+def customer_history(session: Session, customer_id: int, *, today: date) -> CustomerHistory:
+    """Build a customer's purchase and payment history in three eager queries.
+
+    Paid amounts follow the ledger rules: cash sales are fully paid; installment
+    sales count the down payment plus each installment's ``max(amount_paid,
+    sum(payments))``; credit sales count the down payment plus credit payments.
+    Each purchase status is evaluated for ``today``'s month with the configured
+    grace days.
+    """
+    customer = session.scalar(
+        select(Customer)
+        .where(Customer.id == customer_id)
+        .options(
+            selectinload(Customer.sales).selectinload(Sale.installments).selectinload(
+                Installment.payments
+            ),
+            selectinload(Customer.sales).selectinload(Sale.credit_payments),
+        )
+        # Refresh collections already loaded in this session so new sales/payments show.
+        .execution_options(populate_existing=True)
+    )
+    if customer is None:
+        raise ValueError("Customer not found")
+    grace_days = get_grace_days(session)
+    ordered_sales = sorted(
+        customer.sales, key=lambda sale: (sale.purchase_date, sale.id), reverse=True
+    )
+    purchases = tuple(_purchase_record(sale, today, grace_days) for sale in ordered_sales)
+    payments = tuple(sorted(
+        (record for sale in ordered_sales for record in _payment_records(sale)),
+        key=lambda record: (record.payment_date, record.payment_id),
+        reverse=True,
+    ))
+    purchase_dates = [purchase.purchase_date for purchase in purchases]
+    return CustomerHistory(
+        customer_id=customer.id,
+        full_name=customer.full_name,
+        purchases=purchases,
+        payments=payments,
+        purchase_count=len(purchases),
+        total_bought=sum(purchase.total for purchase in purchases),
+        total_paid=sum(purchase.paid for purchase in purchases),
+        remaining=sum(purchase.remaining for purchase in purchases),
+        cash_purchases=sum(1 for purchase in purchases if purchase.sale_type == "cash"),
+        installment_purchases=sum(
+            1 for purchase in purchases if purchase.sale_type == "installment"
+        ),
+        credit_purchases=sum(1 for purchase in purchases if purchase.sale_type == "credit"),
+        first_purchase=min(purchase_dates, default=None),
+        last_purchase=max(purchase_dates, default=None),
+        last_payment=payments[0].payment_date if payments else None,
+        overdue_installments=sum(purchase.overdue_installments for purchase in purchases),
+    )
+
+
+def _installment_paid(installment: Installment) -> int:
+    """Return an installment's paid amount using the ledger's max rule."""
+    return max(installment.amount_paid, sum(payment.amount for payment in installment.payments))
+
+
+def _sale_paid(sale: Sale) -> int:
+    """Return everything received for a sale, including any down payment."""
+    if sale.sale_type == "cash":
+        return sale.total
+    if sale.sale_type == "credit":
+        return sale.down_payment + sum(payment.amount for payment in sale.credit_payments)
+    return sale.down_payment + sum(_installment_paid(row) for row in sale.installments)
+
+
+def _overdue_count(sale: Sale, today: date, grace_days: int) -> int:
+    """Count unpaid installments whose due date plus grace days has passed."""
+    cutoff = today - timedelta(days=grace_days)
+    return sum(
+        1
+        for row in sale.installments
+        if row.due_date < cutoff and _installment_paid(row) < row.amount_due
+    )
+
+
+def _purchase_record(sale: Sale, today: date, grace_days: int) -> PurchaseRecord:
+    """Summarize one eagerly loaded sale for the history view."""
+    paid = _sale_paid(sale)
+    return PurchaseRecord(
+        sale_id=sale.id,
+        purchase_date=sale.purchase_date,
+        product=sale.product,
+        sale_type=sale.sale_type,
+        cash_price=sale.cash_price,
+        wholesale_price=sale.wholesale_price,
+        rate=sale.rate,
+        total=sale.total,
+        down_payment=sale.down_payment,
+        months=sale.months,
+        monthly_amount=sale.monthly_amount,
+        end_date=sale.end_date,
+        expected_pay_date=sale.expected_pay_date,
+        paid=paid,
+        remaining=max(0, sale.total - paid),
+        profit=sale.profit,
+        status=for_month(sale.installments, today.year, today.month, today, grace_days),
+        overdue_installments=_overdue_count(sale, today, grace_days),
+    )
+
+
+def _payment_records(sale: Sale) -> list[PaymentRecord]:
+    """List a sale's installment and credit payments as history rows."""
+    rows: list[tuple[Payment, int | None]] = [
+        (payment, installment.installment_index)
+        for installment in sale.installments
+        for payment in installment.payments
+    ]
+    rows.extend((payment, None) for payment in sale.credit_payments)
+    return [
+        PaymentRecord(
+            payment_id=payment.id,
+            payment_date=payment.payment_date,
+            amount=payment.amount,
+            method=payment.method,
+            sale_id=sale.id,
+            product=sale.product,
+            sale_type=sale.sale_type,
+            installment_index=index,
+            note=payment.note,
+        )
+        for payment, index in rows
+    ]
 
 
 def normalize_search_text(value: str | None) -> str:

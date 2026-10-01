@@ -26,11 +26,28 @@ from app.i18n import ar
 from app.ui import icons
 from app.ui.theme import qcolor, repolish
 
-#: Navigation entries: (page index, icon name). Page titles come from ar.SIDEBAR_ITEMS.
-NAV_ICONS = ("dashboard", "users", "cart", "wallet", "import", "reports", "settings")
+#: Icon per page index. Indexes 0-6 are the original pages; 7 and 8 were added
+#: later, so their position in the sidebar differs from their index.
+NAV_ICONS = ("dashboard", "users", "cart", "wallet", "import", "reports", "settings", "tag", "users")
+PAGE_COUNT = len(NAV_ICONS)
 MAIN_PAGES = (0, 1, 2, 3)
+CATALOG_PAGES = (7, 8)
 MANAGE_PAGES = (4, 5, 6)
-OWNER_ONLY_PAGES = frozenset({4, 6})
+OWNER_ONLY_PAGES = frozenset({4, 6, 8})
+
+
+def page_title(index: int) -> str:
+    """Return a page's title in the active language."""
+    if index < len(ar.SIDEBAR_ITEMS):
+        return ar.SIDEBAR_ITEMS[index]
+    return (ar.NAV_PRODUCTS, ar.NAV_CLIENT_TYPES)[index - len(ar.SIDEBAR_ITEMS)]
+
+
+def page_subtitle(index: int) -> str:
+    """Return a page's one-line description in the active language."""
+    if index < len(ar.PAGE_SUBTITLES):
+        return ar.PAGE_SUBTITLES[index]
+    return (ar.PAGE_SUBTITLE_PRODUCTS, ar.PAGE_SUBTITLE_CLIENT_TYPES)[index - len(ar.PAGE_SUBTITLES)]
 
 EXPANDED_WIDTH = 248
 COLLAPSED_WIDTH = 72
@@ -146,7 +163,7 @@ class Sidebar(QFrame):
         super().__init__(parent)
         self.current_user = current_user
         self.setObjectName("sidebar")
-        self.buttons: list[NavButton] = []
+        self.buttons: list[NavButton] = [None] * PAGE_COUNT  # type: ignore[list-item]
         self.password_button: NavButton | None = None
         self.lock_button: NavButton | None = None
         self._section_labels: list[tuple[QLabel, str]] = []
@@ -162,12 +179,16 @@ class Sidebar(QFrame):
         layout.addWidget(self._build_brand())
         layout.addSpacing(10)
 
-        self._add_section(layout, "NAV_SECTION_MAIN")
-        for index in MAIN_PAGES:
-            layout.addWidget(self._make_nav(index))
-        self._add_section(layout, "NAV_SECTION_MANAGE")
-        for index in MANAGE_PAGES:
-            layout.addWidget(self._make_nav(index))
+        for section, pages in (
+            ("NAV_SECTION_MAIN", MAIN_PAGES),
+            ("NAV_SECTION_CATALOG", CATALOG_PAGES),
+            ("NAV_SECTION_MANAGE", MANAGE_PAGES),
+        ):
+            label = self._add_section(layout, section)
+            if all(self._is_restricted(index) for index in pages):
+                label.hide()
+            for index in pages:
+                layout.addWidget(self._make_nav(index))
 
         if self.current_user is not None and self.current_user.role != "owner":
             self.password_button = NavButton("lock", ar.SET_CHANGE_PASSWORD, self)
@@ -209,19 +230,19 @@ class Sidebar(QFrame):
         row.addWidget(self.brand_text, 1)
         return brand
 
-    def _add_section(self, layout: QVBoxLayout, key: str) -> None:
+    def _add_section(self, layout: QVBoxLayout, key: str) -> QLabel:
         label = QLabel(getattr(ar, key), self)
         label.setObjectName("sidebarSection")
         self._section_labels.append((label, key))
         layout.addWidget(label)
+        return label
 
     def _make_nav(self, index: int) -> NavButton:
-        button = NavButton(NAV_ICONS[index], ar.SIDEBAR_ITEMS[index], self)
+        button = NavButton(NAV_ICONS[index], page_title(index), self)
         button.clicked.connect(lambda _checked=False, i=index: self.page_requested.emit(i))
         if self._is_restricted(index):
             button.setVisible(False)
-        # Sections list pages in index order, so buttons[i] is page i.
-        self.buttons.append(button)
+        self.buttons[index] = button
         return button
 
     def _build_user_card(self) -> QFrame:
@@ -293,8 +314,10 @@ class Sidebar(QFrame):
         self._collapsed = collapsed
         self.setFixedWidth(COLLAPSED_WIDTH if collapsed else EXPANDED_WIDTH)
         self.brand_text.setVisible(not collapsed)
-        for label, _key in self._section_labels:
-            label.setVisible(not collapsed)
+        for label, key in self._section_labels:
+            pages = {"NAV_SECTION_MAIN": MAIN_PAGES, "NAV_SECTION_CATALOG": CATALOG_PAGES,
+                     "NAV_SECTION_MANAGE": MANAGE_PAGES}[key]
+            label.setVisible(not collapsed and not all(self._is_restricted(i) for i in pages))
         for button in self._all_buttons():
             button.set_collapsed(collapsed)
         if hasattr(self, "identity"):
@@ -309,7 +332,7 @@ class Sidebar(QFrame):
         for label, key in self._section_labels:
             label.setText(getattr(ar, key))
         for index, button in enumerate(self.buttons):
-            button.set_title(ar.SIDEBAR_ITEMS[index])
+            button.set_title(page_title(index))
         if self.password_button is not None:
             self.password_button.set_title(ar.SET_CHANGE_PASSWORD)
         if self.lock_button is not None:

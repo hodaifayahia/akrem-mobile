@@ -11,8 +11,16 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSequentialAnimationGroup, QSize, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QPixmap
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QRegularExpression,
+    QSequentialAnimationGroup,
+    QSize,
+    Qt,
+)
+from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent, QPixmap, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -31,6 +39,7 @@ from app.config import RESOURCE_DIR
 from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import SUPPORTED_LANGUAGES, ar, get_language
+from app.services import auth as auth_service
 from app.services.auth import authenticate, create_first_owner
 from app.ui import icons
 from app.ui.events import events
@@ -47,6 +56,25 @@ def caps_lock_on() -> bool | None:
         return bool(ctypes.windll.user32.GetKeyState(0x14) & 1)
     except (AttributeError, OSError):
         return None
+
+
+def code_input(parent: QWidget) -> QLineEdit:
+    """A large, centred, digits-only field for a 6-digit authenticator code."""
+    field = QLineEdit(parent)
+    field.setObjectName("codeInput")
+    field.setMaxLength(7)
+    field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    field.setPlaceholderText("123 456")
+    field.setValidator(
+        QRegularExpressionValidator(QRegularExpression("[0-9\u0660-\u0669\u06F0-\u06F9 ]{0,7}"), field)
+    )
+    field.setInputMethodHints(Qt.InputMethodHint.ImhDigitsOnly)
+    return field
+
+
+def normalized_code(text: str) -> str:
+    """Western digits only: Arabic-Indic digits typed on an Arabic keyboard are converted."""
+    return "".join(str(int(char)) for char in text if char.isdecimal())
 
 
 class PasswordField(QLineEdit):
@@ -363,6 +391,12 @@ class LoginDialog(_AuthShell):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.user: User | None = None
+        self._pending_user: User | None = None
+        card_layout = self.form
+        self.password_page = QWidget(self.card)
+        self.form = QVBoxLayout(self.password_page)
+        self.form.setContentsMargins(0, 0, 0, 0)
+        self.form.setSpacing(6)
         self.title_label, self.subtitle_label = self._title()
         self.username = QLineEdit(self.card)
         self.username.setObjectName("authInput")
@@ -384,8 +418,45 @@ class LoginDialog(_AuthShell):
         self.username.textEdited.connect(self.error.clear)
         self.password.textEdited.connect(self.error.clear)
         self.form.addWidget(self.login_button)
+        card_layout.addWidget(self.password_page)
+        card_layout.addWidget(self._build_code_page())
         self.retranslate()
         self.username.setFocus()
+
+    def _build_code_page(self) -> QWidget:
+        """Second step for accounts protected by Google Authenticator."""
+        self.code_page = QWidget(self.card)
+        layout = QVBoxLayout(self.code_page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        shield = QLabel(self.code_page)
+        shield.setPixmap(icons.pixmap("lock", "primary-glow", 34, stroke=1.6))
+        layout.addWidget(shield, 0, Qt.AlignmentFlag.AlignLeading)
+        self.code_title = QLabel(self.code_page)
+        self.code_title.setObjectName("authTitle")
+        self.code_prompt = QLabel(self.code_page)
+        self.code_prompt.setObjectName("authSubtitle")
+        self.code_prompt.setWordWrap(True)
+        layout.addWidget(self.code_title)
+        layout.addWidget(self.code_prompt)
+        layout.addSpacing(10)
+        self.code = code_input(self.code_page)
+        self.code.textEdited.connect(self._code_edited)
+        self.code.returnPressed.connect(self._verify_code)
+        layout.addWidget(self.code)
+        self.code_error = InlineError(self.code_page)
+        layout.addWidget(self.code_error)
+        layout.addSpacing(6)
+        self.verify_button = self._submit_button()
+        self.verify_button.clicked.connect(self._verify_code)
+        layout.addWidget(self.verify_button)
+        self.back_button = QPushButton(self.code_page)
+        self.back_button.setProperty("variant", "ghost")
+        self.back_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_button.clicked.connect(self._back_to_password)
+        layout.addWidget(self.back_button)
+        self.code_page.hide()
+        return self.code_page
 
     def retranslate(self) -> None:
         super().retranslate()
@@ -403,6 +474,12 @@ class LoginDialog(_AuthShell):
         self.login_button.setLayoutDirection(
             Qt.LayoutDirection.LeftToRight if self.isRightToLeft() else Qt.LayoutDirection.RightToLeft
         )
+        if hasattr(self, "code_page"):
+            self.code_title.setText(ar.TFA_LOGIN_TITLE)
+            name = self._pending_user.username if self._pending_user is not None else ""
+            self.code_prompt.setText(ar.TFA_LOGIN_PROMPT.format(username=name))
+            self.verify_button.setText(ar.TFA_VERIFY)
+            self.back_button.setText(ar.TFA_BACK)
 
     def _login(self) -> None:
         """Check credentials; lockout counters are committed either way."""
@@ -424,6 +501,9 @@ class LoginDialog(_AuthShell):
             return
         self._set_busy(self.login_button, False, ar.LOGIN_BUTTON)
         status = getattr(result.status, "value", result.status)
+        if status == "success" and result.user is not None and auth_service.requires_second_factor(result.user):
+            self._show_code_page(result.user)
+            return
         if status == "success":
             self.user = result.user
             self.accept()
@@ -438,6 +518,56 @@ class LoginDialog(_AuthShell):
         self._shake()
         self.password.clear()
         self.password.setFocus()
+
+
+    def _show_code_page(self, user: User) -> None:
+        self._pending_user = user
+        self.password_page.hide()
+        self.code_page.show()
+        self.code.clear()
+        self.code_error.clear()
+        self.retranslate()
+        self.code.setFocus()
+
+    def _back_to_password(self) -> None:
+        self._pending_user = None
+        self.code_page.hide()
+        self.password_page.show()
+        self.password.clear()
+        self.password.setFocus()
+
+    def _code_edited(self, text: str) -> None:
+        self.code_error.clear()
+        if len(normalized_code(text)) == 6:
+            self._verify_code()
+
+    def _verify_code(self) -> None:
+        """Check the authenticator code; wrong codes count toward the lockout."""
+        if self._pending_user is None:
+            return
+        self._set_busy(self.verify_button, True, ar.TFA_VERIFY)
+        try:
+            with session_scope() as session:
+                result = auth_service.verify_second_factor(
+                    session, self._pending_user.id, normalized_code(self.code.text())
+                )
+        except SQLAlchemyError:
+            self._set_busy(self.verify_button, False, ar.TFA_VERIFY)
+            self.code_error.show_message(ar.ERROR_BODY)
+            return
+        self._set_busy(self.verify_button, False, ar.TFA_VERIFY)
+        status = getattr(result.status, "value", result.status)
+        if status == "success":
+            self.user = result.user
+            self.accept()
+            return
+        if status in ("locked", "disabled"):
+            self._back_to_password()
+            self.error.show_message(ar.LOGIN_LOCKED if status == "locked" else ar.LOGIN_DISABLED)
+            return
+        self.code_error.show_message(ar.TFA_INVALID_CODE)
+        self._shake()
+        self.code.selectAll()
 
 
 class ReauthenticationDialog(QDialog):

@@ -11,12 +11,13 @@ from pathlib import Path
 
 from sqlalchemy.engine import make_url
 
-from app.config import data_dir, database_url
+from app.config import data_dir, database_url, read_local_setting, write_local_setting
 from app.db.models import Base
 
 _BACKUP_PREFIX = "akremmobile_"
 _BACKUP_SUFFIX = ".sqlite3"
 _DEFAULT_RETENTION = 30
+BACKUP_DIRECTORY_SETTING = "backup_directory"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,9 +30,69 @@ class BackupInfo:
     backup_type: str = "manual"
 
 
-def backup_directory() -> Path:
-    """Return the application backup directory under its configured data folder."""
+class BackupLocationError(ValueError):
+    """Raised when a chosen backup folder cannot be used.
+
+    ``code`` is ``"not_directory"`` (the path exists but is not a folder, or a
+    folder could not be created there) or ``"not_writable"``.
+    """
+
+    def __init__(self, code: str, path: Path, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+
+
+def default_backup_directory() -> Path:
+    """Return the default backup folder inside the per-user data folder."""
     return data_dir() / "backups"
+
+
+def backup_directory() -> Path:
+    """Return this PC's configured backup folder, or the default one."""
+    configured = read_local_setting(BACKUP_DIRECTORY_SETTING)
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured).expanduser()
+    return default_backup_directory()
+
+
+def set_backup_directory(path: str | Path | None) -> Path:
+    """Validate, create, and remember a backup folder for this PC; ``None`` resets it.
+
+    Raises ``BackupLocationError`` when the folder cannot be created, is not a
+    directory, or does not accept new files. Returns the effective folder.
+    """
+    if path is None or (isinstance(path, str) and not path.strip()):
+        write_local_setting(BACKUP_DIRECTORY_SETTING, None)
+        return default_backup_directory()
+    folder = Path(path).expanduser().resolve()
+    _ensure_usable_directory(folder)
+    write_local_setting(BACKUP_DIRECTORY_SETTING, str(folder))
+    return folder
+
+
+def _ensure_usable_directory(folder: Path) -> None:
+    """Create ``folder`` if needed and prove a file can be written and removed there."""
+    if folder.exists() and not folder.is_dir():
+        raise BackupLocationError("not_directory", folder, f"Not a folder: {folder}")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as error:
+        raise BackupLocationError("not_directory", folder, f"Not a folder: {folder}") from error
+    except OSError as error:
+        if not folder.is_dir():
+            raise BackupLocationError(
+                "not_directory", folder, f"Cannot create folder: {folder}"
+            ) from error
+    if not folder.is_dir():
+        raise BackupLocationError("not_directory", folder, f"Not a folder: {folder}")
+    try:
+        probe = _make_temporary_path(folder, "write_probe")
+        probe.unlink()
+    except OSError as error:
+        raise BackupLocationError(
+            "not_writable", folder, f"Cannot write to folder: {folder}"
+        ) from error
 
 
 def _detect_backup_type(path: Path) -> str:
@@ -259,6 +320,11 @@ def validate_backup(path: str | Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        older_revision = _older_known_revision(connection, existing_tables)
+        if older_revision is not None:
+            # A backup from an earlier version of this app: its schema is
+            # older, and the migrations run at the next start upgrade it.
+            return
         required_tables = set(Base.metadata.tables)
         missing_tables = sorted(required_tables - existing_tables)
         if missing_tables:
@@ -288,6 +354,26 @@ def validate_backup(path: str | Path) -> None:
     finally:
         if connection is not None:
             connection.close()
+
+
+def _older_known_revision(connection: sqlite3.Connection, tables: set[str]) -> str | None:
+    """Return the backup's migration revision when it is an older revision of this app.
+
+    Returns ``None`` for current-schema backups, backups without migration
+    history, and revisions this app doesn't know (e.g. from a newer version).
+    """
+    if "alembic_version" not in tables:
+        return None
+    row = connection.execute("SELECT version_num FROM alembic_version LIMIT 1").fetchone()
+    if row is None:
+        return None
+    from app.db.migrate import known_revisions
+
+    revisions = known_revisions()
+    revision = str(row[0])
+    if revision in revisions[:-1]:
+        return revision
+    return None
 
 
 def restore_backup(path: str | Path) -> Path:

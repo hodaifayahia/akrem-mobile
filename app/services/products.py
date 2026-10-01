@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import date
+
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import Product, User
+from app.db.models import Product, Sale
 from app.services import auth
 
 
@@ -114,3 +116,15 @@ def _validate_amount(label: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{label.capitalize()} must be a non-negative whole number")
     return value
+
+
+def sales_by_product(session: Session) -> dict[str, tuple[int, date | None]]:
+    """Return ``{product name: (units sold, last sale date)}`` from recorded sales.
+
+    Sales keep a copy of the product name, so renamed catalog entries only
+    count sales made under their current name.
+    """
+    rows = session.execute(
+        select(Sale.product, func.count(Sale.id), func.max(Sale.purchase_date)).group_by(Sale.product)
+    )
+    return {name: (int(count), last_date) for name, count, last_date in rows}

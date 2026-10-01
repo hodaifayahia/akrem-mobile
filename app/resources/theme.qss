@@ -184,7 +184,7 @@ QPushButton:pressed {
     background-color: @primary-pressed;
 }
 
-QPushButton:disabled {
+QPushButton:disabled, QPushButton[variant]:disabled {
     color: @text-disabled;
     background-color: @surface;
     border-color: @border;
@@ -388,6 +388,18 @@ QDateEdit::up-button, QDateEdit::down-button {
     width: 20px;
     background-color: @surface-2;
     border: none;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateEdit::up-arrow {
+    image: url("@resources/icons/chevron-up.png");
+    width: 10px;
+    height: 10px;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url("@resources/icons/spin-down.png");
+    width: 10px;
+    height: 10px;
 }
 
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
@@ -834,6 +846,13 @@ QFrame#authError {
 }
 
 QLabel#authErrorText { color: #FCA5A5; font-size: 12px; font-weight: 600; }
+QLineEdit#codeInput {
+    font-family: "Rajdhani", "Cairo", sans-serif;
+    font-size: 26px;
+    font-weight: 700;
+    padding: 10px 12px;
+}
+
 QLabel#capsLockHint { color: @pending; font-size: 11px; }
 
 QPushButton#authSubmit {

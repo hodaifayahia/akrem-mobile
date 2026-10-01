@@ -35,15 +35,17 @@ from app.ui.dialogs.customer_details_dialog import CustomerDetailsDialog
 from app.ui.dialogs.shortcuts_dialog import ShortcutsDialog
 from app.ui.events import events
 from app.ui.notifications import hub
+from app.ui.pages.client_types_page import ClientTypesPage
 from app.ui.pages.customers_page import CustomersPage
 from app.ui.pages.dashboard_page import DashboardPage
 from app.ui.pages.import_page import ImportPage
 from app.ui.pages.new_sale_page import NewSalePage
 from app.ui.pages.payments_page import PaymentsPage
+from app.ui.pages.products_page import ProductsPage
 from app.ui.pages.reports_page import ReportsPage
 from app.ui.pages.settings_page import SettingsPage
 from app.ui.tray import TrayController, app_icon
-from app.ui.widgets.sidebar import Sidebar
+from app.ui.widgets.sidebar import Sidebar, page_title
 from app.ui.widgets.toast import ToastManager
 from app.ui.widgets.topbar import AppTopBar
 
@@ -51,7 +53,9 @@ _LOG = logging.getLogger(__name__)
 
 PAGE_DASHBOARD, PAGE_CUSTOMERS, PAGE_NEW_SALE, PAGE_PAYMENTS = 0, 1, 2, 3
 PAGE_IMPORT, PAGE_REPORTS, PAGE_SETTINGS = 4, 5, 6
-PAGE_COUNT = 7
+PAGE_PRODUCTS, PAGE_CLIENT_TYPES = 7, 8
+PAGE_COUNT = 9
+OWNER_ONLY_PAGES = frozenset({PAGE_IMPORT, PAGE_CLIENT_TYPES})
 SIDEBAR_SETTING = "window/sidebar_collapsed"
 
 
@@ -70,6 +74,8 @@ class MainWindow(QMainWindow):
         self.import_page: ImportPage | None = None
         self.reports_page: ReportsPage | None = None
         self.settings_page: SettingsPage | None = None
+        self.products_page: ProductsPage | None = None
+        self.client_types_page: ClientTypesPage | None = None
         self._reauth_dialog: ReauthenticationDialog | None = None
         self._quitting = False
         self._lock_pending = False
@@ -137,10 +143,11 @@ class MainWindow(QMainWindow):
 
     _PAGE_CLASSES = (
         DashboardPage, CustomersPage, NewSalePage, PaymentsPage, ImportPage, ReportsPage, SettingsPage,
+        ProductsPage, ClientTypesPage,
     )
     _PAGE_ATTRIBUTES = (
         "dashboard_page", "customers_page", "new_sale_page", "payments_page",
-        "import_page", "reports_page", "settings_page",
+        "import_page", "reports_page", "settings_page", "products_page", "client_types_page",
     )
 
     def _create_pages(self) -> None:
@@ -152,7 +159,7 @@ class MainWindow(QMainWindow):
     def _build_page(self, index: int) -> QWidget:
         """Create one page and connect its cross-page signals."""
         if self.current_user is None:
-            return self._placeholder_page(ar.SIDEBAR_ITEMS[index])
+            return self._placeholder_page(page_title(index))
         page = self._PAGE_CLASSES[index](self.current_user, self.pages)
         setattr(self, self._PAGE_ATTRIBUTES[index], page)
         if index == PAGE_DASHBOARD:
@@ -162,6 +169,9 @@ class MainWindow(QMainWindow):
             page.view_overdue_requested.connect(lambda: self._select_page(PAGE_PAYMENTS))
         elif index == PAGE_CUSTOMERS:
             page.customer_selected.connect(self._open_customer_details)
+            page.manage_types_requested.connect(lambda: self._select_page(PAGE_CLIENT_TYPES))
+        elif index == PAGE_CLIENT_TYPES:
+            page.view_customers_requested.connect(self._show_customers_of_type)
         elif index == PAGE_NEW_SALE:
             page.customer_details_requested.connect(self._open_customer_details)
         return page
@@ -199,7 +209,11 @@ class MainWindow(QMainWindow):
     def _select_page(self, index: int) -> None:
         if not 0 <= index < self.pages.count():
             return
-        if self.current_user is not None and self.current_user.role != "owner" and index == PAGE_IMPORT:
+        if (
+            self.current_user is not None
+            and self.current_user.role != "owner"
+            and index in OWNER_ONLY_PAGES
+        ):
             return
         if index in getattr(self, "_stale_pages", set()):
             self._stale_pages.discard(index)
@@ -223,6 +237,12 @@ class MainWindow(QMainWindow):
         if month is not None:
             self.customers_page.month_selector.setDate(month)
         self.customers_page.set_status_filter(status)
+
+    def _show_customers_of_type(self, type_id: int) -> None:
+        """Open the customer list filtered to one client type."""
+        self._select_page(PAGE_CUSTOMERS)
+        if self.customers_page is not None:
+            self.customers_page.set_type_filter(type_id)
 
     def _show_customer_payment_kind(self, kind: str) -> None:
         """Open the customer list filtered to cash or installment/credit customers."""

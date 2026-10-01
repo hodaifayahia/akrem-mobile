@@ -7,7 +7,7 @@ the acting user is an owner. Validation errors arrive as
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -151,19 +151,22 @@ class ClientTypeEditor(QDialog):
         return str(checked.property("colorKey")) if checked is not None else "blue"
 
 
-class ClientTypesDialog(QDialog):
-    """Owner panel listing every client type with edit/reorder/delete actions."""
+class ClientTypesPanel(QWidget):
+    """Owner panel listing every client type with view/edit/reorder/delete actions.
+
+    Shown as the "Client types" page in the sidebar.
+    """
+
+    view_customers_requested = Signal(int)
 
     def __init__(self, owner_user_id: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.owner_user_id = owner_user_id
-        self.setWindowTitle(ar.CT_TITLE)
-        self.setMinimumSize(560, 560)
         self._types: list[ClientType] = []
         self.changed = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(10)
         header = QHBoxLayout()
         titles = QVBoxLayout()
@@ -195,14 +198,7 @@ class ClientTypesDialog(QDialog):
         self.rows.setSpacing(8)
         scroll.setWidget(self.list_widget)
         layout.addWidget(scroll, 1)
-
-        close = QPushButton(ar.CUST_CLOSE, self)
-        close.setProperty("variant", "secondary")
-        close.clicked.connect(self.accept)
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        footer.addWidget(close)
-        layout.addLayout(footer)
+        events.data_changed.connect(self.reload)
         self.reload()
 
     # ------------------------------------------------------------------ list
@@ -255,6 +251,9 @@ class ClientTypesDialog(QDialog):
             down.clicked.connect(lambda: self._move(item.id, 1))
             line.addWidget(up)
             line.addWidget(down)
+        view = self._tool_button("users", ar.CT_VIEW_CUSTOMERS, row)
+        view.clicked.connect(lambda: self.view_customers_requested.emit(item.id))
+        line.addWidget(view)
         edit = self._tool_button("edit", ar.CT_EDIT, row)
         edit.clicked.connect(lambda: self._edit(item))
         line.addWidget(edit)
@@ -351,8 +350,7 @@ class ClientTypesDialog(QDialog):
 
     def _after_change(self, toast: str | None) -> None:
         self.changed = True
-        self.reload()
-        events.data_changed.emit()
+        events.data_changed.emit()  # reloads this panel and every page
         if toast:
             events.notify.emit("success", ar.CT_TITLE, toast, 3000)
 

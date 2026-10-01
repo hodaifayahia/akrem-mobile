@@ -9,6 +9,7 @@ import re
 from PySide6.QtCore import QDate, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
+    QTabWidget,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -41,6 +42,7 @@ from app.services.sales import PaidInstallmentEditError
 from app.services.pdf_forms import generate_commitment_pdf, generate_payment_receipt_pdf
 from app.services.schedule import ScheduledInstallment
 from app.services.settings import get_value
+from app.ui.widgets.customer_history import CustomerHistoryPanel, HistorySummary
 from app.services.status import Status, for_customer, for_month
 from app.ui.events import events
 from app.ui.dialogs.sale_edit_dialog import SaleEditDialog
@@ -119,8 +121,8 @@ class CustomerDetailsDialog(QDialog):
         self._sale_id: int | None = None
         self._payments_by_id: dict[int, Payment] = {}
         self.setWindowTitle(ar.CUST_DETAILS_TITLE)
-        self.setMinimumSize(760, 690)
-        self.resize(820, 760)
+        self.setMinimumSize(860, 720)
+        self.resize(980, 820)
         self._reload_customer()
         self._build_ui()
         self._populate_sales()
@@ -169,6 +171,21 @@ class CustomerDetailsDialog(QDialog):
         header.addWidget(self.credit_badge_label)
         root.addLayout(header)
 
+        # History summary is always visible; the tabs below hold the selected
+        # sale (price table, schedule, payments) and the full history.
+        self.history_summary = HistorySummary(self)
+        root.addWidget(self.history_summary)
+        self.tabs = QTabWidget(self)
+        sale_tab = QWidget(self.tabs)
+        sale_root = QVBoxLayout(sale_tab)
+        sale_root.setContentsMargins(0, 10, 0, 0)
+        sale_root.setSpacing(12)
+        self.history_panel = CustomerHistoryPanel(is_owner=self.current_user.role == "owner", parent=self.tabs)
+        self.history_panel.purchase_activated.connect(self._show_sale_from_history)
+        self.tabs.addTab(sale_tab, ar.HIST_TAB_SALE)
+        self.tabs.addTab(self.history_panel, ar.HIST_TAB_HISTORY)
+        root.addWidget(self.tabs, 1)
+
         selector_layout = QHBoxLayout()
         selector_label = QLabel(f"🏷️  {ar.CUST_SALE_SELECTOR}:", self)
         selector_label.setStyleSheet("color: #9DBEFF; font-weight: 600; font-size: 13px;")
@@ -176,12 +193,12 @@ class CustomerDetailsDialog(QDialog):
         self.sale_selector = QComboBox(self)
         self.sale_selector.currentIndexChanged.connect(self._render_selected_sale)
         selector_layout.addWidget(self.sale_selector, 1)
-        root.addLayout(selector_layout)
+        sale_root.addLayout(selector_layout)
 
         # Dedicated Installment & Pricing Summary Table
         self.financial_summary_title = QLabel(f"📊  {ar.FINANCIAL_SUMMARY_TITLE}", self)
         self.financial_summary_title.setObjectName("sectionTitle")
-        root.addWidget(self.financial_summary_title)
+        sale_root.addWidget(self.financial_summary_title)
 
         self.financial_table = QTableWidget(1, 7, self)
         self.financial_table.setHorizontalHeaderLabels([
@@ -215,7 +232,7 @@ class CustomerDetailsDialog(QDialog):
             "  border: 1px solid #1F2A3D;"
             "}"
         )
-        root.addWidget(self.financial_table)
+        sale_root.addWidget(self.financial_table)
 
         self.details_table = QTableWidget(0, 4, self)
         self.details_table.horizontalHeader().hide()
@@ -235,11 +252,11 @@ class CustomerDetailsDialog(QDialog):
         self.details_table.setStyleSheet(
             "QTableWidget { background-color: #0E141D; border: 1px solid #1F2A3D; border-radius: 10px; }"
         )
-        root.addWidget(self.details_table)
+        sale_root.addWidget(self.details_table)
 
         self.schedule_title = QLabel(f"📋  {ar.SCHEDULE}", self)
         self.schedule_title.setObjectName("sectionTitle")
-        root.addWidget(self.schedule_title)
+        sale_root.addWidget(self.schedule_title)
         self.schedule_table = QTableWidget(0, 6, self)
         self.schedule_table.setHorizontalHeaderLabels(
             [
@@ -270,7 +287,7 @@ class CustomerDetailsDialog(QDialog):
         self.schedule_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.schedule_table.setAlternatingRowColors(True)
         self.schedule_table.setShowGrid(False)
-        root.addWidget(self.schedule_table, 1)
+        sale_root.addWidget(self.schedule_table, 1)
 
         self.empty_schedule = QLabel(f"ℹ️  {ar.CUST_NO_SCHEDULE}", self)
         self.empty_schedule.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -278,7 +295,7 @@ class CustomerDetailsDialog(QDialog):
             "color: #8A94A6; padding: 18px; font-size: 13px; background-color: #0E141D; "
             "border: 1px dashed #1F2A3D; border-radius: 8px;"
         )
-        root.addWidget(self.empty_schedule)
+        sale_root.addWidget(self.empty_schedule)
 
         self.credit_payment_panel = QFrame(self)
         self.credit_payment_panel.setObjectName("summaryTile")
@@ -296,7 +313,7 @@ class CustomerDetailsDialog(QDialog):
         self.credit_payment_button.clicked.connect(self._record_credit_payment)
         credit_layout.addWidget(self.credit_balance_label, 1)
         credit_layout.addWidget(self.credit_payment_button)
-        root.addWidget(self.credit_payment_panel)
+        sale_root.addWidget(self.credit_payment_panel)
 
         pdf_row = QHBoxLayout()
         self.commitment_pdf_button = QPushButton(f"📄  {ar.PDF_COMMITMENT_ACTION}", self)
@@ -315,7 +332,7 @@ class CustomerDetailsDialog(QDialog):
         pdf_row.addWidget(self.receipt_history_label)
         pdf_row.addWidget(self.receipt_history, 1)
         pdf_row.addWidget(self.receipt_pdf_button)
-        root.addLayout(pdf_row)
+        sale_root.addLayout(pdf_row)
 
         buttons = QHBoxLayout()
         self.edit_button = QPushButton(f"✏️  {ar.CUST_EDIT}", self)
@@ -358,8 +375,23 @@ class CustomerDetailsDialog(QDialog):
             else "first_of_month"
         )
 
+    def _show_sale_from_history(self, sale_id: int) -> None:
+        """Open a purchase picked in the history tab."""
+        index = self.sale_selector.findData(sale_id)
+        if index >= 0:
+            self.sale_selector.setCurrentIndex(index)
+        self.tabs.setCurrentIndex(0)
+
+    def _load_history(self) -> None:
+        """Refresh the history summary and tab from the history service."""
+        with session_scope(self._engine) as session:
+            history = customers.customer_history(session, self.customer_id, today=date.today())
+        self.history_summary.show_history(history)
+        self.history_panel.show_history(history)
+
     def _populate_sales(self) -> None:
         """Fill the selector and render the current or first sale."""
+        self._load_history()
         self.name_label.setText(self._customer.full_name)
         self.contact_label.setText(self._contact_text())
         now = date.today()

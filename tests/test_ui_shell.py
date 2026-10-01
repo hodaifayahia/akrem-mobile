@@ -149,7 +149,7 @@ def test_sidebar_navigation_badges_and_collapse(qapp, memory_engine, shop) -> No
     from app.ui.widgets.sidebar import COLLAPSED_WIDTH, EXPANDED_WIDTH, Sidebar
 
     sidebar = Sidebar(_user(memory_engine, shop["owner_id"]))
-    assert len(sidebar.buttons) == 7
+    assert len(sidebar.buttons) == 9
     sidebar.set_active(3)
     assert sidebar.buttons[3].property("active") is True
     assert sidebar.buttons[0].property("active") is False
@@ -172,6 +172,8 @@ def test_sidebar_hides_owner_pages_from_sellers_and_shows_initials(qapp, memory_
 
     sidebar = Sidebar(_user(memory_engine, shop["seller_id"]))
     assert sidebar.buttons[4].isHidden() and sidebar.buttons[6].isHidden()
+    assert sidebar.buttons[8].isHidden()  # client types: owner only
+    assert not sidebar.buttons[7].isHidden()  # products: sellers may browse
     assert sidebar.password_button is not None
     assert sidebar.role_badge.text() == ar.ROLE_SELLER
     assert _initials("seller_ui") == "SU"
@@ -402,9 +404,9 @@ def test_trend_labels_are_localized(qapp) -> None:
 
 # --------------------------------------------------------- client types UI
 def test_client_type_editor_saves_and_reports_duplicates(qapp, memory_engine, shop) -> None:
-    from app.ui.dialogs.client_types_dialog import ClientTypeEditor, ClientTypesDialog
+    from app.ui.dialogs.client_types_dialog import ClientTypeEditor, ClientTypesPanel
 
-    dialog = ClientTypesDialog(shop["owner_id"])
+    dialog = ClientTypesPanel(shop["owner_id"])
     editor = ClientTypeEditor(dialog)
     editor.name.setText("طلبة")
     editor.color_group.buttons()[2].setChecked(True)
@@ -437,5 +439,4 @@ def test_seller_cannot_manage_client_types(qapp, memory_engine, shop) -> None:
     from app.ui.pages.customers_page import CustomersPage
 
     page = CustomersPage(_user(memory_engine, shop["seller_id"]))
-    assert page.manage_types_button.isHidden()
     assert page.assign_type_button.isHidden()

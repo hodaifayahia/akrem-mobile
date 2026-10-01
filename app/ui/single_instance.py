@@ -77,11 +77,13 @@ class SingleInstance(QObject):
         socket = self._server.nextPendingConnection()
         if socket is None:
             return
+        # The server owns its sockets and deletes them with itself; deleting
+        # them here as well (deleteLater) double-frees once the server goes.
         socket.readyRead.connect(lambda: self._read(socket))
-        socket.disconnected.connect(socket.deleteLater)
         if socket.bytesAvailable():
             self._read(socket)
 
     def _read(self, socket: QLocalSocket) -> None:
         if bytes(socket.readAll().data()).startswith(_MESSAGE):
             self.activation_requested.emit()
+        socket.close()

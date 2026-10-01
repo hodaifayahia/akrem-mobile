@@ -24,7 +24,7 @@ def test_upgrade_database_creates_current_schema(tmp_path: Path) -> None:
         } <= table_names
         with engine.connect() as connection:
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
-        assert revision == "0003_client_types"
+        assert revision == "0004_two_factor"
     finally:
         engine.dispose()
 

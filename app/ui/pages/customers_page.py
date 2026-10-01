@@ -37,15 +37,17 @@ from app.db.models import Category, User
 from app.db.session import session_scope
 from app.i18n import ar
 from app.config import data_dir
-from app.services import auth, categories, customers, reports
+from app.services import auth, categories, customers, products, reports, sales
+from app.services.settings import get_rate_presets
 from app.services.categories import ClientType, ClientTypeError
 from app.services.customers import CustomerSummary, DuplicateCustomerPhoneError
 from app.services.status import Status
 from app.ui import icons
 from app.ui.theme import qcolor
-from app.ui.dialogs.client_types_dialog import AssignTypeDialog, ClientTypesDialog, error_text
+from app.ui.dialogs.client_types_dialog import AssignTypeDialog, error_text
 from app.ui.events import events
 from app.ui.widgets.client_types import TypeFilterBar, TypeTagDelegate
+from app.ui.widgets.purchase_form import FirstPurchaseSection
 
 _STATUS_COLORS = {
     Status.PAID: "#22C55E",
@@ -288,10 +290,13 @@ class _CustomerFormDialog(QDialog):
         category_rows: list[tuple[Category, int]],
         customer: CustomerSummary | None,
         parent: QWidget,
+        *,
+        purchase: FirstPurchaseSection | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(ar.CUST_ADD if customer is None else ar.CUST_EDIT)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(520 if purchase is None else 980)
+        self.purchase = purchase
         self.customer = customer.customer if customer is not None else None
 
         self.full_name = QLineEdit(self)
@@ -356,7 +361,16 @@ class _CustomerFormDialog(QDialog):
         buttons.addWidget(self.save_button)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.setContentsMargins(22, 20, 22, 18)
+        if purchase is None:
+            layout.addLayout(form)
+        else:
+            columns = QHBoxLayout()
+            columns.setSpacing(20)
+            columns.addLayout(form, 1)
+            purchase.setParent(self)
+            columns.addWidget(purchase, 1)
+            layout.addLayout(columns)
         layout.addLayout(buttons)
         self._load_customer()
 
@@ -414,6 +428,7 @@ class CustomersPage(QWidget):
     """Search and manage customers, with service-owned queries and mutations."""
 
     customer_selected = Signal(int)
+    manage_types_requested = Signal()
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -467,14 +482,6 @@ class CustomersPage(QWidget):
         self.assign_type_button.setEnabled(False)
         self.assign_type_button.clicked.connect(self._assign_type_to_selection)
         title_row.addWidget(self.assign_type_button)
-
-        self.manage_types_button = QPushButton(ar.CT_MANAGE, self)
-        self.manage_types_button.setProperty("variant", "secondary")
-        self.manage_types_button.setIcon(icons.icon("settings", "text", 16))
-        self.manage_types_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.manage_types_button.setVisible(self._is_owner)
-        self.manage_types_button.clicked.connect(self._manage_types)
-        title_row.addWidget(self.manage_types_button)
 
         self.add_customer_button = QPushButton(ar.CUST_ADD, self)
         self.add_customer_button.setIcon(icons.icon("plus", "#FFFFFF", 16))
@@ -809,9 +816,14 @@ class CustomersPage(QWidget):
 
     # ----------------------------------------------------------- client types
     def _manage_types(self) -> None:
-        if not self._is_owner:
-            return
-        ClientTypesDialog(self.current_user.id, self).exec()
+        """Client types are managed on their own page (sidebar)."""
+        if self._is_owner:
+            self.manage_types_requested.emit()
+
+    def set_type_filter(self, type_id: int | None) -> None:
+        """Show only customers of one client type (``None`` for all)."""
+        self.type_filter.set_types(self._types, type_id)
+        self.refresh()
 
     def _assign_type_to_selection(self) -> None:
         selection = self._selected_summaries()
@@ -843,32 +855,49 @@ class CustomersPage(QWidget):
 
     # -------------------------------------------------------------- customers
     def _add_customer(self) -> None:
-        """Open the customer form and save through the customer service."""
+        """Open the new-client form (with an optional first purchase) and save it."""
         if not self._category_rows:
             self._show_error(ar.CUST_SAVE_ERROR)
             return
-        dialog = _CustomerFormDialog(self._category_rows, None, self)
+        dialog = _CustomerFormDialog(
+            self._category_rows, None, self, purchase=self._purchase_section()
+        )
         preferred = self.type_filter.selected_type_id()
         if preferred is not None:
             dialog.category.setCurrentIndex(max(0, dialog.category.findData(preferred)))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        values = dialog.values()
+        self.save_new_customer(dialog.values(), dialog.purchase.sale_values() if dialog.purchase else None)
+
+    def _purchase_section(self) -> FirstPurchaseSection:
+        with session_scope() as session:
+            catalog = [
+                (item.name, item.cash_price, item.wholesale_price)
+                for item in products.list_products(session)
+            ]
+            presets = get_rate_presets(session)
+        return FirstPurchaseSection(catalog, presets, is_owner=self._is_owner)
+
+    def save_new_customer(
+        self, values: dict[str, object], sale_values: dict[str, object] | None
+    ) -> int | None:
+        """Save a new client, plus the chosen purchase in the same transaction."""
         try:
-            customer_id = self._save_customer(values, allow_duplicate_phone=False)
+            customer_id = self._save_customer(values, sale_values, allow_duplicate_phone=False)
         except DuplicateCustomerPhoneError as error:
             names = ", ".join(customer.full_name for customer in error.matches)
             if not self._confirm(ar.CUST_DUP_PHONE_CONFIRM + "\n" + names, ar.CUST_ADD, ar.CUST_SAVE):
-                return
+                return None
             try:
-                customer_id = self._save_customer(values, allow_duplicate_phone=True)
+                customer_id = self._save_customer(values, sale_values, allow_duplicate_phone=True)
             except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
                 self._show_error(ar.CUST_SAVE_ERROR)
-                return
+                return None
         except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
             self._show_error(ar.CUST_SAVE_ERROR)
-            return
+            return None
         self._emit_customer_change(customer_id)
+        return customer_id
 
     def _edit_customer(self, summary: CustomerSummary) -> None:
         """Edit customer profile fields through the customer service."""
@@ -892,19 +921,33 @@ class CustomersPage(QWidget):
             return
         self._emit_customer_change(summary.id)
 
-    def _save_customer(self, values: dict[str, object], *, allow_duplicate_phone: bool) -> int:
-        """Create a customer in a caller-committed session."""
+    def _save_customer(
+        self,
+        values: dict[str, object],
+        sale_values: dict[str, object] | None = None,
+        *,
+        allow_duplicate_phone: bool,
+    ) -> int:
+        """Create a customer (and optionally their first sale) in one transaction."""
+        customer_values = {
+            "full_name": str(values["full_name"]),
+            "category_id": int(values["category_id"]),
+            **{key: value for key, value in values.items() if key not in {"full_name", "category_id"}},
+        }
         with session_scope() as session:
             self._require_owner(session)
-            customer = customers.create_customer(
-                session,
-                full_name=str(values["full_name"]),
-                category_id=int(values["category_id"]),
-                phone=values["phone"],
-                allow_duplicate_phone=allow_duplicate_phone,
-                **{key: value for key, value in values.items()
-                   if key not in {"full_name", "category_id", "phone"}},
-            )
+            if sale_values is not None:
+                customer, _sale = sales.create_customer_with_sale(
+                    session,
+                    self.current_user.id,
+                    customer=customer_values,
+                    sale=sale_values,
+                    allow_duplicate_phone=allow_duplicate_phone,
+                )
+            else:
+                customer = customers.create_customer(
+                    session, allow_duplicate_phone=allow_duplicate_phone, **customer_values
+                )
             return customer.id
 
     def _update_customer(
