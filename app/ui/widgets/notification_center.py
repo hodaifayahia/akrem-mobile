@@ -1,379 +1,358 @@
-"""World-class Notification Center and drawer popup for AkremMobile."""
+"""Notification center popup opened from the top-bar bell.
+
+Two kinds of content share one panel:
+
+* collection alerts (overdue / upcoming installments, late credit), computed
+  by :mod:`app.services.alerts`; and
+* the activity history kept by the notification hub (background digests,
+  backups, confirmations), with unread markers.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, timedelta
-import urllib.parse
-from PySide6.QtCore import Qt, QUrl, Signal
+import logging
+from datetime import date
+
+from PySide6.QtCore import QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
-from app.db.models import Customer, Installment, Sale
 from app.db.session import session_scope
-from app.services.customers import _grace_days
-from app.ui.events import events
+from app.i18n import ar
+from app.services.alerts import CollectionAlert, collection_alerts
+from app.services.reminders import whatsapp_link
+from app.ui import icons
+from app.ui.notifications import AppNotification, hub, relative_time
+
+_LOG = logging.getLogger(__name__)
+
+FILTERS = ("all", "overdue", "upcoming", "activity")
+_FILTER_KEYS = {
+    "all": "NOTIF_TAB_ALL",
+    "overdue": "NOTIF_TAB_OVERDUE",
+    "upcoming": "NOTIF_TAB_UPCOMING",
+    "activity": "NOTIF_TAB_ACTIVITY",
+}
+_LEVEL_ICONS = {
+    "success": ("check-circle", "paid"),
+    "warning": ("alert", "pending"),
+    "error": ("alert", "failed"),
+    "info": ("info", "primary-glow"),
+}
 
 
-@dataclass
-class AlertItem:
-    alert_type: str  # 'overdue', 'upcoming', 'system'
-    customer_id: int | None
-    customer_name: str
-    customer_phone: str | None
-    amount: int
-    due_date: date
-    days_delta: int  # > 0 means overdue by N days, < 0 means due in N days
+def alert_line(alert: CollectionAlert, grace_days: int | None = None) -> str:
+    """Describe an alert in one short line ("3 days overdue — A15")."""
+    if alert.kind == "credit_overdue":
+        return ar.NOTIF_CREDIT_OVERDUE_ITEM.format(days=alert.days_late, product=alert.product)
+    if alert.kind == "overdue":
+        return ar.NOTIF_OVERDUE_ITEM.format(days=alert.days_late, product=alert.product)
+    if alert.days_late > 0:
+        return ar.NOTIF_GRACE_ITEM.format(days=alert.days_late, product=alert.product)
+    if alert.days_late == 0:
+        return ar.NOTIF_DUE_TODAY_ITEM.format(product=alert.product)
+    return ar.NOTIF_DUE_IN_ITEM.format(days=-alert.days_late, product=alert.product)
+
+
+def money(amount: int) -> str:
+    """Format whole dinars with Western digits and the currency suffix."""
+    return f"{amount:,} {ar.CURRENCY_SUFFIX}"
 
 
 class NotificationCard(QFrame):
-    """Interactive notification card with quick action buttons."""
+    """One collection alert with quick actions."""
 
-    def __init__(self, alert: AlertItem, on_open_customer: callable, parent: QWidget | None = None) -> None:
+    def __init__(self, alert: CollectionAlert, on_open_customer, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.alert = alert
         self.on_open_customer = on_open_customer
         self.setObjectName("notificationCard")
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self._build_ui()
+        late = alert.kind != "due_soon"
 
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
+        layout.setSpacing(10)
+        badge = QLabel(self)
+        badge.setFixedSize(30, 30)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setProperty("pill", "failed" if late else "info")
+        badge.setPixmap(icons.pixmap("alert" if late else "clock", "failed" if late else "highlight", 16))
+        layout.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
 
-        # Header row: Status pill + Customer Name + Amount
+        body = QVBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(3)
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
+        name = QLabel(alert.customer_name, self)
+        name.setObjectName("notificationTitle")
+        amount = QLabel(money(alert.amount), self)
+        amount.setObjectName("moneyValue")
+        amount.setProperty("pill", "failed" if late else "info")
+        header.addWidget(name, 1)
+        header.addWidget(amount)
+        body.addLayout(header)
 
-        if self.alert.alert_type == "overdue":
-            pill = QLabel(f"متأخر {self.alert.days_delta} يوم", self)
-            pill.setStyleSheet(
-                "background-color: #361014; color: #F87171; border: 1px solid #7F1D1D; "
-                "border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 700;"
-            )
-            border_color = "#7F1D1D"
-        else:
-            pill = QLabel(f"مستحق خلال {abs(self.alert.days_delta)} يوم", self)
-            pill.setStyleSheet(
-                "background-color: #12284C; color: #9DBEFF; border: 1px solid #234275; "
-                "border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 700;"
-            )
-            border_color = "#234275"
+        detail = QLabel(alert_line(alert), self)
+        detail.setObjectName("notificationBody")
+        detail.setWordWrap(True)
+        body.addWidget(detail)
 
-        name_label = QLabel(self.alert.customer_name, self)
-        name_label.setStyleSheet("color: #FFFFFF; font-weight: 700; font-size: 13px;")
-
-        amount_label = QLabel(f"{self.alert.amount:,} دج", self)
-        amount_label.setStyleSheet(
-            "color: #F87171; font-weight: 700; font-size: 13px; font-family: 'Rajdhani', sans-serif;"
-            if self.alert.alert_type == "overdue"
-            else "color: #9DBEFF; font-weight: 700; font-size: 13px; font-family: 'Rajdhani', sans-serif;"
-        )
-
-        header.addWidget(pill)
-        header.addWidget(name_label, 1)
-        header.addWidget(amount_label)
-        layout.addLayout(header)
-
-        # Subtext row: Due date & info
-        sub_layout = QHBoxLayout()
-        sub_layout.setContentsMargins(0, 0, 0, 0)
-
-        date_str = self.alert.due_date.strftime("%Y-%m-%d")
-        info_label = QLabel(f"تاريخ الاستحقاق: {date_str}", self)
-        info_label.setStyleSheet("color: #8A94A6; font-size: 11px;")
-        sub_layout.addWidget(info_label, 1)
-
-        # Action buttons
-        if self.alert.customer_id is not None:
-            view_btn = QPushButton("عرض الزبون 👤", self)
-            view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            view_btn.setStyleSheet(
-                "QPushButton { background-color: #121A2C; color: #9DBEFF; border: 1px solid #24334C; "
-                "border-radius: 5px; padding: 3px 8px; font-size: 11px; } "
-                "QPushButton:hover { background-color: #0758CD; color: #FFFFFF; border-color: #3B92D9; }"
-            )
-            view_btn.clicked.connect(self._handle_view)
-            sub_layout.addWidget(view_btn)
-
-        if self.alert.customer_phone:
-            wa_btn = QPushButton("واتساب 💬", self)
-            wa_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            wa_btn.setStyleSheet(
-                "QPushButton { background-color: #0D2E1E; color: #4ADE80; border: 1px solid #14532D; "
-                "border-radius: 5px; padding: 3px 8px; font-size: 11px; font-weight: 600; } "
-                "QPushButton:hover { background-color: #16A34A; color: #FFFFFF; border-color: #22C55E; }"
-            )
-            wa_btn.clicked.connect(self._open_whatsapp)
-            sub_layout.addWidget(wa_btn)
-
-        layout.addLayout(sub_layout)
-
-        self.setStyleSheet(
-            f"QFrame#notificationCard {{ "
-            f"  background-color: #0E1522; "
-            f"  border: 1px solid {border_color}; "
-            f"  border-radius: 8px; "
-            f"}} "
-            f"QFrame#notificationCard:hover {{ "
-            f"  background-color: #121B2C; "
-            f"}}"
-        )
-
-    def _handle_view(self) -> None:
-        if self.alert.customer_id is not None:
-            self.on_open_customer(self.alert.customer_id)
+        footer = QHBoxLayout()
+        footer.setSpacing(6)
+        when = QLabel(ar.NOTIF_DUE_DATE.format(date=alert.due_date.strftime("%d/%m/%Y")), self)
+        when.setObjectName("notificationTime")
+        footer.addWidget(when, 1)
+        view = QPushButton(ar.NOTIF_OPEN_CUSTOMER, self)
+        view.setProperty("variant", "secondary")
+        view.setProperty("compact", True)
+        view.setCursor(Qt.CursorShape.PointingHandCursor)
+        view.clicked.connect(lambda: self.on_open_customer(alert.customer_id))
+        footer.addWidget(view)
+        if alert.customer_phone:
+            whatsapp = QPushButton(ar.NOTIF_WHATSAPP, self)
+            whatsapp.setProperty("variant", "whatsapp")
+            whatsapp.setProperty("compact", True)
+            whatsapp.setIcon(icons.icon("message", "#FFFFFF", 14))
+            whatsapp.setCursor(Qt.CursorShape.PointingHandCursor)
+            whatsapp.clicked.connect(self._open_whatsapp)
+            footer.addWidget(whatsapp)
+        body.addLayout(footer)
+        layout.addLayout(body, 1)
 
     def _open_whatsapp(self) -> None:
-        if not self.alert.customer_phone:
-            return
-        phone = self.alert.customer_phone.strip()
-        if phone.startswith("0"):
-            phone = "213" + phone[1:]
-        msg = (
-            f"السلام عليكم أخي {self.alert.customer_name}، نود تذكيركم بمستحقات القسط "
-            f"بقيمة {self.alert.amount:,} دج لدى أكرم موبايل. شكراً لوفائكم."
+        message = ar.PAY_REMINDERS_MESSAGE.format(
+            customer=self.alert.customer_name,
+            amount=f"{self.alert.amount:,}",
+            due=self.alert.due_date.strftime("%d/%m/%Y"),
         )
-        url = f"https://wa.me/{phone}?text={urllib.parse.quote(msg)}"
-        QDesktopServices.openUrl(QUrl(url))
+        link = whatsapp_link(self.alert.customer_phone, message)
+        if link is not None:
+            QDesktopServices.openUrl(QUrl(link))
+
+
+class ActivityCard(QFrame):
+    """One entry of the notification history."""
+
+    def __init__(self, entry: AppNotification, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("notificationCard")
+        self.setProperty("unread", not entry.read)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
+        icon_name, color = _LEVEL_ICONS.get(entry.level, _LEVEL_ICONS["info"])
+        badge = QLabel(self)
+        badge.setFixedSize(30, 30)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setPixmap(icons.pixmap(icon_name, color, 16))
+        layout.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+        body = QVBoxLayout()
+        body.setSpacing(2)
+        top = QHBoxLayout()
+        title = QLabel(entry.title, self)
+        title.setObjectName("notificationTitle")
+        when = QLabel(relative_time(entry.created_at), self)
+        when.setObjectName("notificationTime")
+        top.addWidget(title, 1)
+        top.addWidget(when)
+        body.addLayout(top)
+        message = QLabel(entry.message, self)
+        message.setObjectName("notificationBody")
+        message.setWordWrap(True)
+        body.addWidget(message)
+        layout.addLayout(body, 1)
 
 
 class NotificationCenterPopup(QFrame):
-    """Drop-down drawer attached to the topbar notification bell."""
+    """Drop-down panel attached to the notification bell."""
 
     customer_opened = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setObjectName("notificationCenterPopup")
-        self.setFixedSize(420, 520)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self._alerts: list[AlertItem] = []
+        self.setFixedSize(430, 540)
+        self._alerts: list[CollectionAlert] = []
         self._current_filter = "all"
         self._build_ui()
+        self.retranslate()
+        hub.changed.connect(self._on_history_changed)
         self.refresh_alerts()
 
+    # ------------------------------------------------------------------ build
     def _build_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(10)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(10)
 
-        # Header
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-
-        bell_icon = QLabel("🔔", self)
-        bell_icon.setStyleSheet("font-size: 16px;")
-        header.addWidget(bell_icon)
-
-        title = QLabel("مركز التنبيهات والإشعارات", self)
-        title.setStyleSheet("color: #FFFFFF; font-size: 15px; font-weight: 700;")
-        header.addWidget(title, 1)
-
+        self.title_label = QLabel(self)
+        self.title_label.setObjectName("popupTitle")
+        header.addWidget(self.title_label, 1)
         self.badge_count = QLabel("0", self)
-        self.badge_count.setStyleSheet(
-            "background-color: #EF4444; color: #FFFFFF; border-radius: 9px; "
-            "padding: 2px 7px; font-size: 11px; font-weight: 700;"
-        )
+        self.badge_count.setProperty("pill", "failed")
         header.addWidget(self.badge_count)
+        self.mark_read_btn = QPushButton(self)
+        self.mark_read_btn.setProperty("variant", "ghost")
+        self.mark_read_btn.setProperty("compact", True)
+        self.mark_read_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mark_read_btn.clicked.connect(hub.mark_all_read)
+        header.addWidget(self.mark_read_btn)
+        self.refresh_btn = QToolButton(self)
+        self.refresh_btn.setObjectName("iconButton")
+        self.refresh_btn.setFixedSize(30, 30)
+        self.refresh_btn.setIconSize(QSize(15, 15))
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self.refresh_alerts)
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
 
-        refresh_btn = QPushButton("🔄", self)
-        refresh_btn.setFixedSize(28, 28)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setToolTip("تحديث البيانات")
-        refresh_btn.setStyleSheet(
-            "QPushButton { background-color: #121A2C; border: 1px solid #1F2A3D; border-radius: 6px; } "
-            "QPushButton:hover { background-color: #1A2740; }"
-        )
-        refresh_btn.clicked.connect(self.refresh_alerts)
-        header.addWidget(refresh_btn)
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        self.filter_group = QButtonGroup(self)
+        self.filter_group.setExclusive(True)
+        self.filter_buttons: dict[str, QPushButton] = {}
+        for name in FILTERS:
+            chip = QPushButton(self)
+            chip.setProperty("chip", True)
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(lambda _checked=False, n=name: self._set_filter(n))
+            self.filter_group.addButton(chip)
+            self.filter_buttons[name] = chip
+            chips.addWidget(chip)
+        chips.addStretch(1)
+        self.filter_buttons["all"].setChecked(True)
+        layout.addLayout(chips)
 
-        main_layout.addLayout(header)
-
-        # Filter Tabs
-        tab_row = QHBoxLayout()
-        tab_row.setContentsMargins(0, 0, 0, 0)
-        tab_row.setSpacing(6)
-
-        self.btn_all = QPushButton("الكل", self)
-        self.btn_overdue = QPushButton("متأخرات ⚠️", self)
-        self.btn_upcoming = QPushButton("قريباً ⏳", self)
-
-        for btn in (self.btn_all, self.btn_overdue, self.btn_upcoming):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(
-                "QPushButton { background-color: #0E1522; color: #8A94A6; border: 1px solid #1F2E47; "
-                "border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; } "
-                "QPushButton:hover { color: #FFFFFF; background-color: #162032; } "
-                "QPushButton[active='true'] { background-color: #0758CD; color: #FFFFFF; border-color: #3B92D9; }"
-            )
-            tab_row.addWidget(btn)
-
-        self.btn_all.setProperty("active", True)
-        self.btn_all.clicked.connect(lambda: self._set_filter("all"))
-        self.btn_overdue.clicked.connect(lambda: self._set_filter("overdue"))
-        self.btn_upcoming.clicked.connect(lambda: self._set_filter("upcoming"))
-
-        main_layout.addLayout(tab_row)
-
-        # Scroll Area for notifications
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.cards_container = QWidget()
-        self.cards_container.setObjectName("cardsContainer")
         self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(0, 4, 0, 4)
+        self.cards_layout.setContentsMargins(0, 2, 0, 2)
         self.cards_layout.setSpacing(8)
         self.scroll.setWidget(self.cards_container)
+        layout.addWidget(self.scroll, 1)
 
-        main_layout.addWidget(self.scroll, 1)
-
-        # Container styling
-        self.setStyleSheet(
-            "QFrame#notificationCenterPopup { "
-            "  background-color: #0A0E17; "
-            "  border: 1px solid #1F2E47; "
-            "  border-radius: 12px; "
-            "}"
-        )
-
-    def _set_filter(self, filter_name: str) -> None:
-        self._current_filter = filter_name
-        self.btn_all.setProperty("active", filter_name == "all")
-        self.btn_overdue.setProperty("active", filter_name == "overdue")
-        self.btn_upcoming.setProperty("active", filter_name == "upcoming")
-        for btn in (self.btn_all, self.btn_overdue, self.btn_upcoming):
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+    def retranslate(self) -> None:
+        """Refresh labels after a language change."""
+        self.title_label.setText(ar.NOTIF_CENTER_TITLE)
+        self.mark_read_btn.setText(ar.NOTIF_MARK_ALL_READ)
+        self.refresh_btn.setToolTip(ar.NOTIF_REFRESH)
+        self.refresh_btn.setIcon(icons.icon("refresh", "text-muted", 15))
+        self._update_chip_labels()
         self._render_cards()
 
+    # ------------------------------------------------------------------- data
     def refresh_alerts(self) -> None:
-        """Fetch overdue installments and upcoming obligations."""
-        today = date.today()
-        self._alerts.clear()
-
+        """Reload collection alerts from the database."""
         try:
             with session_scope() as session:
-                grace_days = _grace_days(session)
-                # Fetch pending or failed installments
-                sales = session.scalars(
-                    select(Sale).options(
-                        selectinload(Sale.customer),
-                        selectinload(Sale.installments).selectinload(Installment.payments),
-                    )
-                ).all()
+                self.set_alerts(collection_alerts(session, today=date.today()))
+        except Exception:  # noqa: BLE001 - keep the shell usable if the DB is unavailable
+            _LOG.warning("Could not load collection alerts", exc_info=True)
 
-                for sale in sales:
-                    if not sale.customer:
-                        continue
-                    for inst in sale.installments:
-                        paid = max(
-                            inst.amount_paid,
-                            sum(p.amount for p in inst.payments),
-                        )
-                        remaining = inst.amount_due - paid
-                        if remaining <= 0:
-                            continue
-
-                        due_date = inst.due_date
-                        delta_days = (today - due_date).days
-
-                        # If past due + grace period -> Overdue alert
-                        if delta_days > grace_days:
-                            self._alerts.append(
-                                AlertItem(
-                                    alert_type="overdue",
-                                    customer_id=sale.customer.id,
-                                    customer_name=sale.customer.full_name,
-                                    customer_phone=sale.customer.phone,
-                                    amount=remaining,
-                                    due_date=due_date,
-                                    days_delta=delta_days,
-                                )
-                            )
-                        # If due within next 7 days -> Upcoming alert
-                        elif 0 <= -delta_days <= 7:
-                            self._alerts.append(
-                                AlertItem(
-                                    alert_type="upcoming",
-                                    customer_id=sale.customer.id,
-                                    customer_name=sale.customer.full_name,
-                                    customer_phone=sale.customer.phone,
-                                    amount=remaining,
-                                    due_date=due_date,
-                                    days_delta=delta_days,
-                                )
-                            )
-
-            # Sort: overdues by highest days overdue first, upcoming by closest date
-            self._alerts.sort(
-                key=lambda a: (0 if a.alert_type == "overdue" else 1, -a.days_delta if a.alert_type == "overdue" else a.days_delta)
-            )
-        except Exception:
-            pass
-
+    def set_alerts(self, alerts: list[CollectionAlert]) -> None:
+        """Show alerts computed elsewhere (e.g. by the background monitor)."""
+        self._alerts = list(alerts)
         self.badge_count.setText(str(len(self._alerts)))
+        self.badge_count.setVisible(bool(self._alerts))
+        self._update_chip_labels()
         self._render_cards()
 
+    def get_alert_count(self) -> int:
+        """Return how many collection alerts are listed."""
+        return len(self._alerts)
+
+    def attention_count(self) -> int:
+        """Return how many listed alerts are already late (installment or credit)."""
+        return sum(1 for alert in self._alerts if alert.kind != "due_soon")
+
+    def _set_filter(self, filter_name: str) -> None:
+        self._current_filter = filter_name if filter_name in FILTERS else "all"
+        self.filter_buttons[self._current_filter].setChecked(True)
+        self._render_cards()
+
+    def _on_history_changed(self) -> None:
+        self._update_chip_labels()
+        if self._current_filter in ("all", "activity"):
+            self._render_cards()
+
+    # ------------------------------------------------------------- rendering
+    def _update_chip_labels(self) -> None:
+        overdue = sum(1 for alert in self._alerts if alert.kind != "due_soon")
+        counts = {
+            "all": len(self._alerts) + hub.unread_count(),
+            "overdue": overdue,
+            "upcoming": len(self._alerts) - overdue,
+            "activity": hub.unread_count(),
+        }
+        for name, button in self.filter_buttons.items():
+            label = getattr(ar, _FILTER_KEYS[name])
+            button.setText(f"{label}  {counts[name]}" if counts[name] else label)
+        self.mark_read_btn.setVisible(hub.unread_count() > 0)
+
     def _render_cards(self) -> None:
-        # Clear existing cards
         while self.cards_layout.count():
             item = self.cards_layout.takeAt(0)
-            if item.widget():
+            if item.widget() is not None:
                 item.widget().deleteLater()
-
-        filtered = [
-            a for a in self._alerts
-            if self._current_filter == "all"
-            or (self._current_filter == "overdue" and a.alert_type == "overdue")
-            or (self._current_filter == "upcoming" and a.alert_type == "upcoming")
-        ]
-
-        if not filtered:
-            empty_widget = QWidget()
-            empty_layout = QVBoxLayout(empty_widget)
-            empty_layout.setContentsMargins(16, 40, 16, 40)
-            empty_layout.setSpacing(10)
-            empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            icon = QLabel("✨", empty_widget)
-            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon.setStyleSheet("font-size: 38px;")
-            empty_layout.addWidget(icon)
-
-            msg = QLabel("لا توجد إشعارات جديدة\nجميع الأقساط منتظمة وحسابات الزبائن محدثة.", empty_widget)
-            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            msg.setStyleSheet("color: #8A94A6; font-size: 13px; line-height: 1.4;")
-            empty_layout.addWidget(msg)
-
-            self.cards_layout.addWidget(empty_widget)
-            return
-
-        for alert in filtered:
-            card = NotificationCard(alert, on_open_customer=self._handle_open_customer, parent=self.cards_container)
-            self.cards_layout.addWidget(card)
-
+        widgets: list[QWidget] = []
+        if self._current_filter in ("all", "overdue", "upcoming"):
+            for alert in self._alerts:
+                late = alert.kind != "due_soon"
+                if self._current_filter == "overdue" and not late:
+                    continue
+                if self._current_filter == "upcoming" and late:
+                    continue
+                widgets.append(NotificationCard(alert, self._handle_open_customer, self.cards_container))
+        if self._current_filter in ("all", "activity"):
+            widgets.extend(ActivityCard(entry, self.cards_container) for entry in hub.history())
+        if not widgets:
+            self.cards_layout.addWidget(self._empty_state())
+        for widget in widgets:
+            self.cards_layout.addWidget(widget)
         self.cards_layout.addStretch(1)
+
+    def _empty_state(self) -> QWidget:
+        box = QWidget(self.cards_container)
+        column = QVBoxLayout(box)
+        column.setContentsMargins(16, 48, 16, 48)
+        column.setSpacing(8)
+        icon = QLabel(box)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(icons.pixmap("check-circle", "paid", 40, stroke=1.5))
+        column.addWidget(icon)
+        title = QLabel(ar.NOTIF_EMPTY_TITLE, box)
+        title.setObjectName("emptyStateTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(title)
+        body_text = ar.NOTIF_EMPTY_ACTIVITY if self._current_filter == "activity" else ar.NOTIF_EMPTY_BODY
+        body = QLabel(body_text, box)
+        body.setObjectName("emptyStateSub")
+        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body.setWordWrap(True)
+        column.addWidget(body)
+        return box
 
     def _handle_open_customer(self, customer_id: int) -> None:
         self.hide()
         self.customer_opened.emit(customer_id)
-        events.open_customer.emit(customer_id)
 
-    def get_alert_count(self) -> int:
-        return len(self._alerts)
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        """Opening the panel counts as reading the activity history."""
+        super().hideEvent(event)
+        hub.mark_all_read()

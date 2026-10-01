@@ -1,177 +1,293 @@
-"""Dashboard page with month selection and summary cards."""
+"""Dashboard: greeting, month picker, KPIs, trend, collection rate and follow-ups.
+
+Information is ordered by how often the shop acts on it:
+
+1. operations status for the month (paid / pending / failed) - clickable
+   filters into the customer list;
+2. the six-month collection trend and this month's collection rate;
+3. owner-only financial KPIs;
+4. a "needs attention" list of the most overdue customers next to today's
+   register.
+"""
 
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import date, datetime
 
 from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtWidgets import (
     QDateEdit,
-    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
+
 from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
+from app.services.alerts import CollectionAlert, collection_alerts
 from app.services.dashboard import DashboardSummary, get_dashboard_summary
+from app.ui import icons
 from app.ui.events import events
 from app.ui.widgets.collection_gauge import CollectionGaugeWidget
 from app.ui.widgets.daily_register_card import DailyRegisterCard
 from app.ui.widgets.financial_chart import FinancialTrendChart
+from app.ui.widgets.notification_center import alert_line, money
+from app.ui.widgets.responsive_grid import ResponsiveGrid
 from app.ui.widgets.stat_card import StatCard
+
+_LOG = logging.getLogger(__name__)
+ATTENTION_LIMIT = 6
+
+
+def trend_labels(year: int, month: int, count: int = 6) -> list[str]:
+    """Return localized month names for the ``count`` months ending at ``year-month``."""
+    labels = []
+    for offset in range(count - 1, -1, -1):
+        index = year * 12 + (month - 1) - offset
+        labels.append(ar.MONTH_NAMES[index % 12 + 1])
+    return labels
+
+
+class _AttentionRow(QFrame):
+    """One overdue customer in the "needs attention" card."""
+
+    def __init__(self, alert: CollectionAlert, on_open, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("attentionRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open = lambda: on_open(alert.customer_id)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 9, 4, 9)
+        row.setSpacing(10)
+        icon = QLabel(self)
+        icon.setPixmap(icons.pixmap("alert", "failed", 16))
+        row.addWidget(icon)
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        name = QLabel(alert.customer_name, self)
+        name.setObjectName("attentionName")
+        meta = QLabel(alert_line(alert), self)
+        meta.setObjectName("attentionMeta")
+        text.addWidget(name)
+        text.addWidget(meta)
+        row.addLayout(text, 1)
+        amount = QLabel(money(alert.amount), self)
+        amount.setProperty("pill", "failed")
+        row.addWidget(amount)
+        chevron = QLabel(self)
+        chevron.setPixmap(icons.pixmap("chevron-forward", "text-muted", 14))
+        row.addWidget(chevron)
+        for child in (icon, name, meta, amount, chevron):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAccessibleName(f"{alert.customer_name} {money(alert.amount)}")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open()
+        super().mousePressEvent(event)
 
 
 class DashboardPage(QWidget):
-    """Show high-level sales and collection figures for a selected month."""
+    """High-level sales and collection figures for a selected month."""
 
     status_filter_requested = Signal(str)
+    payment_filter_requested = Signal(str)
+    open_customer_requested = Signal(int)
+    view_overdue_requested = Signal()
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.current_user = current_user
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self._role_is_owner = current_user.role == "owner"
         self._build_ui()
         events.data_changed.connect(self.refresh)
         self.refresh()
 
+    # ------------------------------------------------------------------ build
     def _build_ui(self) -> None:
-        """Create header toolbar and two structured rows of summary cards."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 22, 28, 22)
-        root.setSpacing(18)
+        root.setContentsMargins(28, 22, 28, 0)
+        root.setSpacing(16)
+        root.addLayout(self._build_header())
 
-        # Header toolbar with title and month selector
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        heading = QLabel(ar.SIDEBAR_ITEMS[0], self)
-        heading.setObjectName("pageTitle")
-        header_row.addWidget(heading)
-        header_row.addStretch(1)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget(scroll)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 24)
+        layout.setSpacing(20)
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
 
-        month_container = QWidget(self)
-        month_layout = QHBoxLayout(month_container)
-        month_layout.setContentsMargins(0, 0, 0, 0)
-        month_layout.setSpacing(8)
+        layout.addWidget(self._section_title(ar.DASH_SECTION_OPERATIONS))
+        self.status_grid = ResponsiveGrid(parent=body)
+        self.completed_card = StatCard(ar.DASHBOARD_COMPLETED, color="paid", icon="check-circle",
+                                       subtitle=ar.DASH_CAPTION_COMPLETED)
+        self.pending_card = StatCard(ar.DASHBOARD_PENDING, color="pending", icon="clock",
+                                     subtitle=ar.DASH_CAPTION_PENDING)
+        self.failed_card = StatCard(ar.DASHBOARD_FAILED, color="failed", icon="alert",
+                                    subtitle=ar.DASH_CAPTION_FAILED)
+        self.wholesale_card = StatCard(ar.DASHBOARD_WHOLESALE, color="highlight", icon="tag",
+                                       subtitle=ar.DASH_CAPTION_WHOLESALE)
+        for card in (self.completed_card, self.pending_card, self.failed_card, self.wholesale_card):
+            self.status_grid.add(card)
+        self.wholesale_card.setVisible(self._role_is_owner)
+        self.status_grid.refresh()
+        self.completed_card.clicked.connect(lambda: self.status_filter_requested.emit("PAID"))
+        self.pending_card.clicked.connect(lambda: self.status_filter_requested.emit("PENDING"))
+        self.failed_card.clicked.connect(lambda: self.status_filter_requested.emit("FAILED"))
+        self.wholesale_card.clicked.connect(lambda: self.status_filter_requested.emit("ALL"))
+        layout.addWidget(self.status_grid)
 
-        month_label = QLabel(f"📅  {ar.DASHBOARD_MONTH}:", month_container)
-        month_label.setStyleSheet("color: #9DBEFF; font-weight: 600; font-size: 13px;")
-        month_layout.addWidget(month_label)
+        layout.addWidget(self._section_title(ar.DASH_SECTION_MIX))
+        self.mix_grid = ResponsiveGrid(max_columns=3, parent=body)
+        self.cash_customers_card = StatCard(ar.DASH_MIX_CASH_CUSTOMERS, color="paid", icon="cash",
+                                            subtitle=ar.DASH_MIX_CASH_CAPTION)
+        self.facility_customers_card = StatCard(ar.DASH_MIX_FACILITY_CUSTOMERS, color="primary-glow",
+                                                icon="calendar", subtitle=ar.DASH_MIX_FACILITY_CAPTION)
+        self.month_mix_card = StatCard(ar.DASH_MIX_MONTH_SALES, color="highlight", icon="cart",
+                                       clickable=False)
+        for card in (self.cash_customers_card, self.facility_customers_card, self.month_mix_card):
+            self.mix_grid.add(card)
+        self.cash_customers_card.clicked.connect(lambda: self.payment_filter_requested.emit("cash"))
+        self.facility_customers_card.clicked.connect(
+            lambda: self.payment_filter_requested.emit("facilities")
+        )
+        layout.addWidget(self.mix_grid)
 
-        self.month_selector = QDateEdit(month_container)
+        charts = QHBoxLayout()
+        charts.setSpacing(16)
+        self.trend_chart = FinancialTrendChart(body)
+        self.gauge_widget = CollectionGaugeWidget(body)
+        charts.addWidget(self.trend_chart, 3)
+        charts.addWidget(self.gauge_widget, 1)
+        layout.addLayout(charts)
+
+        self.owner_metrics = QWidget(body)
+        owner_layout = QVBoxLayout(self.owner_metrics)
+        owner_layout.setContentsMargins(0, 0, 0, 0)
+        owner_layout.setSpacing(12)
+        owner_layout.addWidget(self._section_title(ar.DASH_SECTION_FINANCE))
+        self.owner_grid = ResponsiveGrid(parent=self.owner_metrics)
+        self.expected_card = StatCard(ar.DASHBOARD_EXPECTED, color="primary-glow", icon="calendar",
+                                      subtitle=ar.DASH_CAPTION_EXPECTED, clickable=False)
+        self.collected_card = StatCard(ar.DASHBOARD_COLLECTED, color="paid", icon="wallet",
+                                       subtitle=ar.DASH_CAPTION_COLLECTED, clickable=False)
+        self.profit_card = StatCard(ar.DASHBOARD_PROFIT, color="highlight", icon="trend-up",
+                                    subtitle=ar.DASH_CAPTION_PROFIT, clickable=False)
+        self.remaining_card = StatCard(ar.DASHBOARD_REMAINING, color="pending", icon="cash",
+                                       subtitle=ar.DASH_CAPTION_REMAINING, clickable=False)
+        for card in (self.expected_card, self.collected_card, self.profit_card, self.remaining_card):
+            self.owner_grid.add(card)
+        owner_layout.addWidget(self.owner_grid)
+        self.owner_metrics.setVisible(self._role_is_owner)
+        layout.addWidget(self.owner_metrics)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(16)
+        bottom.addWidget(self._build_attention_card(body), 3)
+        self.daily_register = DailyRegisterCard(is_owner=self._role_is_owner, parent=body)
+        side = QVBoxLayout()
+        side.addWidget(self.daily_register)
+        side.addStretch(1)
+        bottom.addLayout(side, 2)
+        layout.addLayout(bottom)
+        layout.addStretch(1)
+
+    def _build_header(self) -> QHBoxLayout:
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        self.greeting = QLabel(self._greeting_text(), self)
+        self.greeting.setObjectName("pageTitle")
+        subtitle = QLabel(ar.DASH_SUBTITLE, self)
+        subtitle.setObjectName("pageSubtitle")
+        titles.addWidget(self.greeting)
+        titles.addWidget(subtitle)
+        header.addLayout(titles, 1)
+
+        month_icon = QLabel(self)
+        month_icon.setPixmap(icons.pixmap("calendar", "text-muted", 16))
+        month_label = QLabel(ar.DASHBOARD_MONTH, self)
+        month_label.setObjectName("sectionHint")
+        self.month_selector = QDateEdit(self)
         self.month_selector.setCalendarPopup(True)
         self.month_selector.setDisplayFormat("MM/yyyy")
         self.month_selector.setDate(QDate.currentDate())
         self.month_selector.setMinimumWidth(130)
         self.month_selector.dateChanged.connect(self.refresh)
-        month_layout.addWidget(self.month_selector)
+        header.addWidget(month_icon)
+        header.addWidget(month_label)
+        header.addWidget(self.month_selector)
+        return header
 
-        header_row.addWidget(month_container)
-        root.addLayout(header_row)
+    def _build_attention_card(self, parent: QWidget) -> QFrame:
+        card = QFrame(parent)
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 16, 20, 14)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        title = QLabel(ar.DASH_SECTION_ATTENTION, card)
+        title.setObjectName("sectionTitle")
+        header.addWidget(title, 1)
+        self.attention_count = QLabel(card)
+        self.attention_count.setProperty("pill", "failed")
+        header.addWidget(self.attention_count)
+        view_all = QPushButton(ar.DASH_VIEW_ALL, card)
+        view_all.setProperty("variant", "ghost")
+        view_all.setProperty("compact", True)
+        view_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        view_all.clicked.connect(self.view_overdue_requested.emit)
+        header.addWidget(view_all)
+        layout.addLayout(header)
+        self.attention_list = QVBoxLayout()
+        self.attention_list.setSpacing(0)
+        layout.addLayout(self.attention_list)
+        layout.addStretch(1)
+        return card
 
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        body = QWidget(scroll)
-        body.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(22)
-        scroll.setWidget(body)
-        root.addWidget(scroll, 1)
+    def _section_title(self, text: str) -> QLabel:
+        label = QLabel(text, self)
+        label.setObjectName("sectionTitle")
+        return label
 
-        self._role_is_owner = self.current_user.role == "owner"
+    def _greeting_text(self) -> str:
+        key = "DASH_GREETING_MORNING" if datetime.now().hour < 12 else "DASH_GREETING_EVENING"
+        return getattr(ar, key).format(name=self.current_user.username)
 
-        # 0. Daily Register Snapshot (Live Cash Box)
-        self.daily_register = DailyRegisterCard(is_owner=self._role_is_owner, parent=body)
-        body_layout.addWidget(self.daily_register)
-
-        # Section 1: Operations & Collection Status
-        sec1_header = QHBoxLayout()
-        sec1_header.setContentsMargins(0, 0, 0, 0)
-        sec1_title = QLabel("📌  حالة العمليات والاقتطاعات", body)
-        sec1_title.setObjectName("sectionTitle")
-        sec1_header.addWidget(sec1_title)
-        sec1_header.addStretch(1)
-
-        sec1_sub = QLabel("تحديث تلقائي مستمر ومباشر", body)
-        sec1_sub.setStyleSheet("color: #64748B; font-size: 11px;")
-        sec1_header.addWidget(sec1_sub)
-        body_layout.addLayout(sec1_header)
-
-        self.top_cards = QGridLayout()
-        self.top_cards.setSpacing(14)
-        self.wholesale_card = StatCard(ar.DASHBOARD_WHOLESALE, color="#06B6D4", subtitle="إجمالي السلع بالخارج بسعر الجملة للأعضاء", parent=body)
-        self.completed_card = StatCard(ar.DASHBOARD_COMPLETED, color="#10B981", subtitle="تم الدفع بالكامل (نقطة خضراء)", parent=body)
-        self.pending_card = StatCard(ar.DASHBOARD_PENDING, color="#F59E0B", subtitle="قيد الانتظار (نقطة برتقالية)", parent=body)
-        self.failed_card = StatCard(ar.DASHBOARD_FAILED, color="#EF4444", subtitle="فات تاريخ الدفع ولم يدفع (نقطة حمراء)", parent=body)
-
-        for column, card in enumerate((self.wholesale_card, self.completed_card,
-                                       self.pending_card, self.failed_card)):
-            self.top_cards.addWidget(card, 0, column)
-        self.wholesale_card.clicked.connect(lambda: self.status_filter_requested.emit(None))
-        self.failed_card.clicked.connect(lambda: self.status_filter_requested.emit("FAILED"))
-        self.completed_card.clicked.connect(lambda: self.status_filter_requested.emit("PAID"))
-        self.pending_card.clicked.connect(lambda: self.status_filter_requested.emit("PENDING"))
-        body_layout.addLayout(self.top_cards)
-
-        # Section 2: Visual Charts & Intelligence (Trend Chart & Radial Gauge)
-        charts_row = QHBoxLayout()
-        charts_row.setContentsMargins(0, 0, 0, 0)
-        charts_row.setSpacing(16)
-
-        self.trend_chart = FinancialTrendChart(parent=body)
-        self.gauge_widget = CollectionGaugeWidget(parent=body)
-
-        charts_row.addWidget(self.trend_chart, 3)
-        charts_row.addWidget(self.gauge_widget, 1)
-        body_layout.addLayout(charts_row)
-
-        # Section 3: Owner Financial Metrics
-        self.owner_metrics = QWidget(body)
-        owner_container_layout = QVBoxLayout(self.owner_metrics)
-        owner_container_layout.setContentsMargins(0, 0, 0, 0)
-        owner_container_layout.setSpacing(14)
-
-        sec2_title = QLabel("💰  المؤشرات المالية والتحصيل", self.owner_metrics)
-        sec2_title.setObjectName("sectionTitle")
-        owner_container_layout.addWidget(sec2_title)
-
-        self.owner_cards = QGridLayout()
-        self.owner_cards.setSpacing(14)
-        self.expected_card = StatCard(ar.DASHBOARD_EXPECTED, color="#3B92D9", parent=self.owner_metrics)
-        self.collected_card = StatCard(ar.DASHBOARD_COLLECTED, color="#22C55E", parent=self.owner_metrics)
-        self.profit_card = StatCard(ar.DASHBOARD_PROFIT, color="#9DBEFF", parent=self.owner_metrics)
-        self.remaining_card = StatCard(ar.DASHBOARD_REMAINING, color="#F59E0B", parent=self.owner_metrics)
-
-        for column, card in enumerate((self.expected_card, self.collected_card,
-                                       self.profit_card, self.remaining_card)):
-            self.owner_cards.addWidget(card, 0, column)
-        owner_container_layout.addLayout(self.owner_cards)
-
-        body_layout.addWidget(self.owner_metrics)
-        body_layout.addStretch(1)
-
-        self.wholesale_card.setVisible(self._role_is_owner)
-        self.owner_metrics.setVisible(self._role_is_owner)
-
+    # ------------------------------------------------------------------ data
     def refresh(self, _selected_date: QDate | None = None) -> None:
-        """Reload summary values after a month or data change."""
+        """Reload figures after a month or data change."""
         selected = self.month_selector.date()
-        with session_scope() as session:
-            summary = get_dashboard_summary(
-                session,
-                year=selected.year(),
-                month=selected.month(),
-                today=date.today(),
-                role=self.current_user.role,
-            )
+        today = date.today()
+        try:
+            with session_scope() as session:
+                summary = get_dashboard_summary(
+                    session,
+                    year=selected.year(),
+                    month=selected.month(),
+                    today=today,
+                    role=self.current_user.role,
+                )
+                alerts = [a for a in collection_alerts(session, today=today) if a.kind != "due_soon"]
+        except Exception:  # noqa: BLE001 - show the last figures rather than crash
+            _LOG.exception("Dashboard refresh failed")
+            return
+        self.greeting.setText(self._greeting_text())
         self._apply_summary(summary)
+        self._apply_attention(alerts)
 
     def _apply_summary(self, summary: DashboardSummary) -> None:
-        """Set card values and visual charts from the service result."""
+        """Set card values and charts from the service result."""
         self.wholesale_card.set_value(summary.total_wholesale or 0, currency=True)
         self.failed_card.set_value(summary.failed_operations)
         self.completed_card.set_value(summary.completed_operations)
@@ -180,16 +296,46 @@ class DashboardPage(QWidget):
         self.collected_card.set_value(summary.collected_this_month, currency=True)
         self.profit_card.set_value(summary.total_profit or 0, currency=True)
         self.remaining_card.set_value(summary.remaining_balance, currency=True)
-
-        # Update visual analytics & live register
+        self.cash_customers_card.set_value(summary.cash_customers)
+        self.facility_customers_card.set_value(summary.facility_customers)
+        self.month_mix_card.set_value(
+            summary.month_cash_sales + summary.month_installment_sales + summary.month_credit_sales
+        )
+        self.month_mix_card.set_subtitle(ar.DASH_MIX_MONTH_CAPTION.format(
+            cash=summary.month_cash_sales,
+            installment=summary.month_installment_sales,
+            credit=summary.month_credit_sales,
+        ))
         self.daily_register.update_metrics(
             collected=summary.today_collected,
             sales_count=summary.today_sales_count,
             profit=summary.today_profit,
         )
-        self.trend_chart.set_data(summary.monthly_trends)
+        selected = self.month_selector.date()
+        labels = trend_labels(selected.year(), selected.month(), len(summary.monthly_trends))
+        self.trend_chart.set_data(
+            [(label, expected, collected)
+             for label, (_name, expected, collected) in zip(labels, summary.monthly_trends)]
+        )
         self.gauge_widget.set_values(
             rate=summary.collection_rate,
             collected=summary.collected_this_month,
             expected=summary.expected_collections,
         )
+
+    def _apply_attention(self, alerts: list[CollectionAlert]) -> None:
+        while self.attention_list.count():
+            item = self.attention_list.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.attention_count.setText(str(len(alerts)))
+        self.attention_count.setVisible(bool(alerts))
+        if not alerts:
+            empty = QLabel(ar.DASH_ATTENTION_EMPTY, self)
+            empty.setObjectName("emptyStateSub")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setMinimumHeight(80)
+            self.attention_list.addWidget(empty)
+            return
+        for alert in alerts[:ATTENTION_LIMIT]:
+            self.attention_list.addWidget(_AttentionRow(alert, self.open_customer_requested.emit, self))

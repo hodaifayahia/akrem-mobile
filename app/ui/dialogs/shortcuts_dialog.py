@@ -42,7 +42,6 @@ class ShortcutsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("اختصارات لوحة المفاتيح")
         self.setFixedSize(580, 520)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
 
     def _build_ui(self) -> None:

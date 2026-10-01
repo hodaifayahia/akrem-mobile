@@ -32,6 +32,11 @@ class DashboardSummary:
     healthy_count: int = 0
     overdue_count: int = 0
     monthly_trends: tuple[tuple[str, int, int], ...] = ()
+    month_cash_sales: int = 0
+    month_installment_sales: int = 0
+    month_credit_sales: int = 0
+    cash_customers: int = 0
+    facility_customers: int = 0
 
 
 _ARABIC_MONTHS = (
@@ -62,6 +67,9 @@ def get_dashboard_summary(
     counts = {Status.FAILED: 0, Status.PAID: 0, Status.PENDING: 0}
     expected = 0
     collected = 0
+    # Only installment and credit payments count toward the collection rate;
+    # cash sales and down payments were never part of "expected".
+    collected_on_schedule = 0
     remaining = 0
 
     today_collected = 0
@@ -76,7 +84,12 @@ def get_dashboard_summary(
         trend_months.append((y, m0 + 1))
     trends_map: dict[tuple[int, int], list[int]] = {ym: [0, 0] for ym in trend_months}
 
+    month_sales_by_type = {"cash": 0, "installment": 0, "credit": 0}
+    customer_types: dict[int, set[str]] = {}
     for sale in sales:
+        customer_types.setdefault(sale.customer_id, set()).add(sale.sale_type)
+        if sale.purchase_date.year == year and sale.purchase_date.month == month:
+            month_sales_by_type[sale.sale_type] = month_sales_by_type.get(sale.sale_type, 0) + 1
         sale_status = for_month(sale.installments, year, month, today, grace_days)
         if sale_status in counts:
             counts[sale_status] += 1
@@ -108,6 +121,7 @@ def get_dashboard_summary(
                     today_collected += payment.amount
                 if payment.payment_date.year == year and payment.payment_date.month == month:
                     collected += payment.amount
+                    collected_on_schedule += payment.amount
                 ym = (payment.payment_date.year, payment.payment_date.month)
                 if ym in trends_map:
                     trends_map[ym][1] += payment.amount
@@ -154,6 +168,7 @@ def get_dashboard_summary(
                     today_collected += payment.amount
                 if payment.payment_date.year == year and payment.payment_date.month == month:
                     collected += payment.amount
+                    collected_on_schedule += payment.amount
                 p_ym = (payment.payment_date.year, payment.payment_date.month)
                 if p_ym in trends_map:
                     trends_map[p_ym][1] += payment.amount
@@ -166,8 +181,8 @@ def get_dashboard_summary(
 
     # Compute collection rate percentage
     if expected > 0:
-        rate_val = min(100, round((collected / expected) * 100))
-    elif collected > 0:
+        rate_val = min(100, round((collected_on_schedule / expected) * 100))
+    elif collected_on_schedule > 0:
         rate_val = 100
     else:
         rate_val = 0
@@ -189,6 +204,11 @@ def get_dashboard_summary(
         healthy_count=counts[Status.PAID],
         overdue_count=counts[Status.FAILED],
         monthly_trends=tuple(trend_points),
+        month_cash_sales=month_sales_by_type["cash"],
+        month_installment_sales=month_sales_by_type["installment"],
+        month_credit_sales=month_sales_by_type["credit"],
+        cash_customers=sum(1 for kinds in customer_types.values() if kinds == {"cash"}),
+        facility_customers=sum(1 for kinds in customer_types.values() if kinds - {"cash"}),
     )
 
 

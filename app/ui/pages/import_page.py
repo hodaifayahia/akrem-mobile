@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -30,56 +31,71 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import select
 
 from app import config
-from app.db.models import Category
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import importer
-from app.services.seed import DEFAULT_CATEGORIES
+from app.services import categories, importer
 from app.ui.events import events
 
-_FIELD_LABELS = {
-    "full_name": ar.IMP_FIELD_FULL_NAME,
-    "product": ar.IMP_FIELD_PRODUCT,
-    "sale_type": ar.IMP_FIELD_SALE_TYPE,
-    "wholesale_price": ar.IMP_FIELD_WHOLESALE,
-    "cash_price": ar.IMP_FIELD_CASH_PRICE,
-    "rate": ar.IMP_FIELD_RATE,
-    "financed": ar.IMP_FIELD_FINANCED,
-    "down_payment": ar.IMP_FIELD_DOWN_PAYMENT,
-    "months": ar.IMP_FIELD_MONTHS,
-    "monthly_amount": ar.IMP_FIELD_MONTHLY,
-    "profit": ar.IMP_FIELD_PROFIT,
-    "purchase_date": ar.IMP_FIELD_PURCHASE_DATE,
-    "end_date": ar.IMP_FIELD_END_DATE,
-}
-_PREVIEW_COLUMNS = (
-    ar.IMP_COLUMN_ROW,
-    ar.IMP_COLUMN_CUSTOMER,
-    ar.IMP_COLUMN_PRODUCT,
-    ar.IMP_COLUMN_TYPE,
-    ar.IMP_COLUMN_WHOLESALE,
-    ar.IMP_COLUMN_CASH,
-    ar.IMP_COLUMN_RATE,
-    ar.IMP_COLUMN_DOWN,
-    ar.IMP_COLUMN_MONTHS,
-    ar.IMP_COLUMN_DATE,
-    ar.IMP_COLUMN_SHEET_FINANCED,
-    ar.IMP_COLUMN_CALC_FINANCED,
-    ar.IMP_COLUMN_SHEET_MONTHLY,
-    ar.IMP_COLUMN_CALC_MONTHLY,
-    ar.IMP_COLUMN_SHEET_PROFIT,
-    ar.IMP_COLUMN_CALC_PROFIT,
-    ar.IMP_COLUMN_STATUS,
-    ar.IMP_COLUMN_SOURCE,
-)
-_SALE_TYPE_CHOICES = (
-    (ar.IMP_TYPE_CASH, "cash"),
-    (ar.IMP_TYPE_INSTALLMENT, "installment"),
-    (ar.IMP_TYPE_CREDIT, "credit"),
-)
+
+def _field_labels() -> dict[str, str]:
+    """Labels in the active language (evaluated at call time)."""
+    return {
+        "full_name": ar.IMP_FIELD_FULL_NAME,
+        "product": ar.IMP_FIELD_PRODUCT,
+        "sale_type": ar.IMP_FIELD_SALE_TYPE,
+        "wholesale_price": ar.IMP_FIELD_WHOLESALE,
+        "cash_price": ar.IMP_FIELD_CASH_PRICE,
+        "rate": ar.IMP_FIELD_RATE,
+        "financed": ar.IMP_FIELD_FINANCED,
+        "down_payment": ar.IMP_FIELD_DOWN_PAYMENT,
+        "months": ar.IMP_FIELD_MONTHS,
+        "monthly_amount": ar.IMP_FIELD_MONTHLY,
+        "profit": ar.IMP_FIELD_PROFIT,
+        "purchase_date": ar.IMP_FIELD_PURCHASE_DATE,
+        "end_date": ar.IMP_FIELD_END_DATE,
+        "phone": ar.IMP_FIELD_PHONE,
+        "client_type": ar.IMP_FIELD_CLIENT_TYPE,
+        "payment_interval": ar.IMP_FIELD_INTERVAL,
+        "color": ar.PROD_TPL_COLOR,
+        "battery": ar.PROD_TPL_BATTERY,
+        "imei": ar.PROD_TPL_IMEI,
+        "reference": ar.PROD_TPL_REF,
+    }
+
+
+def _preview_columns() -> tuple[str, ...]:
+    """Labels in the active language (evaluated at call time)."""
+    return (
+        ar.IMP_COLUMN_ROW,
+        ar.IMP_COLUMN_CUSTOMER,
+        ar.IMP_COLUMN_PRODUCT,
+        ar.IMP_COLUMN_TYPE,
+        ar.IMP_COLUMN_WHOLESALE,
+        ar.IMP_COLUMN_CASH,
+        ar.IMP_COLUMN_RATE,
+        ar.IMP_COLUMN_DOWN,
+        ar.IMP_COLUMN_MONTHS,
+        ar.IMP_COLUMN_DATE,
+        ar.IMP_COLUMN_SHEET_FINANCED,
+        ar.IMP_COLUMN_CALC_FINANCED,
+        ar.IMP_COLUMN_SHEET_MONTHLY,
+        ar.IMP_COLUMN_CALC_MONTHLY,
+        ar.IMP_COLUMN_SHEET_PROFIT,
+        ar.IMP_COLUMN_CALC_PROFIT,
+        ar.IMP_COLUMN_STATUS,
+        ar.IMP_COLUMN_SOURCE,
+    )
+
+
+def _sale_type_choices() -> tuple[tuple[str, str], ...]:
+    """Labels in the active language (evaluated at call time)."""
+    return (
+        (ar.IMP_TYPE_CASH, "cash"),
+        (ar.IMP_TYPE_INSTALLMENT, "installment"),
+        (ar.IMP_TYPE_CREDIT, "credit"),
+    )
 
 
 class ImportPage(QWidget):
@@ -96,7 +112,6 @@ class ImportPage(QWidget):
         self._uncategorized_id: int | None = None
         self._loading_preview = False
 
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         if getattr(current_user, "role", None) != "owner":
             layout = QVBoxLayout(self)
             layout.setContentsMargins(34, 30, 34, 30)
@@ -147,7 +162,6 @@ class ImportPage(QWidget):
         layout.addLayout(sheet_row)
 
         self.mapping_section = QGroupBox(f"⚙️  {ar.IMP_MAPPING_TITLE}", self)
-        self.mapping_section.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         mapping_layout = QVBoxLayout(self.mapping_section)
         mapping_layout.addWidget(QLabel(ar.IMP_MAPPING_HELP, self.mapping_section))
         self.mapping_form = QFormLayout()
@@ -198,8 +212,8 @@ class ImportPage(QWidget):
         self.preview_summary.setStyleSheet("color: #9DBEFF; font-weight: 600; font-size: 13px;")
         layout.addWidget(self.preview_summary)
 
-        self.preview_table = QTableWidget(0, len(_PREVIEW_COLUMNS), self)
-        self.preview_table.setHorizontalHeaderLabels(_PREVIEW_COLUMNS)
+        self.preview_table = QTableWidget(0, len(_preview_columns()), self)
+        self.preview_table.setHorizontalHeaderLabels(_preview_columns())
         self.preview_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.preview_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.preview_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -334,7 +348,7 @@ class ImportPage(QWidget):
                 selected_index = combo.findData(existing_column)
                 if selected_index >= 0:
                     combo.setCurrentIndex(selected_index)
-            label = _FIELD_LABELS[field]
+            label = _field_labels()[field]
             if field in importer.REQUIRED_HEADERS:
                 label += ar.IMP_REQUIRED_MARK
             self.mapping_form.addRow(label, combo)
@@ -447,7 +461,7 @@ class ImportPage(QWidget):
         """Create a per-row selector for missing or unrecognized sale types."""
         combo = QComboBox(self.preview_table)
         combo.addItem(ar.IMP_CHOOSE_TYPE, None)
-        for label, value in _SALE_TYPE_CHOICES:
+        for label, value in _sale_type_choices():
             combo.addItem(label, value)
         selected_type = self._sale_type_overrides.get(source_row)
         if selected_type is not None:
@@ -499,10 +513,9 @@ class ImportPage(QWidget):
 
     def _load_uncategorized_category(self) -> None:
         """Require the existing default uncategorized category before importing."""
-        expected_name = DEFAULT_CATEGORIES[-1]
         try:
             with session_scope() as session:
-                category = session.scalar(select(Category).where(Category.name == expected_name))
+                category = categories.get_fallback_type(session)
                 if category is not None:
                     self._uncategorized_id = category.id
                     self.category_selector.clear()
@@ -553,6 +566,7 @@ class ImportPage(QWidget):
                     uncategorized_id=self._uncategorized_id,
                     mark_past_due_paid=self.mark_past_due.isChecked(),
                     use_sheet_values=set(self._sheet_value_rows),
+                    owner_user_id=int(self.current_user.id),
                 )
         except Exception:
             self.progress.setVisible(False)
@@ -570,7 +584,7 @@ class ImportPage(QWidget):
         events.notify.emit(
             "success",
             ar.IMP_DONE_TITLE,
-            f"تم استيراد {result.imported} سجل بنجاح",
+            ar.IMP_DONE_TOAST.format(count=result.imported),
             5000,
         )
         summary = ar.IMP_DONE_SUMMARY.format(
@@ -599,7 +613,9 @@ class ImportPage(QWidget):
         if path.suffix.casefold() != ".xlsx":
             path = path.with_suffix(".xlsx")
         try:
-            _write_template(path)
+            with session_scope() as session:
+                client_types = [category.name for category in categories.list_client_types(session)]
+            _write_template(path, client_types)
         except Exception:
             self._show_error(ar.IMP_TEMPLATE_ERROR)
             return
@@ -689,39 +705,54 @@ def _sale_type_label(sale_type: str) -> str:
     }.get(sale_type, sale_type)
 
 
-def _write_template(path: Path) -> None:
-    """Create the spreadsheet template and add editable column dropdowns."""
+def _write_template(path: Path, client_types: list[str] | None = None) -> None:
+    """Create the sales sheet template (cash, installment and credit) with dropdowns.
+
+    The required columns are blue; the optional ones (phone, client type,
+    payment interval and the phone's colour, battery, IMEI and REF) are grey.
+    """
+    from app.i18n import is_rtl
+
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = importer.SHEET_NAME[:31]
+    worksheet.sheet_view.rightToLeft = is_rtl()
     fields = tuple(importer.HEADERS)
     headers = [importer.HEADERS[field] for field in fields]
     worksheet.append(headers)
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}500"
-    for column, header in enumerate(headers, start=1):
+    for column, (field, header) in enumerate(zip(fields, headers), start=1):
         cell = worksheet.cell(row=1, column=column)
         cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="0758CD")
+        optional = field in importer.OPTIONAL_HEADERS
+        cell.fill = PatternFill(fill_type="solid", fgColor="5B6577" if optional else "0758CD")
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        if optional:
+            cell.comment = Comment(ar.IMP_TEMPLATE_OPTIONAL_NOTE, "AkremMobile")
         worksheet.column_dimensions[get_column_letter(column)].width = max(
             17, min(34, len(header) + 4)
         )
+    imei_letter = get_column_letter(fields.index("imei") + 1)
+    worksheet.column_dimensions[imei_letter].number_format = "@"
 
-    validations = (
+    list_rules = [
         ("sale_type", ar.IMP_TEMPLATE_TYPES),
-        ("months", ",".join(str(month) for month in range(2, 13))),
         ("rate", "0,5,10,15,20,25,30,35,40,45,50"),
-    )
-    for field, choices in validations:
-        column = fields.index(field) + 1
-        letter = get_column_letter(column)
-        validation = DataValidation(
-            type="list",
-            formula1=f'"{choices}"',
-            allow_blank=True,
-        )
+    ]
+    if client_types:
+        choices = ",".join(name.replace(",", " ") for name in client_types)
+        if len(choices) < 250:  # Excel's limit for an inline list
+            list_rules.append(("client_type", choices))
+    for field, choices in list_rules:
+        letter = get_column_letter(fields.index(field) + 1)
+        validation = DataValidation(type="list", formula1=f'"{choices}"', allow_blank=True)
+        worksheet.add_data_validation(validation)
+        validation.add(f"{letter}2:{letter}500")
+    for field in ("months", "payment_interval"):
+        letter = get_column_letter(fields.index(field) + 1)
+        validation = DataValidation(type="whole", operator="between", formula1="1", formula2="60", allow_blank=True)
         worksheet.add_data_validation(validation)
         validation.add(f"{letter}2:{letter}500")
     workbook.save(path)

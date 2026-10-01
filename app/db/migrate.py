@@ -33,5 +33,15 @@ def upgrade_database(url: str | None = None) -> None:
     ini_path = Path(__file__).with_name("alembic.ini")
     config = Config(str(ini_path))
     config.set_main_option("sqlalchemy.url", (url or database_url()).replace("%", "%%"))
+    config.attributes["configure_logger"] = False
     command.upgrade(config, "head")
 
+
+
+def known_revisions() -> list[str]:
+    """Return this app's migration revision ids, oldest first."""
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(Path(__file__).with_name("alembic.ini")))
+    script = ScriptDirectory.from_config(config)
+    return [revision.revision for revision in reversed(list(script.walk_revisions()))]

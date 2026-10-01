@@ -13,7 +13,6 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -21,47 +20,27 @@ from PySide6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from app.ui.events import events
+from app.ui import icons
+from app.ui.notifications import hub
+from app.ui.theme import token
 
 
 class ToastCard(QFrame):
-    """An individual animated notification card with countdown and pause-on-hover."""
+    """An animated notification card with a countdown that pauses on hover."""
 
     dismissed = Signal(object)
 
+    #: level -> (icon name, accent colour token)
     STYLES = {
-        "success": {
-            "border_color": "#22C55E",
-            "icon_bg": "#0D2E1E",
-            "icon_color": "#4ADE80",
-            "icon": "✓",
-            "bar_color": "#22C55E",
-        },
-        "warning": {
-            "border_color": "#F59E0B",
-            "icon_bg": "#332200",
-            "icon_color": "#FBBF24",
-            "icon": "⚠️",
-            "bar_color": "#F59E0B",
-        },
-        "error": {
-            "border_color": "#EF4444",
-            "icon_bg": "#361014",
-            "icon_color": "#F87171",
-            "icon": "✕",
-            "bar_color": "#EF4444",
-        },
-        "info": {
-            "border_color": "#3B92D9",
-            "icon_bg": "#0F2646",
-            "icon_color": "#9DBEFF",
-            "icon": "ℹ️",
-            "bar_color": "#3B92D9",
-        },
+        "success": ("check-circle", "paid"),
+        "warning": ("alert", "pending"),
+        "error": ("alert", "failed"),
+        "info": ("info", "primary-glow"),
     }
 
     def __init__(
@@ -79,106 +58,78 @@ class ToastCard(QFrame):
         self.duration_ms = max(duration_ms, 1500)
         self.remaining_ms = self.duration_ms
         self.action_callback = action_callback
-
         self.setFixedWidth(380)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setObjectName("toastCard")
+        icon_name, accent_token = self.STYLES[self.level]
+        accent = token(accent_token)
 
-        cfg = self.STYLES[self.level]
-
-        # Layout
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(14, 12, 14, 8)
+        main_layout.setContentsMargins(14, 12, 12, 8)
         main_layout.setSpacing(6)
-
-        # Content row: Icon + Texts + (Action) + Close button
         content_row = QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
         content_row.setSpacing(12)
 
-        # Icon badge
-        icon_label = QLabel(cfg["icon"], self)
-        icon_label.setFixedSize(32, 32)
+        icon_label = QLabel(self)
+        icon_label.setFixedSize(30, 30)
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_label.setStyleSheet(
-            f"background-color: {cfg['icon_bg']}; color: {cfg['icon_color']}; "
-            f"border: 1px solid {cfg['border_color']}; border-radius: 16px; font-weight: 700; font-size: 14px;"
-        )
+        icon_label.setPixmap(icons.pixmap(icon_name, accent_token, 18))
         content_row.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignTop)
 
-        # Text column
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(3)
-
+        text_layout.setSpacing(2)
         title_label = QLabel(title, self)
-        title_label.setStyleSheet("color: #FFFFFF; font-weight: 700; font-size: 13px;")
+        title_label.setObjectName("notificationTitle")
         text_layout.addWidget(title_label)
-
         msg_label = QLabel(message, self)
+        msg_label.setObjectName("notificationBody")
         msg_label.setWordWrap(True)
-        msg_label.setStyleSheet("color: #9DB0C7; font-size: 12px; line-height: 1.3;")
         text_layout.addWidget(msg_label)
-
         if action_text and action_callback:
             action_btn = QPushButton(action_text, self)
+            action_btn.setProperty("variant", "secondary")
+            action_btn.setProperty("compact", True)
             action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            action_btn.setStyleSheet(
-                f"QPushButton {{ background-color: {cfg['icon_bg']}; color: {cfg['icon_color']}; "
-                f"border: 1px solid {cfg['border_color']}; border-radius: 5px; padding: 3px 10px; font-size: 11px; font-weight: 600; }} "
-                f"QPushButton:hover {{ background-color: {cfg['border_color']}; color: #FFFFFF; }}"
-            )
             action_btn.clicked.connect(self._handle_action)
-            text_layout.addWidget(action_btn, 0, Qt.AlignmentFlag.AlignRight)
-
+            text_layout.addWidget(action_btn, 0, Qt.AlignmentFlag.AlignLeading)
         content_row.addLayout(text_layout, 1)
 
-        # Close button
-        close_btn = QPushButton("×", self)
-        close_btn.setFixedSize(22, 22)
+        close_btn = QToolButton(self)
+        close_btn.setObjectName("iconButton")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setIconSize(QSize(12, 12))
+        close_btn.setIcon(icons.icon("close", "text-muted", 12))
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; color: #64748B; font-size: 16px; font-weight: 700; } "
-            "QPushButton:hover { color: #FFFFFF; background: #1E293B; border-radius: 11px; }"
-        )
         close_btn.clicked.connect(self.close_toast)
         content_row.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
-
         main_layout.addLayout(content_row)
 
-        # Countdown Progress bar at the bottom
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setFixedHeight(3)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setRange(0, self.duration_ms)
         self.progress_bar.setValue(self.duration_ms)
         self.progress_bar.setStyleSheet(
-            f"QProgressBar {{ background-color: rgba(255, 255, 255, 0.08); border: none; border-radius: 1px; }} "
-            f"QProgressBar::chunk {{ background-color: {cfg['bar_color']}; border-radius: 1px; }}"
+            "QProgressBar { background-color: rgba(255, 255, 255, 0.06); border: none; "
+            "border-radius: 1px; min-height: 3px; } "
+            f"QProgressBar::chunk {{ background-color: {accent}; border-radius: 1px; }}"
         )
         main_layout.addWidget(self.progress_bar)
 
-        # Style sheet for card body
+        # The accent stripe sits on the reading-start edge (Qt doesn't mirror borders).
+        start_side = "right" if self.isRightToLeft() else "left"
         self.setStyleSheet(
-            f"QFrame#toastCard {{ "
-            f"  background-color: #0E1522; "
-            f"  border: 1px solid #1F2E47; "
-            f"  border-right: 4px solid {cfg['border_color']}; "
-            f"  border-radius: 10px; "
-            f"}}"
+            f"QFrame#toastCard {{ border-{start_side}: 3px solid {accent}; }}"
         )
 
-        # Animation effects
         self.opacity_effect = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self.opacity_effect)
         self.opacity_effect.setOpacity(0.0)
-
-        # Timers
         self.tick_interval_ms = 40
         self.timer = QTimer(self)
         self.timer.setInterval(self.tick_interval_ms)
         self.timer.timeout.connect(self._on_tick)
-
         self._is_closing = False
 
     def enterEvent(self, event) -> None:  # noqa: N802 - Qt event name
@@ -257,13 +208,13 @@ class ToastManager(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.hide()
         self.setGeometry(0, 0, 0, 0)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        # Position at bottom-left in RTL
+        # Toasts stack in the bottom reading-end corner: bottom-left in Arabic,
+        # bottom-right in English/French.
         self.margin_x = 24
         self.margin_y = 24
         self.spacing = 10
 
-        events.notify.connect(self._on_notify_signal)
+        hub.toast_requested.connect(self._on_notify_signal)
         self.parent_window.installEventFilter(self)
 
     def eventFilter(self, watched: object, event) -> bool:  # noqa: N802
@@ -305,7 +256,7 @@ class ToastManager(QWidget):
 
         target_y = self._calculate_toast_y(len(self.toasts) - 1, card_height)
         start_y = target_y + 20
-        target_x = self.margin_x
+        target_x = self._toast_x(card)
 
         start_pos = QPoint(target_x, start_y)
         end_pos = QPoint(target_x, target_y)
@@ -335,7 +286,7 @@ class ToastManager(QWidget):
             card_height = card.height() or card.sizeHint().height()
             accumulated_height += card_height + self.spacing
             target_y = bottom_y - accumulated_height + self.spacing
-            target_x = self.margin_x
+            target_x = self._toast_x(card)
 
             # Animate repositioning
             anim = QPropertyAnimation(card, b"pos", self)
@@ -344,6 +295,12 @@ class ToastManager(QWidget):
             anim.setEndValue(QPoint(target_x, target_y))
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
             anim.start()
+
+    def _toast_x(self, card: ToastCard) -> int:
+        """Return the x position of the reading-end corner."""
+        if self.parent_window.isRightToLeft():
+            return self.margin_x
+        return self.parent_window.width() - card.width() - self.margin_x
 
     def _on_toast_dismissed(self, card: ToastCard) -> None:
         if card in self.toasts:

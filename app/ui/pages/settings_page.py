@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -28,10 +29,10 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import database_url
-from app.db.models import Product, User
+from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, backup, products, settings
+from app.services import auth, backup, calc, settings
 from app.ui.events import events
 
 
@@ -43,12 +44,16 @@ class _UserCredentialsDialog(QDialog):
         *,
         title: str,
         username: str | None = None,
+        with_role: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(410)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.role = QComboBox(self)
+        self.role.addItem(ar.ROLE_SELLER, "seller")
+        self.role.addItem(ar.ROLE_OWNER, "owner")
+        self.role.setVisible(with_role)
         self.username = QLineEdit(self)
         self.username.setText(username or "")
         self.username.setVisible(username is None)
@@ -62,6 +67,8 @@ class _UserCredentialsDialog(QDialog):
         else:
             identity = QLabel(username, self)
             form.addRow(ar.USER_USERNAME, identity)
+        if with_role:
+            form.addRow(ar.USER_ROLE, self.role)
         form.addRow(ar.USER_NEW_PASSWORD, self.password)
         form.addRow(ar.USER_PASSWORD_CONFIRMATION, self.confirmation)
         layout.addLayout(form)
@@ -82,52 +89,6 @@ class _UserCredentialsDialog(QDialog):
         return field
 
 
-class _ProductDialog(QDialog):
-    """Collect a product's name and owner-only wholesale/cash prices."""
-
-    def __init__(
-        self,
-        *,
-        title: str,
-        product: Product | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setMinimumWidth(420)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.name = QLineEdit(self)
-        self.wholesale_price = self._money_input(self)
-        self.cash_price = self._money_input(self)
-        if product is not None:
-            self.name.setText(product.name)
-            self.wholesale_price.setValue(product.wholesale_price)
-            self.cash_price.setValue(product.cash_price)
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        form.addRow(ar.SET_PRODUCT_NAME, self.name)
-        form.addRow(ar.SET_PRODUCT_WHOLESALE, self.wholesale_price)
-        form.addRow(ar.SET_PRODUCT_CASH, self.cash_price)
-        layout.addLayout(form)
-        buttons = QDialogButtonBox(self)
-        self.save_button = buttons.addButton(ar.USER_SAVE, QDialogButtonBox.ButtonRole.AcceptRole)
-        self.save_button.setProperty("variant", "primary")
-        self.cancel_button = buttons.addButton(ar.USER_CANCEL, QDialogButtonBox.ButtonRole.RejectRole)
-        self.cancel_button.setProperty("variant", "secondary")
-        self.save_button.clicked.connect(self.accept)
-        self.cancel_button.clicked.connect(self.reject)
-        layout.addWidget(buttons)
-
-    @staticmethod
-    def _money_input(parent: QWidget) -> QSpinBox:
-        """Create a whole-dinar price control."""
-        editor = QSpinBox(parent)
-        editor.setRange(0, 2_000_000_000)
-        editor.setGroupSeparatorShown(True)
-        return editor
-
-
 class SettingsPage(QWidget):
     """Configure installment rules and accounts, with service-side role checks."""
 
@@ -135,20 +96,16 @@ class SettingsPage(QWidget):
         super().__init__(parent)
         self.current_user = current_user
         self._is_owner = current_user.role == "owner"
-        self._products_by_id: dict[int, Product] = {}
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
         if self._is_owner:
             try:
                 self._load_owner_settings()
-                self._refresh_products()
                 self._refresh_backups()
                 self._refresh_sellers()
             except (auth.AuthorizationError, SQLAlchemyError):
                 self._set_owner_access(False)
         else:
             self.owner_settings_group.hide()
-            self.product_group.hide()
             self.backup_group.hide()
             self.user_group.hide()
             self.owner_access_label.hide()
@@ -179,17 +136,17 @@ class SettingsPage(QWidget):
         self.owner_access_label.setVisible(False)
         body_layout.addWidget(self.owner_access_label)
         self.owner_settings_group = self._build_owner_settings(body)
-        self.product_group = self._build_product_pricebook(body)
         self.backup_group = self._build_backup_section(body)
         self.user_group = self._build_user_management(body)
         if self._is_owner:
             body_layout.addWidget(self.owner_settings_group)
-            body_layout.addWidget(self.product_group)
             body_layout.addWidget(self.backup_group)
             body_layout.addWidget(self.user_group)
 
         self.password_group = self._build_password_section(body)
         body_layout.addWidget(self.password_group)
+        self.security_group = self._build_two_factor_section(body)
+        body_layout.addWidget(self.security_group)
         body_layout.addStretch(1)
 
     def _build_owner_settings(self, parent: QWidget) -> QGroupBox:
@@ -245,77 +202,46 @@ class SettingsPage(QWidget):
         return group
 
     def _build_user_management(self, parent: QWidget) -> QGroupBox:
-        """Create the owner-only seller account list and actions."""
-        group = QGroupBox(f"👥  {ar.USER_MANAGEMENT_TITLE}", parent)
+        """Owner-only list of every account (owners and sellers) and its actions."""
+        group = QGroupBox(ar.USER_MANAGEMENT_TITLE, parent)
         layout = QVBoxLayout(group)
-        self.seller_table = QTableWidget(0, 2, group)
-        self.seller_table.setHorizontalHeaderLabels([ar.USER_USERNAME, ar.SET_USER_STATUS])
+        hint = QLabel(ar.USER_MANAGEMENT_HINT, group)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.seller_table = QTableWidget(0, 4, group)
+        self.seller_table.setHorizontalHeaderLabels(
+            [ar.USER_USERNAME, ar.USER_ROLE, ar.SET_USER_STATUS, ar.TFA_COLUMN]
+        )
         self.seller_table.verticalHeader().setVisible(False)
         self.seller_table.horizontalHeader().setStretchLastSection(True)
         self.seller_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.seller_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.seller_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.seller_table.setMaximumHeight(230)
+        self.seller_table.setMaximumHeight(250)
         self.seller_table.itemSelectionChanged.connect(self._update_seller_actions)
         layout.addWidget(self.seller_table)
 
         actions = QHBoxLayout()
-        self.add_seller_button = QPushButton(f"➕  {ar.USER_ADD_SELLER}", group)
-        self.add_seller_button.setProperty("variant", "primary")
+        self.add_seller_button = QPushButton(ar.USER_ADD, group)
         self.add_seller_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle_seller_button = QPushButton(f"⚠️  {ar.USER_DISABLE}", group)
+        self.toggle_seller_button = QPushButton(ar.USER_DISABLE, group)
         self.toggle_seller_button.setProperty("variant", "warning")
         self.toggle_seller_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.reset_seller_button = QPushButton(f"🔑  {ar.USER_RESET_PASSWORD}", group)
+        self.reset_seller_button = QPushButton(ar.USER_RESET_PASSWORD, group)
         self.reset_seller_button.setProperty("variant", "secondary")
         self.reset_seller_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reset_tfa_button = QPushButton(ar.TFA_RESET, group)
+        self.reset_tfa_button.setProperty("variant", "secondary")
+        self.reset_tfa_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_seller_button.clicked.connect(self._create_seller)
         self.toggle_seller_button.clicked.connect(self._toggle_seller)
         self.reset_seller_button.clicked.connect(self._reset_seller_password)
-        actions.addWidget(self.add_seller_button)
-        actions.addWidget(self.toggle_seller_button)
-        actions.addWidget(self.reset_seller_button)
-        layout.addLayout(actions)
-        return group
-
-    def _build_product_pricebook(self, parent: QWidget) -> QGroupBox:
-        """Create the owner-only product catalog with editable price snapshots."""
-        group = QGroupBox(f"🏷️  {ar.SET_PRICE_BOOK}", parent)
-        layout = QVBoxLayout(group)
-        self.product_table = QTableWidget(0, 4, group)
-        self.product_table.setHorizontalHeaderLabels(
-            [
-                ar.SET_PRODUCT_NAME,
-                ar.SET_PRODUCT_WHOLESALE,
-                ar.SET_PRODUCT_CASH,
-                ar.SET_PRODUCT_ACTIVE,
-            ]
-        )
-        self.product_table.verticalHeader().setVisible(False)
-        self.product_table.horizontalHeader().setStretchLastSection(True)
-        self.product_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.product_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.product_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.product_table.setMaximumHeight(250)
-        self.product_table.itemSelectionChanged.connect(self._update_product_actions)
-        layout.addWidget(self.product_table)
-
-        actions = QHBoxLayout()
-        self.add_product_button = QPushButton(f"➕  {ar.SET_PRODUCT_ADD}", group)
-        self.add_product_button.setProperty("variant", "primary")
-        self.add_product_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.edit_product_button = QPushButton(f"✏️  {ar.SET_PRODUCT_EDIT}", group)
-        self.edit_product_button.setProperty("variant", "secondary")
-        self.edit_product_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle_product_button = QPushButton(f"📦  {ar.SET_PRODUCT_ARCHIVE}", group)
-        self.toggle_product_button.setProperty("variant", "warning")
-        self.toggle_product_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.add_product_button.clicked.connect(self._create_product)
-        self.edit_product_button.clicked.connect(self._edit_product)
-        self.toggle_product_button.clicked.connect(self._toggle_product)
-        actions.addWidget(self.add_product_button)
-        actions.addWidget(self.edit_product_button)
-        actions.addWidget(self.toggle_product_button)
+        self.reset_tfa_button.clicked.connect(self._reset_user_two_factor)
+        for button in (self.add_seller_button, self.toggle_seller_button,
+                       self.reset_seller_button, self.reset_tfa_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
         layout.addLayout(actions)
         return group
 
@@ -340,6 +266,33 @@ class SettingsPage(QWidget):
         status_layout.addWidget(self.backup_auto_badge)
         status_layout.addStretch(1)
         layout.addWidget(status_box)
+
+        folder_row = QHBoxLayout()
+        folder_caption = QLabel(ar.BACKUP_FOLDER, group)
+        folder_caption.setObjectName("fieldLabel")
+        self.backup_folder_label = QLabel(group)
+        self.backup_folder_label.setObjectName("notificationBody")
+        self.backup_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.backup_folder_label.setWordWrap(True)
+        self.change_backup_folder_button = QPushButton(ar.BACKUP_FOLDER_CHANGE, group)
+        self.change_backup_folder_button.setProperty("variant", "secondary")
+        self.change_backup_folder_button.clicked.connect(self._choose_backup_folder)
+        self.default_backup_folder_button = QPushButton(ar.BACKUP_FOLDER_DEFAULT, group)
+        self.default_backup_folder_button.setProperty("variant", "ghost")
+        self.default_backup_folder_button.clicked.connect(lambda: self.set_backup_folder(None))
+        self.open_backup_folder_button = QPushButton(ar.BACKUP_FOLDER_OPEN, group)
+        self.open_backup_folder_button.setProperty("variant", "ghost")
+        self.open_backup_folder_button.clicked.connect(self._open_backup_folder)
+        folder_row.addWidget(folder_caption)
+        folder_row.addWidget(self.backup_folder_label, 1)
+        folder_row.addWidget(self.open_backup_folder_button)
+        folder_row.addWidget(self.default_backup_folder_button)
+        folder_row.addWidget(self.change_backup_folder_button)
+        layout.addLayout(folder_row)
+        folder_hint = QLabel(ar.BACKUP_FOLDER_HINT, group)
+        folder_hint.setObjectName("sectionHint")
+        folder_hint.setWordWrap(True)
+        layout.addWidget(folder_hint)
 
         self.backup_table = QTableWidget(0, 4, group)
         self.backup_table.setHorizontalHeaderLabels(
@@ -402,12 +355,66 @@ class SettingsPage(QWidget):
         layout.addWidget(self.change_password_button, alignment=Qt.AlignmentFlag.AlignLeft)
         return group
 
+    def _build_two_factor_section(self, parent: QWidget) -> QGroupBox:
+        """Google Authenticator two-step verification for the signed-in account."""
+        group = QGroupBox(ar.TFA_SECTION, parent)
+        layout = QVBoxLayout(group)
+        explanation = QLabel(ar.TFA_EXPLANATION, group)
+        explanation.setObjectName("sectionHint")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        row = QHBoxLayout()
+        self.tfa_status = QLabel(group)
+        row.addWidget(self.tfa_status)
+        row.addStretch(1)
+        self.tfa_enable_button = QPushButton(ar.TFA_ENABLE, group)
+        self.tfa_enable_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tfa_enable_button.clicked.connect(self._enable_two_factor)
+        self.tfa_disable_button = QPushButton(ar.TFA_DISABLE, group)
+        self.tfa_disable_button.setProperty("variant", "secondary")
+        self.tfa_disable_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tfa_disable_button.clicked.connect(self._disable_two_factor)
+        row.addWidget(self.tfa_enable_button)
+        row.addWidget(self.tfa_disable_button)
+        layout.addLayout(row)
+        self._refresh_two_factor()
+        return group
+
+    def _refresh_two_factor(self) -> None:
+        with session_scope() as session:
+            user = session.get(User, self.current_user.id)
+            enabled = user is not None and auth.requires_second_factor(user)
+        self.tfa_status.setText(ar.TFA_STATUS_ON if enabled else ar.TFA_STATUS_OFF)
+        self.tfa_status.setProperty("pill", "paid" if enabled else "pending")
+        self.tfa_status.style().unpolish(self.tfa_status)
+        self.tfa_status.style().polish(self.tfa_status)
+        self.tfa_enable_button.setVisible(not enabled)
+        self.tfa_disable_button.setVisible(enabled)
+
+    def _enable_two_factor(self) -> None:
+        from app.ui.dialogs.two_factor_dialog import TwoFactorSetupDialog
+
+        if TwoFactorSetupDialog(self.current_user, self).exec() == QDialog.DialogCode.Accepted:
+            events.notify.emit("success", ar.TFA_SECTION, ar.TFA_ENABLED_DONE, 4000)
+        self._refresh_two_factor()
+        if self._is_owner:
+            self._refresh_sellers()
+
+    def _disable_two_factor(self) -> None:
+        from app.ui.dialogs.two_factor_dialog import TwoFactorDisableDialog
+
+        if TwoFactorDisableDialog(self.current_user, self).exec() == QDialog.DialogCode.Accepted:
+            events.notify.emit("success", ar.TFA_SECTION, ar.TFA_DISABLED_DONE, 4000)
+        self._refresh_two_factor()
+        if self._is_owner:
+            self._refresh_sellers()
+
     def _load_owner_settings(self) -> None:
         """Load protected settings after verifying the current account in DB."""
         with session_scope() as session:
             auth.require_owner(session, self.current_user.id)
             from app.i18n import get_language
-            lang = settings.get_value(session, "language", get_language())
+            lang = get_language()
             due_mode = settings.get_value(session, "due_mode", "first_of_month")
             grace_days = settings.get_value(session, "grace_days", 5)
             inactivity_minutes = settings.get_value(session, "inactivity_minutes", 15)
@@ -448,16 +455,16 @@ class SettingsPage(QWidget):
             self._show_error(ar.SET_SAVE_ERROR)
             return
 
-        from app.i18n import set_language
-        from PySide6.QtCore import QSettings
-        from app.config import APP_NAME
-        QSettings(APP_NAME, APP_NAME).setValue("language", new_lang)
-        set_language(new_lang)
-
         events.data_changed.emit()
         events.settings_changed.emit()
         events.notify.emit("success", ar.SET_TITLE, ar.SET_SAVED, 4000)
-        QMessageBox.information(self, ar.SET_TITLE, ar.SET_SAVED)
+        from app.i18n import get_language
+        if new_lang and new_lang != get_language():
+            # Switching language rebuilds every page, including this one, so
+            # it must be the last thing this slot does.
+            from app.ui.locale import change_language
+
+            change_language(new_lang)
 
     def _read_rate_presets(self) -> dict[int, int]:
         """Read and validate editable months-to-rate rows."""
@@ -470,7 +477,7 @@ class SettingsPage(QWidget):
                 rate = int(rate_item.text().strip()) if rate_item else -1
             except ValueError as error:
                 raise ValueError(ar.SET_RATE_INVALID) from error
-            if not 2 <= months <= 12 or not 0 <= rate <= 50:
+            if not 1 <= months <= calc.MAX_PLAN_MONTHS or not 0 <= rate <= 100:
                 raise ValueError(ar.SET_RATE_INVALID)
             if months in presets:
                 raise ValueError(ar.SET_RATE_DUPLICATE_MONTH)
@@ -493,7 +500,9 @@ class SettingsPage(QWidget):
             for row in range(self.rate_table.rowCount())
             if self.rate_table.item(row, 0) is not None
         }
-        months = next((value for value in range(2, 13) if str(value) not in existing), None)
+        months = next(
+            (value for value in range(1, calc.MAX_PLAN_MONTHS + 1) if str(value) not in existing), None
+        )
         if months is None:
             self._show_error(ar.SET_RATE_INVALID)
             return
@@ -507,39 +516,56 @@ class SettingsPage(QWidget):
             self.rate_table.removeRow(row)
 
     def _refresh_sellers(self) -> None:
-        """Load seller accounts through the owner-guarded service method."""
+        """Load every account through the owner-guarded service method."""
         with session_scope() as session:
             auth.require_owner(session, self.current_user.id)
             users = auth.list_users(session, self.current_user.id)
-        sellers = [user for user in users if user.role == "seller"]
-        self.seller_table.setRowCount(len(sellers))
-        for row, user in enumerate(sellers):
+        self.seller_table.setRowCount(len(users))
+        for row, user in enumerate(users):
             username = QTableWidgetItem(user.username)
             username.setData(Qt.ItemDataRole.UserRole, user.id)
+            username.setData(Qt.ItemDataRole.UserRole + 1, bool(user.disabled))
             self.seller_table.setItem(row, 0, username)
+            role = ar.ROLE_OWNER if user.role == "owner" else ar.ROLE_SELLER
+            self.seller_table.setItem(row, 1, QTableWidgetItem(role))
             state_text = ar.SET_USER_DISABLED if user.disabled else ar.SET_USER_ACTIVE
-            self.seller_table.setItem(row, 1, QTableWidgetItem(state_text))
+            self.seller_table.setItem(row, 2, QTableWidgetItem(state_text))
+            tfa = ar.TFA_ON if auth.requires_second_factor(user) else ar.TFA_OFF
+            self.seller_table.setItem(row, 3, QTableWidgetItem(tfa))
         self._update_seller_actions()
 
-    def _refresh_products(self) -> None:
-        """Load all catalog entries after checking the active owner role."""
-        with session_scope() as session:
-            auth.require_owner(session, self.current_user.id)
-            catalog = products.list_products(session, include_inactive=True)
-        self._products_by_id = {item.id: item for item in catalog}
-        self.product_table.setRowCount(len(catalog))
-        for row, product in enumerate(catalog):
-            name = QTableWidgetItem(product.name)
-            name.setData(Qt.ItemDataRole.UserRole, product.id)
-            self.product_table.setItem(row, 0, name)
-            self.product_table.setItem(row, 1, QTableWidgetItem(self._money(product.wholesale_price)))
-            self.product_table.setItem(row, 2, QTableWidgetItem(self._money(product.cash_price)))
-            state = ar.SET_USER_ACTIVE if product.active else ar.SET_PRODUCT_ARCHIVED
-            self.product_table.setItem(row, 3, QTableWidgetItem(state))
-        self._update_product_actions()
+    def _choose_backup_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, ar.BACKUP_FOLDER_CHANGE, str(backup.backup_directory())
+        )
+        if chosen:
+            self.set_backup_folder(chosen)
+
+    def set_backup_folder(self, folder: str | None) -> bool:
+        """Store where backups go on this PC (``None`` = default folder)."""
+        try:
+            backup.set_backup_directory(folder)
+        except backup.BackupLocationError:
+            self._show_error(ar.BACKUP_FOLDER_ERROR)
+            return False
+        self._refresh_backups()
+        events.notify.emit(
+            "success", ar.SET_BACKUP_SECTION,
+            ar.BACKUP_FOLDER_SAVED.format(path=backup.backup_directory()), 4000,
+        )
+        return True
+
+    def _open_backup_folder(self) -> None:
+        folder = backup.backup_directory()
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _refresh_backups(self) -> None:
         """List local backup files after checking owner access and backend support."""
+        if hasattr(self, "backup_folder_label"):
+            folder = backup.backup_directory()
+            self.backup_folder_label.setText(str(folder))
+            self.default_backup_folder_button.setEnabled(folder != backup.default_backup_directory())
         self._backup_supported = self._supports_local_backups()
         self.create_backup_button.setEnabled(self._backup_supported)
         self.upload_backup_button.setEnabled(self._backup_supported)
@@ -796,117 +822,13 @@ class SettingsPage(QWidget):
         """Display a localized backup operation error."""
         QMessageBox.warning(self, ar.SET_BACKUP_SECTION, message)
 
-    def _selected_product(self) -> Product | None:
-        """Return the selected catalog entry."""
-        row = self.product_table.currentRow()
-        if row < 0:
-            return None
-        item = self.product_table.item(row, 0)
+    def _selected_seller(self) -> tuple[int, bool] | None:
+        """Return the selected account's ID and disabled state."""
+        row = self.seller_table.currentRow()
+        item = self.seller_table.item(row, 0) if row >= 0 else None
         if item is None:
             return None
-        product_id = item.data(Qt.ItemDataRole.UserRole)
-        return self._products_by_id.get(int(product_id))
-
-    def _update_product_actions(self) -> None:
-        """Update product action availability and archive button text."""
-        if not hasattr(self, "edit_product_button"):
-            return
-        product = self._selected_product()
-        self.edit_product_button.setEnabled(product is not None)
-        self.toggle_product_button.setEnabled(product is not None)
-        if product is not None:
-            self.toggle_product_button.setText(
-                ar.SET_PRODUCT_ACTIVATE if not product.active else ar.SET_PRODUCT_ARCHIVE
-            )
-
-    def _create_product(self) -> None:
-        """Create a product after collecting its owner-entered prices."""
-        dialog = _ProductDialog(title=ar.SET_PRODUCT_ADD, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            with session_scope() as session:
-                products.create_product(
-                    session,
-                    self.current_user.id,
-                    name=dialog.name.text(),
-                    wholesale_price=dialog.wholesale_price.value(),
-                    cash_price=dialog.cash_price.value(),
-                )
-        except (ValueError, auth.AuthorizationError, SQLAlchemyError) as error:
-            self._show_error(
-                ar.SET_OWNER_ONLY if isinstance(error, auth.AuthorizationError) else ar.SET_PRODUCT_ERROR
-            )
-            return
-        self._refresh_products()
-        events.data_changed.emit()
-        QMessageBox.information(self, ar.SET_PRICE_BOOK, ar.SET_PRODUCT_SAVED)
-
-    def _edit_product(self) -> None:
-        """Edit the selected catalog name and prices."""
-        product = self._selected_product()
-        if product is None:
-            return
-        dialog = _ProductDialog(title=ar.SET_PRODUCT_EDIT, product=product, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            with session_scope() as session:
-                products.update_product(
-                    session,
-                    self.current_user.id,
-                    product.id,
-                    name=dialog.name.text(),
-                    wholesale_price=dialog.wholesale_price.value(),
-                    cash_price=dialog.cash_price.value(),
-                )
-        except (ValueError, auth.AuthorizationError, SQLAlchemyError) as error:
-            self._show_error(
-                ar.SET_OWNER_ONLY if isinstance(error, auth.AuthorizationError) else ar.SET_PRODUCT_ERROR
-            )
-            return
-        self._refresh_products()
-        events.data_changed.emit()
-        QMessageBox.information(self, ar.SET_PRICE_BOOK, ar.SET_PRODUCT_SAVED)
-
-    def _toggle_product(self) -> None:
-        """Archive or reactivate the selected catalog entry."""
-        product = self._selected_product()
-        if product is None:
-            return
-        try:
-            with session_scope() as session:
-                products.set_product_active(
-                    session,
-                    self.current_user.id,
-                    product.id,
-                    not product.active,
-                )
-        except (ValueError, auth.AuthorizationError, SQLAlchemyError) as error:
-            self._show_error(
-                ar.SET_OWNER_ONLY if isinstance(error, auth.AuthorizationError) else ar.SET_PRODUCT_ERROR
-            )
-            return
-        self._refresh_products()
-        events.data_changed.emit()
-        QMessageBox.information(self, ar.SET_PRICE_BOOK, ar.SET_USER_UPDATED)
-
-    @staticmethod
-    def _money(amount: int) -> str:
-        """Format whole dinars for the owner-visible catalog table."""
-        return f"{amount:,} {ar.CURRENCY_SUFFIX}"
-
-    def _selected_seller(self) -> tuple[int, bool] | None:
-        """Return the selected seller's ID and disabled state."""
-        row = self.seller_table.currentRow()
-        if row < 0:
-            return None
-        username = self.seller_table.item(row, 0)
-        state = self.seller_table.item(row, 1)
-        if username is None or state is None:
-            return None
-        user_id = username.data(Qt.ItemDataRole.UserRole)
-        return int(user_id), state.text() == ar.SET_USER_DISABLED
+        return int(item.data(Qt.ItemDataRole.UserRole)), bool(item.data(Qt.ItemDataRole.UserRole + 1))
 
     def _update_seller_actions(self) -> None:
         """Set seller action labels and availability for the current selection."""
@@ -915,13 +837,14 @@ class SettingsPage(QWidget):
         selected = self._selected_seller()
         self.toggle_seller_button.setEnabled(selected is not None)
         self.reset_seller_button.setEnabled(selected is not None)
+        self.reset_tfa_button.setEnabled(selected is not None)
         if selected is not None:
             _user_id, disabled = selected
             self.toggle_seller_button.setText(ar.USER_ENABLE if disabled else ar.USER_DISABLE)
 
     def _create_seller(self) -> None:
         """Collect a seller username and initial password, then create it."""
-        dialog = _UserCredentialsDialog(title=ar.USER_ADD_SELLER, parent=self)
+        dialog = _UserCredentialsDialog(title=ar.USER_ADD, with_role=True, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         username = dialog.username.text().strip()
@@ -935,12 +858,13 @@ class SettingsPage(QWidget):
             return
         try:
             with session_scope() as session:
-                auth.create_seller(
+                auth.create_user(
                     session,
                     self.current_user.id,
                     username=username,
                     password=password,
                     password_confirmation=confirmation,
+                    role=dialog.role.currentData(),
                 )
         except (ValueError, auth.AuthorizationError, SQLAlchemyError) as error:
             self._show_error(self._localized_error(error))
@@ -1004,6 +928,22 @@ class SettingsPage(QWidget):
         events.data_changed.emit()
         QMessageBox.information(self, ar.USER_MANAGEMENT_TITLE, ar.SET_USER_UPDATED)
 
+    def _reset_user_two_factor(self) -> None:
+        """Owner: remove two-step verification from an account (lost phone)."""
+        selected = self._selected_seller()
+        if selected is None:
+            return
+        user_id, _disabled = selected
+        try:
+            with session_scope() as session:
+                auth.reset_two_factor(session, self.current_user.id, user_id)
+        except (ValueError, auth.AuthorizationError, SQLAlchemyError) as error:
+            self._show_error(self._localized_error(error))
+            return
+        self._refresh_sellers()
+        self._refresh_two_factor()
+        events.notify.emit("success", ar.USER_MANAGEMENT_TITLE, ar.TFA_RESET_DONE, 3500)
+
     def _change_own_password(self) -> None:
         """Change the signed-in user's password through the auth service."""
         current = self.current_password.text()
@@ -1036,7 +976,6 @@ class SettingsPage(QWidget):
     def _set_owner_access(self, allowed: bool) -> None:
         """Hide protected sections when the active account is no longer owner."""
         self.owner_settings_group.setVisible(allowed)
-        self.product_group.setVisible(allowed)
         self.backup_group.setVisible(allowed)
         self.user_group.setVisible(allowed)
         self.owner_access_label.setVisible(not allowed)

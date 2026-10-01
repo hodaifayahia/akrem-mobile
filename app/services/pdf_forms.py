@@ -14,7 +14,8 @@ from PySide6.QtGui import QTextDocument
 from app.config import RESOURCE_DIR
 from app.db.models import Customer, Installment, Payment, Sale
 from app.i18n import ar
-from app.services import schedule
+from app.i18n.plan_text import every_text
+from app.services import calc, schedule
 
 
 def generate_commitment_pdf(
@@ -25,7 +26,7 @@ def generate_commitment_pdf(
     include_sensitive: bool = True,
     logo_path: str | Path | None = None,
 ) -> Path:
-    """Create an A4 commitment form with customer data and twelve schedule rows.
+    """Create an A4 commitment form with customer data and twelve schedule rows (one per payment).
 
     Stored installment rows are authoritative. Missing rows are filled from the
     standard first-of-month schedule. Owner-only wholesale and profit amounts are
@@ -33,8 +34,12 @@ def generate_commitment_pdf(
     """
     if sale.sale_type != "installment":
         raise ValueError("Commitment forms are available for installment sales only")
-    if sale.months is None or sale.months < 1 or sale.months > 12:
-        raise ValueError("Commitment forms support installment plans from 1 to 12 months")
+    try:
+        payment_count = len(calc.payment_offsets(sale.months, sale.payment_interval or 1))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Commitment forms need a valid installment plan") from error
+    if payment_count > 12:
+        raise ValueError("Commitment forms support installment plans of up to 12 payments")
 
     schedule_rows = _commitment_schedule(sale)
     logo_uri = _logo_uri(logo_path)
@@ -179,6 +184,22 @@ def _commitment_schedule(sale: Sale) -> dict[int, tuple[date, int]]:
     return fallback
 
 
+def _product_with_details(sale: Sale) -> str:
+    """Product name plus the phone's colour, battery, IMEI and REF when recorded."""
+    from app.i18n.stock_text import battery_text
+
+    parts = [sale.product]
+    if sale.color:
+        parts.append(sale.color)
+    if sale.is_new or sale.battery_health is not None:
+        parts.append(battery_text(sale.is_new, sale.battery_health))
+    if sale.imei:
+        parts.append(f"IMEI {sale.imei}")
+    if sale.reference:
+        parts.append(sale.reference)
+    return " · ".join(parts)
+
+
 def _commitment_html(
     customer: Customer,
     sale: Sale,
@@ -203,11 +224,13 @@ def _commitment_html(
          _missing(customer.ccp_number)),
     ]
     sale_details: list[tuple[str, str, str, str]] = [
-        (ar.PDF_PRODUCT, sale.product, ar.PDF_SALE_TYPE, _sale_type(sale.sale_type)),
+        (ar.PDF_PRODUCT, _product_with_details(sale), ar.PDF_SALE_TYPE, _sale_type(sale.sale_type)),
         (ar.PDF_CASH_PRICE, _money(sale.cash_price), ar.PDF_RATE, f"{sale.rate}%"),
         (ar.PDF_TOTAL_PRICE, _money(sale.total), ar.PDF_DOWN_PAYMENT, _money(sale.down_payment)),
         (ar.PDF_FINANCED_AMOUNT, _money(sale.financed), ar.PDF_MONTHLY_AMOUNT,
-         _money(sale.monthly_amount)),
+         _money(sale.monthly_amount) + (
+             f" {every_text(sale.payment_interval)}" if (sale.payment_interval or 1) > 1 else ""
+         )),
         (ar.PDF_MONTHS, str(sale.months), ar.PDF_END_DATE, _date(sale.end_date)),
     ]
     if include_sensitive:

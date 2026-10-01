@@ -7,17 +7,19 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
-import unicodedata
 
 from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Category, Customer, Installment, Payment, Sale
-from app.services import calc, customers, sales
+from app.services import calc, customers, products, sales, stock
 from app.services.calc import SaleCalculation
 from app.services.customers import normalize_search_text
 from app.services.payments import lock_payment_ledger
+from app.services.spreadsheet import is_blank as _is_blank
+from app.services.spreadsheet import normalize_header as _normalize_header
+from app.services.spreadsheet import western_digits as _western_digits
 
 SHEET_NAME = "التقسيط"
 HEADERS = {
@@ -34,6 +36,25 @@ HEADERS = {
     "profit": "الفائدة",
     "purchase_date": "تاريخ شراء المنتج",
     "end_date": "تاريخ انتهاء الاقتطاع",
+    # Optional columns (the shop's original sheet does not have them).
+    "phone": "رقم الهاتف",
+    "client_type": "نوع الزبون",
+    "payment_interval": "الدفع كل كم شهر",
+    "color": "اللون",
+    "battery": "البطارية",
+    "imei": "IMEI",
+    "reference": "REF",
+}
+OPTIONAL_HEADERS = ("phone", "client_type", "payment_interval", "color", "battery", "imei", "reference")
+# Other spellings accepted for the optional columns.
+_OPTIONAL_ALIASES: dict[str, tuple[str, ...]] = {
+    "phone": ("الهاتف", "رقم الهاتف", "الجوال", "phone", "telephone", "téléphone", "tel"),
+    "client_type": ("نوع الزبون", "فئة الزبون", "الفئة", "client type", "category", "type de client", "catégorie"),
+    "payment_interval": ("الدفع كل", "الدفع كل كم شهر", "كل كم شهر", "pays every", "every", "tous les"),
+    "color": ("اللون", "color", "colour", "couleur"),
+    "battery": ("البطارية", "battery", "batterie"),
+    "imei": ("imei", "رقم imei"),
+    "reference": ("ref", "réf", "reference", "référence", "المرجع"),
 }
 REQUIRED_HEADERS = (
     "full_name", "product", "sale_type", "wholesale_price", "cash_price",
@@ -66,6 +87,14 @@ class ImportRow:
     calculation: SaleCalculation | None
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    phone: str | None = None
+    client_type: str | None = None
+    payment_interval: int = 1
+    color: str | None = None
+    battery_health: int | None = None
+    is_new: bool = False
+    imei: str | None = None
+    reference: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -152,12 +181,16 @@ def import_preview(
     uncategorized_id: int,
     mark_past_due_paid: bool = True,
     use_sheet_values: set[int] | None = None,
+    owner_user_id: int | None = None,
 ) -> ImportResult:
     """Import valid, nonduplicate rows in the caller's transaction.
 
-    Customers with the same normalized name are merged. Missing spreadsheet
-    phones stay empty and all new customers use the selected uncategorized group.
-    Earlier installment rows are recorded as cash payments when requested.
+    Customers with the same normalized name are merged. A phone or client type
+    column fills those fields (an unknown type falls back to the selected
+    uncategorized group). Each sale is linked to the catalog product with the
+    same name; with ``owner_user_id`` a missing product is added to the
+    catalog. A row with an IMEI or REF of an unsold stock phone sells that
+    phone. Earlier installment rows are recorded as cash payments when requested.
     """
     if preview.missing_columns:
         raise ValueError("Column mapping is incomplete")
@@ -169,6 +202,10 @@ def import_preview(
     customers_by_name = {
         normalize_search_text(row.full_name): row
         for row in session.scalars(select(Customer).order_by(Customer.id))
+    }
+    types_by_name = {
+        normalize_search_text(type_row.name): type_row.id
+        for type_row in session.scalars(select(Category))
     }
     imported_ids: list[int] = []
     duplicate_rows: list[int] = []
@@ -186,10 +223,13 @@ def import_preview(
             customer = customers.create_customer(
                 session,
                 full_name=row.full_name,
-                phone=None,
-                category_id=uncategorized_id,
+                phone=row.phone,
+                category_id=types_by_name.get(normalize_search_text(row.client_type or ""), uncategorized_id),
+                allow_duplicate_phone=True,
             )
             customers_by_name[key] = customer
+        elif row.phone and not customer.phone:
+            customer.phone = row.phone
 
         duplicate = session.scalar(
             select(Sale.id).where(
@@ -204,10 +244,24 @@ def import_preview(
             duplicate_rows.append(row.source_row)
             continue
 
+        product_id = None
+        if owner_user_id is not None:
+            product, _created = products.find_or_create_product(
+                session, owner_user_id, row.product,
+                cash_price=max(row.cash_price or 0, 1), wholesale_price=row.wholesale_price or 0,
+            )
+            product_id = product.id
         sale = sales.create_sale(
             session,
             customer_id=customer.id,
             product=row.product,
+            product_id=product_id,
+            payment_interval=row.payment_interval if row.sale_type == "installment" else 1,
+            color=row.color,
+            battery_health=row.battery_health,
+            is_new=row.is_new,
+            imei=row.imei,
+            reference=row.reference,
             sale_type=row.sale_type or "",
             wholesale_price=row.wholesale_price if row.wholesale_price is not None else -1,
             cash_price=row.cash_price if row.cash_price is not None else -1,
@@ -316,11 +370,18 @@ def _read_xls(path: Path, sheet_name: str) -> tuple[list[list[Any]], str]:
 
 def _detect_mapping(headers: tuple[str, ...]) -> dict[str, int]:
     """Match trimmed Arabic headers, tolerating Arabic spelling variants."""
-    normalized = {_normalize_header(label): index for index, label in enumerate(headers)}
+    normalized: dict[str, int] = {}
+    for index, label in enumerate(headers):
+        normalized.setdefault(_normalize_header(label), index)
     mapping: dict[str, int] = {}
     for field, expected in HEADERS.items():
         match = normalized.get(_normalize_header(expected))
-        if match is not None:
+        if match is None:
+            for alias in _OPTIONAL_ALIASES.get(field, ()):
+                match = normalized.get(_normalize_header(alias))
+                if match is not None:
+                    break
+        if match is not None and match not in mapping.values():
             mapping[field] = match
     return mapping
 
@@ -381,12 +442,68 @@ def _parse_row(excel_row: int, values: Mapping[str, Any], override: str | None) 
             warnings.append("الاقتطاع الشهري في الملف يختلف عن الحساب")
         if sheet_profit is not None and sheet_profit != calculation.profit:
             warnings.append("الفائدة في الملف تختلف عن الحساب")
-    warnings.append("رقم الهاتف غير موجود في ملف Excel")
+    extra = _parse_optional_fields(values, sale_type, months, errors, warnings)
+    if extra["payment_interval"] > 1 and calculation is not None and not errors:
+        try:
+            calculation = calc.compute_sale(
+                cash_price=cash, rate=rate, down_payment=down, months=months, wholesale=wholesale,
+                sale_type=sale_type, purchase_date=purchase_date, interval=extra["payment_interval"],
+            )
+        except (TypeError, ValueError):
+            errors.append("الدفع كل كم شهر أطول من مدة التقسيط")
+            calculation = None
     return ImportRow(
         excel_row, name, product, sale_type, wholesale, cash, rate, down,
         months, purchase_date, sheet_financed, sheet_monthly, sheet_profit,
         calculation, tuple(dict.fromkeys(warnings)), tuple(dict.fromkeys(errors)),
+        **extra,
     )
+
+
+def _parse_optional_fields(
+    values: Mapping[str, Any],
+    sale_type: str | None,
+    months: int | None,
+    errors: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Phone, client type, payment interval and the phone's details, when the sheet has them."""
+    raw_phone = values.get("phone")
+    if isinstance(raw_phone, (int, float)) and not isinstance(raw_phone, bool):
+        # Excel drops the leading zero of a number typed as 0550123456.
+        raw_phone = str(int(raw_phone))
+        raw_phone = "0" + raw_phone if len(raw_phone) == 9 else raw_phone
+    phone = _clean_text(raw_phone)
+    if phone:
+        try:
+            phone = customers.normalize_phone(_western_digits(phone)) or None
+        except ValueError:
+            warnings.append("رقم الهاتف غير صالح؛ سيُترك فارغاً")
+            phone = None
+    else:
+        warnings.append("رقم الهاتف غير موجود في ملف Excel")
+        phone = None
+    interval = _parse_integer(values.get("payment_interval"), "الدفع كل كم شهر", errors, optional=True) or 1
+    if sale_type == "installment" and months and interval > months:
+        errors.append("الدفع كل كم شهر أطول من مدة التقسيط")
+    is_new, health, battery_text = stock.parse_battery(values.get("battery"))
+    if battery_text:
+        warnings.append("قيمة البطارية غير مفهومة")
+    imei_cell = values.get("imei")
+    imei = stock.normalize_imei(imei_cell)
+    if imei is None and not _is_blank(imei_cell):
+        warnings.append("IMEI غير صالح؛ سيُترك فارغاً")
+    color = _clean_text(values.get("color")) or None
+    return {
+        "phone": phone,
+        "client_type": _clean_text(values.get("client_type")) or None,
+        "payment_interval": interval if sale_type == "installment" else 1,
+        "color": color[:60] if color else None,
+        "battery_health": health,
+        "is_new": is_new,
+        "imei": imei,
+        "reference": stock.normalize_reference(values.get("reference")),
+    }
 
 
 def _parse_integer(value: Any, label: str, errors: list[str], *, optional: bool = False) -> int | None:
@@ -437,44 +554,8 @@ def _parse_date(value: Any, errors: list[str]) -> date | None:
     return None
 
 
-def _normalize_header(value: str) -> str:
-    """Normalize an Arabic Excel header for matching and sale type parsing."""
-    result: list[str] = []
-    for char in unicodedata.normalize("NFKD", value).casefold():
-        if unicodedata.category(char).startswith("M") or char == "ـ":
-            continue
-        if char in "أإآٱء":
-            result.append("ا")
-        elif char == "ة":
-            result.append("ه")
-        else:
-            result.append(char)
-    return "".join(result).strip()
-
-
-def _western_digits(value: str) -> str:
-    """Translate Arabic and Persian decimal digits to Western digits."""
-    return "".join(str(unicodedata.digit(char)) if char.isdecimal() else char for char in value)
-
-
 def _clean_text(value: Any) -> str:
     """Return stripped display text or an empty string for blank cells."""
     if _is_blank(value):
         return ""
     return str(value).strip()
-
-
-def _is_blank(value: Any) -> bool:
-    """Treat spreadsheet blanks, NaN, and whitespace-only strings uniformly."""
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return not value.strip()
-    if isinstance(value, Decimal):
-        return value.is_nan()
-    try:
-        if value != value:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return bool(getattr(value, "__class__", None) and value.__class__.__name__ == "NAType")

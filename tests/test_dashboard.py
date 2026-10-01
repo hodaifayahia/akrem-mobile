@@ -5,7 +5,7 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from app.db.models import Category, Installment, Payment, Sale
+from app.db.models import Category, Customer, Installment, Payment, Sale
 from app.db.session import session_scope
 from app.services import repositories
 from app.services.dashboard import get_dashboard_summary
@@ -143,3 +143,32 @@ def test_dashboard_visual_analytics_widgets():
     assert "45,000" in reg.collected_tile[1].text()
     assert "3 عملية" in reg.count_tile[1].text()
 
+
+
+def test_cash_sales_do_not_inflate_the_collection_rate(memory_engine: Engine) -> None:
+    """A cash sale counts as money collected but not toward installment collection."""
+    with session_scope(memory_engine) as session:
+        seed_defaults(session)
+        category = session.scalar(select(Category).where(Category.name == "أساتذة"))
+        customer = Customer(full_name="زبون", category_id=category.id)
+        session.add(customer)
+        session.flush()
+        cash = Sale(
+            customer_id=customer.id, product="Cash phone", sale_type="cash", wholesale_price=10,
+            cash_price=500, total=500, financed=0, profit=490, purchase_date=date(2026, 10, 2),
+        )
+        installment = Sale(
+            customer_id=customer.id, product="Installment phone", sale_type="installment",
+            wholesale_price=10, cash_price=100, total=100, financed=100, months=1,
+            monthly_amount=100, profit=90, purchase_date=date(2026, 9, 2),
+        )
+        session.add_all((cash, installment))
+        session.flush()
+        session.add(Installment(sale_id=installment.id, installment_index=1,
+                                due_date=date(2026, 10, 1), amount_due=100))
+        session.flush()
+        summary = get_dashboard_summary(session, year=2026, month=10, today=date(2026, 10, 3), role="owner")
+        assert summary.collected_this_month == 500
+        assert summary.collection_rate == 0
+        assert summary.month_cash_sales == 1
+        assert summary.cash_customers == 0 and summary.facility_customers == 1

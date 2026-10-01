@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import Setting
+from app.services.calc import MAX_PLAN_MONTHS
 
 DEFAULT_RATE_PRESETS: dict[int, int] = {4: 35, 5: 35, 6: 35, 7: 35, 10: 40, 12: 45}
 
@@ -46,6 +47,27 @@ def get_rate_presets(session: Session) -> dict[int, int]:
             rate_percent = int(rate)
         except (TypeError, ValueError):
             continue
-        if 2 <= month_count <= 12 and 0 <= rate_percent <= 50:
+        if 1 <= month_count <= MAX_PLAN_MONTHS and 0 <= rate_percent <= 100:
             result[month_count] = rate_percent
     return result or DEFAULT_RATE_PRESETS.copy()
+
+
+DEFAULT_GRACE_DAYS = 5
+
+
+def get_grace_days(session: Session) -> int:
+    """Return the owner's grace-days setting, or 5 when missing or invalid.
+
+    Booleans, negative numbers, non-integers, and undecodable JSON all fall
+    back to the documented default.
+    """
+    setting = session.get(Setting, "grace_days")
+    if setting is None:
+        return DEFAULT_GRACE_DAYS
+    try:
+        value = json.loads(setting.value)
+    except (TypeError, json.JSONDecodeError):
+        return DEFAULT_GRACE_DAYS
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_GRACE_DAYS
+    return value

@@ -6,6 +6,7 @@ from datetime import date
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDateEdit,
     QFileDialog,
     QFrame,
@@ -33,7 +34,6 @@ class ReportsPage(QWidget):
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.current_user = current_user
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -68,7 +68,6 @@ class ReportsPage(QWidget):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         cards_widget = QWidget(scroll)
-        cards_widget.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         cards_layout = QVBoxLayout(cards_widget)
         cards_layout.setContentsMargins(0, 0, 0, 0)
         cards_layout.setSpacing(16)
@@ -117,11 +116,26 @@ class ReportsPage(QWidget):
         self.profit_card.layout().addWidget(self.profit_button, alignment=Qt.AlignmentFlag.AlignLeft)
         cards_layout.addWidget(self.profit_card)
 
+        # Card 4: Owner full data export (every table in one workbook)
+        self.full_export_card = self._build_report_card(
+            icon="🗂️",
+            title=ar.REPORT_FULL_TITLE,
+            description=ar.REPORT_FULL_DESC,
+            accent_color="#9DBEFF",
+        )
+        self.full_export_button = QPushButton(ar.REPORT_EXPORT_FULL, self.full_export_card)
+        self.full_export_button.setProperty("variant", "secondary")
+        self.full_export_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.full_export_button.clicked.connect(self._export_everything)
+        self.full_export_card.layout().addWidget(self.full_export_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        cards_layout.addWidget(self.full_export_card)
+
         cards_layout.addStretch(1)
 
         is_owner = self.current_user.role == "owner"
         self.profit_card.setVisible(is_owner)
         self.profit_button.setVisible(is_owner)
+        self.full_export_card.setVisible(is_owner)
 
     @staticmethod
     def _build_report_card(icon: str, title: str, description: str, accent_color: str) -> QFrame:
@@ -132,7 +146,7 @@ class ReportsPage(QWidget):
             f"QFrame#reportCard {{"
             f"  background-color: #0E141D;"
             f"  border: 1px solid #1F2A3D;"
-            f"  border-right: 3px solid {accent_color};"
+            f"  border-{'right' if QApplication.isRightToLeft() else 'left'}: 3px solid {accent_color};"
             f"  border-radius: 12px;"
             f"  padding: 18px 22px;"
             f"}}"
@@ -221,6 +235,31 @@ class ReportsPage(QWidget):
             self._show_error()
             return
         self._show_success()
+
+    def _export_everything(self) -> None:
+        """Owner-only workbook with every customer, sale, installment and payment."""
+        if self.current_user.role != "owner":
+            return
+        exports = data_dir() / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self, ar.REPORT_FULL_TITLE, str(exports / ar.REPORT_FULL_FILENAME), "Excel (*.xlsx)"
+        )
+        if path:
+            self.export_everything_to(path)
+
+    def export_everything_to(self, destination: str) -> bool:
+        """Write the full data workbook to ``destination``; returns success."""
+        try:
+            with session_scope() as session:
+                reports.export_full_workbook(
+                    session, destination, owner_user_id=int(self.current_user.id)
+                )
+        except (ValueError, PermissionError, RuntimeError, OSError, SQLAlchemyError):
+            self._show_error()
+            return False
+        self._show_success()
+        return True
 
     def _choose_destination(self, title: str) -> str | None:
         """Ask for an export path, defaulting to the application's export folder."""

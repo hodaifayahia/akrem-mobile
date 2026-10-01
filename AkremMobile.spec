@@ -1,4 +1,6 @@
 # PyInstaller one-folder build; run on a Windows machine with the project venv active.
+# UPX stays off: compressing Qt's DLLs and plugins can break the windowed app
+# (unresponsive or crashing windows) and makes antivirus software flag it.
 from pathlib import Path
 
 import psycopg  # Ensure psycopg is initialized before collecting psycopg-binary files.
@@ -25,7 +27,7 @@ a = Analysis(
         + collect_submodules("psycopg")
         + collect_submodules("sqlalchemy.dialects.sqlite")
         + collect_submodules("sqlalchemy.dialects.postgresql")
-        + ["logging.config", "logging.handlers", "psycopg_binary._uuid", "xlrd"]
+        + ["logging.config", "logging.handlers", "psycopg_binary._uuid", "xlrd", "PySide6.QtTest"]
     ),
     hookspath=[],
     hooksconfig={},
@@ -45,7 +47,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     icon=str(icon_path) if icon_path.exists() else None,
     disable_windowed_traceback=False,
@@ -59,7 +61,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="AkremMobile",
 )

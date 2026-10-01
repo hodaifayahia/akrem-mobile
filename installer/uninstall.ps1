@@ -4,8 +4,11 @@ $currentDirectory = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
 if (-not [string]::Equals($currentDirectory, $expectedDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to remove an unexpected directory: $currentDirectory"
 }
-if (Get-Process -Name "AkremMobile" -ErrorAction SilentlyContinue) {
-    throw "Close AkremMobile before uninstalling it."
+# The app may still be running hidden in the tray: stop it so its files can be removed.
+$running = Get-Process -Name "AkremMobile" -ErrorAction SilentlyContinue
+if ($running) {
+    $running | Stop-Process -Force
+    Start-Sleep -Milliseconds 800
 }
 
 $startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AkremMobile.lnk"

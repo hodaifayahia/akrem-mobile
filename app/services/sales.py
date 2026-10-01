@@ -10,9 +10,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Customer, Installment, Payment, Sale, Setting, User
-from app.services import auth, products as product_service
-from app.services import calc, repositories, schedule
+from app.db.models import Customer, Installment, Payment, Sale, Setting, StockItem, User
+from app.services import auth, customers as customer_service, products as product_service
+from app.services import calc, repositories, schedule, stock
 
 _SALE_FIELDS = {
     "customer_id",
@@ -23,15 +23,23 @@ _SALE_FIELDS = {
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
     "purchase_date",
     "expected_pay_date",
+    "color",
+    "battery_health",
+    "is_new",
+    "imei",
+    "reference",
 }
+_DETAIL_FIELDS = ("color", "battery_health", "is_new", "imei", "reference")
 _SCHEDULE_FIELDS = {
     "sale_type",
     "cash_price",
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
     "purchase_date",
 }
 _PRICING_FIELDS = {
@@ -40,6 +48,7 @@ _PRICING_FIELDS = {
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
 }
 _DEFAULT_SCHEDULE_SETTINGS: dict[str, object] = {
     "due_mode": "first_of_month",
@@ -60,20 +69,94 @@ def create_sale_for_user(
     user = session.get(User, user_id)
     if user is None or user.disabled:
         raise auth.AuthorizationError("An active account is required")
+    unit = _requested_unit(session, sale_values.get("stock_item_id"))
     if user.role == "owner":
         auth.require_owner(session, user_id)
+        if unit is not None:
+            sale_values["product"] = unit.product.name
+            sale_values["product_id"] = unit.product_id
+        elif sale_values.get("product_id") is None and str(sale_values.get("product", "")).strip():
+            # "Connect" the product: reuse the catalog entry with this name or add it.
+            catalog_product, _created = product_service.find_or_create_product(
+                session, user_id, str(sale_values["product"]),
+                cash_price=max(int(sale_values.get("cash_price") or 0), 1),
+                wholesale_price=max(int(sale_values.get("wholesale_price") or 0), 0),
+            )
+            sale_values["product"] = catalog_product.name
+            sale_values["product_id"] = catalog_product.id
     elif user.role == "seller":
         auth.require_seller(session, user_id)
-        catalog_product = product_service.find_active_product(
-            session, str(sale_values.get("product", ""))
-        )
-        if catalog_product is None:
-            raise auth.AuthorizationError("A seller must choose an active catalog product")
-        sale_values["wholesale_price"] = catalog_product.wholesale_price
-        sale_values["cash_price"] = catalog_product.cash_price
+        if unit is not None:
+            # A phone from stock is sold at its own price.
+            sale_values["product"] = unit.product.name
+            sale_values["product_id"] = unit.product_id
+            sale_values["wholesale_price"] = unit.wholesale_price
+            sale_values["cash_price"] = unit.cash_price
+        else:
+            catalog_product = product_service.find_active_product(
+                session, str(sale_values.get("product", ""))
+            ) or product_service.find_by_name(session, str(sale_values.get("product", "")))
+            if catalog_product is None or not catalog_product.active:
+                raise auth.AuthorizationError("A seller must choose an active catalog product")
+            sale_values["product"] = catalog_product.name
+            sale_values["product_id"] = catalog_product.id
+            sale_values["wholesale_price"] = catalog_product.wholesale_price
+            sale_values["cash_price"] = catalog_product.cash_price
     else:
         raise auth.AuthorizationError("Unsupported account role")
     return create_sale(session, **sale_values)
+
+
+def _requested_unit(session: Session, stock_item_id: Any) -> StockItem | None:
+    """The stock unit a sale asks for, which must still be available."""
+    if stock_item_id is None:
+        return None
+    unit = session.get(StockItem, stock_item_id)
+    if unit is None:
+        raise ValueError("Stock unit not found")
+    if unit.status != stock.STATUS_AVAILABLE:
+        raise stock.StockError("sold", "This unit was already sold")
+    return unit
+
+
+def create_customer_with_sale(
+    session: Session,
+    user_id: int,
+    *,
+    customer: Mapping[str, Any],
+    sale: Mapping[str, Any],
+    allow_duplicate_phone: bool = False,
+) -> tuple[Customer, Sale]:
+    """Create a new customer and their first sale together, or neither.
+
+    ``customer`` holds ``customers.create_customer`` keyword arguments and
+    ``sale`` holds ``create_sale`` keyword arguments without ``customer_id``.
+    Sellers get catalog prices exactly as in ``create_sale_for_user``. Any
+    failure, including ``DuplicateCustomerPhoneError``, rolls back the customer.
+    """
+    _require_sale_operator(session, user_id)
+    customer_values = dict(customer)
+    sale_values = dict(sale)
+    if "customer_id" in sale_values:
+        raise ValueError("Sale values cannot include a customer_id")
+    if "allow_duplicate_phone" in customer_values:
+        raise ValueError("Pass allow_duplicate_phone as its own argument")
+    with session.begin_nested():
+        new_customer = customer_service.create_customer(
+            session, allow_duplicate_phone=allow_duplicate_phone, **customer_values
+        )
+        new_sale = create_sale_for_user(
+            session, user_id, customer_id=new_customer.id, **sale_values
+        )
+    return new_customer, new_sale
+
+
+def _require_sale_operator(session: Session, user_id: int) -> User:
+    """Return an active owner or seller allowed to record sales."""
+    user = session.get(User, user_id)
+    if user is None or user.disabled or user.role not in ("owner", "seller"):
+        raise auth.AuthorizationError("An active account is required")
+    return user
 
 
 def update_sale_for_user(
@@ -101,13 +184,27 @@ def create_sale(
     purchase_date: date | None = None,
     expected_pay_date: date | None = None,
     settings: Mapping[str, object] | None = None,
+    payment_interval: int = 1,
+    product_id: int | None = None,
+    stock_item_id: int | None = None,
+    color: str | None = None,
+    battery_health: int | None = None,
+    is_new: bool = False,
+    imei: str | None = None,
+    reference: str | None = None,
 ) -> Sale:
     """Calculate and save a sale with its schedule as one session transaction.
 
     The caller owns the outer session commit. A nested transaction keeps the sale
     and generated installment rows together if calculation or persistence fails.
     Cash and credit sales have no installment rows; ``expected_pay_date`` is only
-    accepted for credit sales.
+    accepted for credit sales. ``payment_interval`` is the number of months
+    between installment payments (1 = monthly) and must be 1 for cash/credit.
+
+    The phone's details (colour, battery, IMEI, REF) are stored on the sale.
+    ``stock_item_id`` sells that stock unit; otherwise an unsold unit with the
+    same IMEI or REF is assigned automatically. Without ``product_id`` the
+    sale is linked to the catalog product of the same name when one exists.
     """
     if session.get(Customer, customer_id) is None:
         raise ValueError("Customer not found")
@@ -121,9 +218,19 @@ def create_sale(
         rate=rate,
         down_payment=down_payment,
         months=months,
+        payment_interval=payment_interval,
         purchase_date=purchase_date,
         expected_pay_date=expected_pay_date,
+        color=color,
+        battery_health=battery_health,
+        is_new=is_new,
+        imei=imei,
+        reference=reference,
     )
+    if product_id is None:
+        linked = product_service.find_by_name(session, values["product"])
+        product_id = linked.id if linked is not None else None
+    unit = _requested_unit(session, stock_item_id)
     result = calc.compute_sale(
         cash_price=values["cash_price"],
         rate=values["rate"],
@@ -132,6 +239,7 @@ def create_sale(
         wholesale=values["wholesale_price"],
         sale_type=values["sale_type"],
         purchase_date=values["purchase_date"],
+        interval=values["payment_interval"],
     )
     resolved_settings = _schedule_settings(session, settings)
     with session.begin_nested():
@@ -145,6 +253,7 @@ def create_sale(
             rate=values["rate"],
             down_payment=values["down_payment"],
             months=values["months"],
+            payment_interval=values["payment_interval"],
             total=result.total,
             financed=result.financed,
             monthly_amount=result.monthly_list[0] if result.monthly_list else None,
@@ -152,8 +261,14 @@ def create_sale(
             purchase_date=values["purchase_date"],
             end_date=result.end_date,
             expected_pay_date=values["expected_pay_date"],
+            product_id=product_id,
+            **{field: values[field] for field in _DETAIL_FIELDS},
         )
         _insert_schedule(session, sale, resolved_settings)
+        if unit is None and (values["imei"] or values["reference"]):
+            unit = stock.find_available_unit(session, imei=values["imei"], reference=values["reference"])
+        if unit is not None:
+            stock.mark_sold(session, unit, sale)
         session.flush()
     return sale
 
@@ -196,8 +311,10 @@ def update_sale(
         "rate": sale.rate,
         "down_payment": sale.down_payment,
         "months": sale.months,
+        "payment_interval": sale.payment_interval,
         "purchase_date": sale.purchase_date,
         "expected_pay_date": sale.expected_pay_date,
+        **{field: getattr(sale, field) for field in _DETAIL_FIELDS},
     }
     values.update(changes)
     values = _validated_values(**values)
@@ -230,6 +347,7 @@ def update_sale(
             wholesale=values["wholesale_price"],
             sale_type=values["sale_type"],
             purchase_date=values["purchase_date"],
+            interval=values["payment_interval"],
         )
         if calculation_changed
         else None
@@ -315,6 +433,12 @@ def _validated_values(
     months: int | None,
     purchase_date: date,
     expected_pay_date: date | None,
+    payment_interval: int = 1,
+    color: str | None = None,
+    battery_health: int | None = None,
+    is_new: bool = False,
+    imei: str | None = None,
+    reference: str | None = None,
 ) -> dict[str, Any]:
     """Normalize form values and reject invalid sale type/date combinations."""
     clean_product = product.strip()
@@ -328,6 +452,14 @@ def _validated_values(
         raise ValueError("Cash sales cannot have a rate, down payment, or installment months")
     if sale_type == "credit" and months is not None:
         raise ValueError("Credit sales do not have installment months")
+    if sale_type != "installment":
+        payment_interval = 1  # only installment plans have a payment rhythm
+    elif isinstance(payment_interval, bool) or not isinstance(payment_interval, int):
+        raise ValueError("Payment interval must be a whole number of months")
+    if sale_type == "installment":
+        if months is None:
+            raise ValueError("Installment sales require months")
+        calc.validate_plan(months, payment_interval)
     if not isinstance(purchase_date, date):
         raise ValueError("Purchase date is required")
     for field, value in (
@@ -347,8 +479,26 @@ def _validated_values(
         "rate": rate,
         "down_payment": down_payment,
         "months": months,
+        "payment_interval": payment_interval,
         "purchase_date": purchase_date,
         "expected_pay_date": expected_pay_date,
+        **_detail_values(color, battery_health, is_new, imei, reference),
+    }
+
+
+def _detail_values(
+    color: str | None, battery_health: int | None, is_new: bool, imei: str | None, reference: str | None
+) -> dict[str, Any]:
+    """Validated phone details for a sale (IMEI digits, battery 0-100, trimmed text)."""
+    details = stock.UnitDetails(
+        color=color, battery_health=battery_health, is_new=bool(is_new), imei=imei, reference=reference,
+    ).cleaned()
+    return {
+        "color": details.color,
+        "battery_health": details.battery_health,
+        "is_new": details.is_new,
+        "imei": details.imei,
+        "reference": details.reference,
     }
 
 

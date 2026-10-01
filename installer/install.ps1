@@ -6,8 +6,12 @@ $uninstaller = Join-Path $installDirectory "uninstall.ps1"
 $appExecutable = Join-Path $installDirectory "AkremMobile.exe"
 $uninstallKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AkremMobile"
 
-if (Get-Process -Name "AkremMobile" -ErrorAction SilentlyContinue) {
-    throw "Close AkremMobile before installing or updating it."
+# A copy hidden in the tray would keep the old files in use and answer the
+# new shortcut with a stale, unresponsive window: stop it first.
+$running = Get-Process -Name "AkremMobile" -ErrorAction SilentlyContinue
+if ($running) {
+    $running | Stop-Process -Force
+    Start-Sleep -Milliseconds 800
 }
 if (-not (Test-Path -LiteralPath $payloadArchive)) {
     throw "Installer payload not found: $payloadArchive"

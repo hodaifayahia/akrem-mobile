@@ -12,13 +12,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import User
+from app.services import two_factor
 
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION = timedelta(minutes=5)
 MIN_PASSWORD_LENGTH = 6
 MAX_BCRYPT_PASSWORD_BYTES = 72
 
-AuthStatus = Literal["success", "invalid_credentials", "locked", "disabled"]
+AuthStatus = Literal["success", "invalid_credentials", "locked", "disabled", "invalid_code"]
 Role = Literal["owner", "seller"]
 
 
@@ -109,6 +110,11 @@ def authenticate(
 
     Expected failures are returned as statuses instead of raised exceptions so a
     surrounding ``session_scope`` can commit the failed-attempt counter.
+
+    A ``"success"`` for an account where ``requires_second_factor`` is true only
+    proves the password: the caller must then call ``verify_second_factor``.
+    For such accounts the failed-attempt counter is not reset here, so a known
+    password cannot be replayed to get unlimited verification-code guesses.
     """
     clean_username = username.strip() if isinstance(username, str) else ""
     current_time = _utc(now or datetime.now(timezone.utc))
@@ -132,21 +138,28 @@ def authenticate(
         user.locked_until = None
 
     if verify_password(password, user.password_hash):
-        user.failed_attempts = 0
-        user.locked_until = None
-        user.last_activity_at = current_time
+        if not requires_second_factor(user):
+            user.failed_attempts = 0
+            user.locked_until = None
+            user.last_activity_at = current_time
         session.flush()
         return LoginResult("success", user)
 
+    if _record_failed_attempt(user, current_time):
+        session.flush()
+        return LoginResult("locked")
+    session.flush()
+    return LoginResult("invalid_credentials")
+
+
+def _record_failed_attempt(user: User, current_time: datetime) -> bool:
+    """Count one failed password or code attempt; return True when it starts a lockout."""
     user.failed_attempts += 1
     if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
         user.failed_attempts = MAX_FAILED_ATTEMPTS
         user.locked_until = current_time + LOCKOUT_DURATION
-        session.flush()
-        return LoginResult("locked")
-
-    session.flush()
-    return LoginResult("invalid_credentials")
+        return True
+    return False
 
 
 def change_password(
@@ -210,13 +223,35 @@ def create_seller(
     password_confirmation: str,
 ) -> User:
     """Create an enabled seller account; only an active owner may do so."""
+    return create_user(
+        session,
+        owner_user_id,
+        username=username,
+        password=password,
+        password_confirmation=password_confirmation,
+        role="seller",
+    )
+
+
+def create_user(
+    session: Session,
+    owner_user_id: int,
+    *,
+    username: str,
+    password: str,
+    password_confirmation: str,
+    role: Role,
+) -> User:
+    """Create an enabled owner or seller account; only an active owner may do so."""
     require_owner(session, owner_user_id)
+    if role not in ("owner", "seller"):
+        raise ValueError(f"Unsupported role: {role}")
     clean_username = _validate_username(username)
     _validate_password(password, password_confirmation)
     user = User(
         username=clean_username,
         password_hash=hash_password(password),
-        role="seller",
+        role=role,
         disabled=False,
     )
     try:
@@ -298,6 +333,130 @@ def reset_password(
     target.locked_until = None
     session.flush()
     return target
+
+
+def requires_second_factor(user: User) -> bool:
+    """Return whether this active account must pass a TOTP code after its password."""
+    return bool(user.totp_enabled and user.totp_secret and not user.disabled)
+
+
+def start_two_factor_setup(session: Session, user_id: int) -> str:
+    """Store a new pending TOTP secret for an active user and return it.
+
+    Two-step verification stays off (also for an account that had it enabled)
+    until ``confirm_two_factor_setup`` accepts a code from the new secret.
+    """
+    user = _active_user(session, user_id)
+    secret = two_factor.generate_secret()
+    user.totp_secret = secret
+    user.totp_enabled = False
+    user.totp_last_counter = None
+    session.flush()
+    return secret
+
+
+def confirm_two_factor_setup(
+    session: Session,
+    user_id: int,
+    code: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Enable two-step verification once a code from the pending secret is correct."""
+    user = _active_user(session, user_id)
+    if not user.totp_secret:
+        raise ValueError("Two-step verification setup has not been started")
+    if user.totp_enabled:
+        raise ValueError("Two-step verification is already enabled")
+    current_time = _utc(now or datetime.now(timezone.utc))
+    counter = two_factor.matching_counter(user.totp_secret, code, current_time)
+    if counter is None:
+        raise ValueError("Invalid verification code")
+    user.totp_enabled = True
+    user.totp_last_counter = counter
+    session.flush()
+
+
+def disable_two_factor(session: Session, user_id: int, *, password: str) -> None:
+    """Turn off the user's own two-step verification after re-checking the password."""
+    user = _active_user(session, user_id)
+    if not verify_password(password, user.password_hash):
+        raise ValueError("Current password is incorrect")
+    _clear_two_factor(user)
+    session.flush()
+
+
+def reset_two_factor(session: Session, owner_user_id: int, target_user_id: int) -> User:
+    """Clear another account's two-step verification (for a lost phone); owner only."""
+    require_owner(session, owner_user_id)
+    target = session.get(User, target_user_id)
+    if target is None:
+        raise ValueError("User not found")
+    _clear_two_factor(target)
+    session.flush()
+    return target
+
+
+def verify_second_factor(
+    session: Session,
+    user_id: int,
+    code: str,
+    *,
+    now: datetime | None = None,
+) -> LoginResult:
+    """Check the login verification code that follows a successful password.
+
+    A code is accepted once: its time step must be newer than the last accepted
+    one. Wrong or replayed codes share the password lockout counter.
+    """
+    current_time = _utc(now or datetime.now(timezone.utc))
+    user = session.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if user is None:
+        return LoginResult("invalid_credentials")
+    if user.disabled:
+        return LoginResult("disabled")
+    if user.locked_until is not None:
+        if _utc(user.locked_until) > current_time:
+            return LoginResult("locked")
+        user.failed_attempts = 0
+        user.locked_until = None
+    if not requires_second_factor(user):
+        session.flush()
+        return LoginResult("invalid_code")
+
+    counter = two_factor.matching_counter(user.totp_secret or "", code, current_time)
+    last_counter = user.totp_last_counter
+    if counter is not None and (last_counter is None or counter > last_counter):
+        user.totp_last_counter = counter
+        user.failed_attempts = 0
+        user.locked_until = None
+        user.last_activity_at = current_time
+        session.flush()
+        return LoginResult("success", user)
+
+    locked = _record_failed_attempt(user, current_time)
+    session.flush()
+    return LoginResult("locked" if locked else "invalid_code")
+
+
+def _active_user(session: Session, user_id: int) -> User:
+    """Return an enabled account or raise an authorization error."""
+    user = session.get(User, user_id)
+    if user is None or user.disabled:
+        raise AuthorizationError("User account is unavailable")
+    return user
+
+
+def _clear_two_factor(user: User) -> None:
+    """Remove the TOTP secret, enabled flag, and replay counter."""
+    user.totp_secret = None
+    user.totp_enabled = False
+    user.totp_last_counter = None
 
 
 def _validate_username(username: str) -> str:
