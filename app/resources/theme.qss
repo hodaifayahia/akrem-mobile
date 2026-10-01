@@ -65,9 +65,9 @@ QLabel#textWarning { color: @pending; font-weight: 700; }
 QLabel#wordmark {
     color: @text;
     font-family: "Rajdhani", "Cairo", sans-serif;
-    font-size: 22px;
+    font-size: 17px;
     font-weight: 700;
-    letter-spacing: 1px;
+    letter-spacing: 0.5px;
 }
 
 QLabel#wordmarkSub {
