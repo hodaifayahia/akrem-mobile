@@ -33,6 +33,7 @@ def upgrade_database(url: str | None = None) -> None:
     ini_path = Path(__file__).with_name("alembic.ini")
     config = Config(str(ini_path))
     config.set_main_option("sqlalchemy.url", (url or database_url()).replace("%", "%%"))
+    config.attributes["configure_logger"] = False
     command.upgrade(config, "head")
 
 

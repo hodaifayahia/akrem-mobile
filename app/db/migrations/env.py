@@ -10,7 +10,10 @@ from sqlalchemy import create_engine, event, pool, text
 from app.db.models import Base
 
 config = context.config
-if config.config_file_name:
+# The app configures logging itself (to a file). Re-running fileConfig here
+# would replace its handlers with a console handler, and a windowed Windows
+# build has no console, so the app's log would silently stop after start-up.
+if config.config_file_name and config.attributes.get("configure_logger", True):
     try:
         fileConfig(config.config_file_name, disable_existing_loggers=False)
     except Exception:

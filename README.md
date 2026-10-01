@@ -47,11 +47,20 @@ On first launch, the application runs database migrations, seeds the default cat
 
     python -m app.main
 
-## Build a Windows distribution
+## Build the Windows installer
 
-Build on Windows from the project folder after installing the requirements:
+On a Windows PC with Python 3.12, double-click `build_installer.bat` (or run `.\build_installer.ps1` in PowerShell). The one script does everything:
 
-    .\scripts\build_windows.ps1
+1. creates/updates the build environment `.venv-build` and installs `requirements.txt`;
+2. runs the test suite (`-SkipTests` to skip);
+3. builds the app with PyInstaller (`AkremMobile.spec`, UPX off) and a portable ZIP;
+4. runs the packaged app's self-test (`AkremMobile.exe --self-test report.json`): it migrates a throw-away database, opens the main window in Arabic and English and clicks every sidebar button with real mouse events, so a build that opens but cannot be clicked fails here (`-SkipSelfTest` to skip);
+5. compiles the Inno Setup installer with the version from `app/config.py` (`-InstallInnoSetup` installs Inno Setup 6 with winget when it is missing; without it the Windows IExpress packager is used);
+6. prints the installer path and its SHA-256.
+
+    .\build_installer.ps1 -InstallInnoSetup
+
+The installer stops any running copy first (including one hidden in the tray), so an update never leaves the old copy answering the new shortcut. A launch of a different build also asks a stale running copy to quit and takes over, and `AkremMobile.exe --quit` closes a running copy. Logs are in `%APPDATA%\AkremMobile\logs` (`akremmobile.log`, plus `crash.log` for native crashes).
 
 The PyInstaller one-folder application is written to `dist\AkremMobile`, a portable ZIP is written to `dist`, and the per-user setup package is written to `dist\installer\AkremMobile-Setup-<version>.exe`. The setup installs under `%LOCALAPPDATA%\Programs\AkremMobile`, creates Start menu and desktop shortcuts, and leaves the database under `%APPDATA%\AkremMobile` when the app is uninstalled.
 

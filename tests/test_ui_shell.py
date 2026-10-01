@@ -440,3 +440,93 @@ def test_seller_cannot_manage_client_types(qapp, memory_engine, shop) -> None:
 
     page = CustomersPage(_user(memory_engine, shop["seller_id"]))
     assert page.assign_type_button.isHidden()
+
+
+_LAUNCH = """
+import sys
+from PySide6.QtCore import QCoreApplication
+app = QCoreApplication([])
+from app.ui.single_instance import SingleInstance
+second = SingleInstance(sys.argv[1], build=sys.argv[2])
+second._wait_until_free = lambda: print("waited")
+print(second.request_quit() if sys.argv[3] == "quit" else second.notify_existing())
+"""
+
+
+def _launch_second_copy(name: str, build: str, qapp, *, quit_only: bool = False) -> list:
+    """Run a second launch in a separate process while the first one serves events."""
+    import subprocess
+    import sys
+    import time
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LAUNCH, name, build, "quit" if quit_only else "launch"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    deadline = time.monotonic() + 30
+    while process.poll() is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    for _ in range(10):
+        qapp.processEvents()
+    lines = process.stdout.read().split()
+    return [{"True": True, "False": False}.get(line, line) for line in lines]
+
+
+def test_a_newer_build_replaces_a_stale_copy_running_in_the_tray(qapp) -> None:
+    from app.ui.single_instance import SingleInstance
+
+    name = f"akrem-test-{uuid.uuid4().hex[:8]}"
+    old = SingleInstance(name, build="0.1.0-1000")
+    assert old.listen()
+    shown: list[bool] = []
+    quit_asked: list[bool] = []
+    old.activation_requested.connect(lambda: shown.append(True))
+    old.quit_requested.connect(lambda: quit_asked.append(True))
+    try:
+        # Same build: the running copy shows itself and the new launch exits.
+        assert _launch_second_copy(name, "0.1.0-1000", qapp) == [True]
+        assert shown and not quit_asked
+        # Reinstalled build: the old copy is told to quit and the new launch continues.
+        assert _launch_second_copy(name, "0.1.0-2000", qapp) == ["waited", False]
+        assert quit_asked
+        # The installer's "--quit".
+        quit_asked.clear()
+        assert _launch_second_copy(name, "x", qapp, quit_only=True) == [True]
+        assert quit_asked
+    finally:
+        old.close()
+
+
+def test_every_sidebar_and_topbar_button_receives_real_mouse_clicks(qapp, memory_engine, shop) -> None:
+    """Regression for "after installing, nothing can be clicked"."""
+    from app.ui.locale import apply_language
+    from app.ui.main_window import MainWindow
+    from app.ui.self_test import SelfTestReport, check_window
+
+    for language in ("ar", "en"):
+        apply_language(language)
+        window = MainWindow(current_user=_user(memory_engine, shop["owner_id"]))
+        window.resize(1366, 768)
+        window.show()
+        report = SelfTestReport()
+        check_window(qapp, window, report)
+        window.monitor.stop()
+        window.hide()
+        assert report.ok, report.failures
+        assert sum("opens its page" in check for check in report.checks) == 9
+    apply_language("ar")
+
+
+def test_uncaught_errors_never_block_the_window(qapp, monkeypatch) -> None:
+    import app.main as entry
+
+    monkeypatch.setattr(entry, "_error_notice", None)
+    entry.show_uncaught_exception(RuntimeError, RuntimeError("boom"), None)
+    notice = entry._error_notice
+    assert notice is not None and notice.isVisible()
+    assert notice.windowModality() == Qt.WindowModality.NonModal
+    assert QApplication.activeModalWidget() is None
+    entry.show_uncaught_exception(RuntimeError, RuntimeError("again"), None)
+    assert entry._error_notice is notice  # one notice at a time
+    notice.close()
