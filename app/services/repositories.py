@@ -114,6 +114,7 @@ def create_sale(
     purchase_date: date,
     end_date: date | None = None,
     expected_pay_date: date | None = None,
+    payment_interval: int = 1,
 ) -> Sale:
     """Create a sale record using already-computed integer amounts."""
     sale = Sale(
@@ -125,6 +126,7 @@ def create_sale(
         rate=rate,
         down_payment=down_payment,
         months=months,
+        payment_interval=payment_interval,
         total=total,
         financed=financed,
         monthly_amount=monthly_amount,

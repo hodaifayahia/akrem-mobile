@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Mapping
 
-from app.services.calc import add_months
+from app.services.calc import add_months, payment_offsets
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +23,9 @@ def build(sale: Any, settings: Mapping[str, Any] | None = None) -> list[Schedule
     """Build schedule rows for a Sale ORM object or compatible sale record.
 
     ``due_mode`` may be ``first_of_month`` (the default) or ``purchase_day``.
-    The schedule is derived from ``financed`` and ``months`` so persisted Sale
-    rows do not need to store each monthly amount.
+    The schedule is derived from ``financed``, ``months`` and
+    ``payment_interval`` (months between payments, default 1) so persisted
+    Sale rows do not need to store each amount.
     """
     if getattr(sale, "sale_type", None) != "installment":
         return []
@@ -43,10 +44,12 @@ def build(sale: Any, settings: Mapping[str, Any] | None = None) -> list[Schedule
     if due_mode not in {"first_of_month", "purchase_day"}:
         raise ValueError("due_mode must be 'first_of_month' or 'purchase_day'")
 
-    amounts = _monthly_amounts(sale, financed, months)
+    interval = getattr(sale, "payment_interval", None) or 1
+    offsets = payment_offsets(months, interval)
+    amounts = _monthly_amounts(sale, financed, len(offsets))
     result: list[ScheduledInstallment] = []
-    for index, amount in enumerate(amounts, start=1):
-        target_month = add_months(purchase_date, index)
+    for index, (offset, amount) in enumerate(zip(offsets, amounts, strict=True), start=1):
+        target_month = add_months(purchase_date, offset)
         due_date = (
             target_month.replace(day=1)
             if due_mode == "first_of_month"
@@ -62,21 +65,21 @@ def build(sale: Any, settings: Mapping[str, Any] | None = None) -> list[Schedule
     return result
 
 
-def _monthly_amounts(sale: Any, financed: int, months: int) -> list[int]:
-    """Use a supplied calculation list when valid; otherwise derive amounts."""
+def _monthly_amounts(sale: Any, financed: int, count: int) -> list[int]:
+    """Use a supplied calculation list when valid; otherwise derive one amount per payment."""
     supplied = getattr(sale, "monthly_list", None)
     if supplied is not None:
         values = list(supplied)
         if (
-            len(values) != months
+            len(values) != count
             or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values)
             or sum(values) != financed
         ):
-            raise ValueError("monthly_list must contain one non-negative integer amount per month and sum to financed")
+            raise ValueError("monthly_list must contain one non-negative integer amount per payment and sum to financed")
         return values
 
-    base, remainder = divmod(financed, months)
-    values = [base] * months
+    base, remainder = divmod(financed, count)
+    values = [base] * count
     values[-1] += remainder
     return values
 

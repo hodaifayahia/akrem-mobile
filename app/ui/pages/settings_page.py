@@ -32,7 +32,7 @@ from app.config import database_url
 from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, backup, settings
+from app.services import auth, backup, calc, settings
 from app.ui.events import events
 
 
@@ -477,7 +477,7 @@ class SettingsPage(QWidget):
                 rate = int(rate_item.text().strip()) if rate_item else -1
             except ValueError as error:
                 raise ValueError(ar.SET_RATE_INVALID) from error
-            if not 2 <= months <= 12 or not 0 <= rate <= 50:
+            if not 1 <= months <= calc.MAX_PLAN_MONTHS or not 0 <= rate <= 100:
                 raise ValueError(ar.SET_RATE_INVALID)
             if months in presets:
                 raise ValueError(ar.SET_RATE_DUPLICATE_MONTH)
@@ -500,7 +500,9 @@ class SettingsPage(QWidget):
             for row in range(self.rate_table.rowCount())
             if self.rate_table.item(row, 0) is not None
         }
-        months = next((value for value in range(2, 13) if str(value) not in existing), None)
+        months = next(
+            (value for value in range(1, calc.MAX_PLAN_MONTHS + 1) if str(value) not in existing), None
+        )
         if months is None:
             self._show_error(ar.SET_RATE_INVALID)
             return

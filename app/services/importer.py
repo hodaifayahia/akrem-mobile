@@ -7,7 +7,6 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
-import unicodedata
 
 from openpyxl import load_workbook
 from sqlalchemy import select
@@ -18,6 +17,9 @@ from app.services import calc, customers, sales
 from app.services.calc import SaleCalculation
 from app.services.customers import normalize_search_text
 from app.services.payments import lock_payment_ledger
+from app.services.spreadsheet import is_blank as _is_blank
+from app.services.spreadsheet import normalize_header as _normalize_header
+from app.services.spreadsheet import western_digits as _western_digits
 
 SHEET_NAME = "التقسيط"
 HEADERS = {
@@ -437,44 +439,8 @@ def _parse_date(value: Any, errors: list[str]) -> date | None:
     return None
 
 
-def _normalize_header(value: str) -> str:
-    """Normalize an Arabic Excel header for matching and sale type parsing."""
-    result: list[str] = []
-    for char in unicodedata.normalize("NFKD", value).casefold():
-        if unicodedata.category(char).startswith("M") or char == "ـ":
-            continue
-        if char in "أإآٱء":
-            result.append("ا")
-        elif char == "ة":
-            result.append("ه")
-        else:
-            result.append(char)
-    return "".join(result).strip()
-
-
-def _western_digits(value: str) -> str:
-    """Translate Arabic and Persian decimal digits to Western digits."""
-    return "".join(str(unicodedata.digit(char)) if char.isdecimal() else char for char in value)
-
-
 def _clean_text(value: Any) -> str:
     """Return stripped display text or an empty string for blank cells."""
     if _is_blank(value):
         return ""
     return str(value).strip()
-
-
-def _is_blank(value: Any) -> bool:
-    """Treat spreadsheet blanks, NaN, and whitespace-only strings uniformly."""
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return not value.strip()
-    if isinstance(value, Decimal):
-        return value.is_nan()
-    try:
-        if value != value:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return bool(getattr(value, "__class__", None) and value.__class__.__name__ == "NAType")

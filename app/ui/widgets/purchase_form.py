@@ -1,10 +1,11 @@
 """First-purchase section of the "new client" form.
 
-Picking a catalog product fills in its price; the sale type decides which
-fields apply (cash: none, installment: months/rate/down payment, credit:
-down payment). A live summary shows total, financed amount, monthly
-installment and end date using the calculation service, so the screen and
-the saved sale always agree.
+Picking a catalog product fills in its price and its default installment
+plan (duration, payment every N months, rate); the plan can then be changed
+for this client. The sale type decides which fields apply (cash: none,
+installment: months/interval/rate/down payment, credit: down payment). A live
+summary shows total, financed amount, installment amount and end date using
+the calculation service, so the screen and the saved sale always agree.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
 
 from app.i18n import ar
 from app.services import calc
+from app.services.products import CatalogEntry
+from app.i18n.plan_text import every_text, plan_description
 
 
 class FirstPurchaseSection(QGroupBox):
@@ -32,17 +35,17 @@ class FirstPurchaseSection(QGroupBox):
 
     def __init__(
         self,
-        catalog: list[tuple[str, int, int]],
+        catalog: list[CatalogEntry] | list[tuple[str, int, int]],
         rate_presets: dict[int, int],
         *,
         is_owner: bool,
         parent: QWidget | None = None,
     ) -> None:
-        """``catalog`` is a list of (product name, cash price, wholesale price)."""
+        """``catalog`` holds catalog entries (name, cash price, wholesale price, plan)."""
         super().__init__(ar.PURCHASE_SECTION_TITLE, parent)
         self.setCheckable(True)
         self.setChecked(bool(catalog))
-        self._catalog = catalog
+        self._catalog = [CatalogEntry(*entry) for entry in catalog]
         self._presets = rate_presets
         self._is_owner = is_owner
 
@@ -55,8 +58,8 @@ class FirstPurchaseSection(QGroupBox):
 
         form = QFormLayout()
         self.product = QComboBox(self)
-        for name, cash_price, _wholesale in catalog:
-            self.product.addItem(f"{name} — {cash_price:,} {ar.CURRENCY_SUFFIX}", name)
+        for entry in self._catalog:
+            self.product.addItem(f"{entry.name} — {entry.cash_price:,} {ar.CURRENCY_SUFFIX}", entry.name)
         self.sale_type = QComboBox(self)
         for label, value in (
             (ar.SALE_CASH, "cash"),
@@ -67,8 +70,12 @@ class FirstPurchaseSection(QGroupBox):
         self.cash_price = self._money()
         self.cash_price.setEnabled(is_owner)  # sellers always sell at the catalog price
         self.months = QSpinBox(self)
-        self.months.setRange(1, 24)
+        self.months.setRange(1, calc.MAX_PLAN_MONTHS)
         self.months.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.interval = QSpinBox(self)
+        self.interval.setRange(1, calc.MAX_PLAN_MONTHS)
+        self.interval.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.interval.setSpecialValueText(ar.PLAN_EVERY_1)
         self.rate = QSpinBox(self)
         self.rate.setRange(0, 100)
         self.rate.setSuffix(" %")
@@ -81,11 +88,17 @@ class FirstPurchaseSection(QGroupBox):
         form.addRow(ar.CUST_SALE_TYPE, self.sale_type)
         form.addRow(ar.CASH_PRICE_DETAIL, self.cash_price)
         form.addRow(ar.MONTHS_DURATION, self.months)
+        form.addRow(ar.PLAN_INTERVAL, self.interval)
         form.addRow(ar.RATE, self.rate)
         form.addRow(ar.PURCHASE_DOWN_PAYMENT, self.down_payment)
         form.addRow(ar.CUST_COL_PURCHASE_DATE, self.purchase_date)
         self._form = form
         layout.addLayout(form)
+
+        self.plan_hint = QLabel(self)
+        self.plan_hint.setObjectName("sectionHint")
+        self.plan_hint.setWordWrap(True)
+        layout.addWidget(self.plan_hint)
 
         self.summary = QLabel(self)
         self.summary.setObjectName("notificationBody")
@@ -96,7 +109,8 @@ class FirstPurchaseSection(QGroupBox):
         self.product.currentIndexChanged.connect(self._product_changed)
         self.sale_type.currentIndexChanged.connect(self._type_changed)
         self.months.valueChanged.connect(self._months_changed)
-        for editor in (self.cash_price, self.rate, self.down_payment):
+        self.months.valueChanged.connect(self.interval.setMaximum)
+        for editor in (self.cash_price, self.rate, self.down_payment, self.interval):
             editor.valueChanged.connect(self._update_summary)
         self.purchase_date.dateChanged.connect(self._update_summary)
         default_months = 6 if 6 in rate_presets else (min(rate_presets) if rate_presets else 6)
@@ -114,22 +128,42 @@ class FirstPurchaseSection(QGroupBox):
         return editor
 
     # ------------------------------------------------------------- reactions
-    def _product_changed(self, *_args: object) -> None:
+    def _entry(self) -> CatalogEntry | None:
         index = self.product.currentIndex()
-        if 0 <= index < len(self._catalog):
-            self.cash_price.setValue(self._catalog[index][1])
+        return self._catalog[index] if 0 <= index < len(self._catalog) else None
+
+    def _product_changed(self, *_args: object) -> None:
+        entry = self._entry()
+        if entry is not None:
+            self.cash_price.setValue(entry.cash_price)
+            self.apply_plan(entry.months, entry.interval)
+            self.plan_hint.setText(ar.PLAN_FROM_PRODUCT.format(plan=plan_description(entry.months, entry.interval)))
         self._update_summary()
+
+    def apply_plan(self, months: int, interval: int) -> None:
+        """Load a plan into the editors; the rate follows the product or the presets."""
+        self.months.setValue(months)
+        self.interval.setValue(min(interval, months))
+        self._months_changed()
+
+    def _rate_for(self, months: int) -> int:
+        entry = self._entry()
+        if entry is not None and entry.rate is not None and entry.months == months:
+            return entry.rate
+        return self._presets.get(months, self.rate.value())
 
     def _type_changed(self, *_args: object) -> None:
         kind = self.sale_type.currentData()
         self._set_row_visible(self.months, kind == "installment")
+        self._set_row_visible(self.interval, kind == "installment")
+        self.plan_hint.setVisible(kind == "installment" and bool(self.plan_hint.text()))
         self._set_row_visible(self.rate, kind == "installment")
         self._set_row_visible(self.down_payment, kind != "cash")
         self._months_changed()
 
     def _months_changed(self, *_args: object) -> None:
         if self.sale_type.currentData() == "installment":
-            self.rate.setValue(self._presets.get(self.months.value(), self.rate.value()))
+            self.rate.setValue(self._rate_for(self.months.value()))
         self._update_summary()
 
     def _set_row_visible(self, field: QWidget, visible: bool) -> None:
@@ -148,13 +182,17 @@ class FirstPurchaseSection(QGroupBox):
                 wholesale=self._wholesale(),
                 sale_type=kind,
                 purchase_date=self.purchase_date.date().toPython(),
+                interval=self._interval() if kind == "installment" else 1,
             )
         except ValueError:
             return None
 
     def _wholesale(self) -> int:
-        index = self.product.currentIndex()
-        return self._catalog[index][2] if 0 <= index < len(self._catalog) else 0
+        entry = self._entry()
+        return entry.wholesale_price if entry is not None else 0
+
+    def _interval(self) -> int:
+        return min(self.interval.value(), self.months.value())
 
     def _update_summary(self, *_args: object) -> None:
         result = self.calculation()
@@ -165,8 +203,10 @@ class FirstPurchaseSection(QGroupBox):
         if self.sale_type.currentData() != "cash":
             parts.append(ar.PURCHASE_SUMMARY_FINANCED.format(financed=_money(result.financed)))
         if result.monthly_list:
-            parts.append(ar.PURCHASE_SUMMARY_MONTHLY.format(
-                monthly=_money(result.monthly_list[0]), months=len(result.monthly_list)
+            parts.append(ar.PURCHASE_SUMMARY_PLAN.format(
+                amount=_money(result.monthly_list[0]),
+                every=every_text(result.payment_interval),
+                count=result.payment_count,
             ))
         if result.end_date is not None:
             parts.append(ar.PURCHASE_SUMMARY_END.format(date=result.end_date.strftime("%d/%m/%Y")))
@@ -186,6 +226,7 @@ class FirstPurchaseSection(QGroupBox):
             "rate": self.rate.value() if kind == "installment" else 0,
             "down_payment": self.down_payment.value() if kind != "cash" else 0,
             "months": self.months.value() if kind == "installment" else None,
+            "payment_interval": self._interval() if kind == "installment" else 1,
             "purchase_date": purchase,
         }
 

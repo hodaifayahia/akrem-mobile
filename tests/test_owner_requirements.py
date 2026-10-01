@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from app.db.models import Customer, Sale, User
 from app.db.session import dispose_database_engines, session_scope
+from app.i18n import ar
 from app.services import auth, backup, categories, customers, importer, payments, reports, sales, settings
 from app.services.calc import add_months
 from app.services.status import Status
@@ -320,7 +321,8 @@ def test_every_excel_export_opens_with_the_expected_data(shop, tmp_path, monkeyp
     assert workbook["الزبائن"].max_row == 1 + 5
     assert workbook["المبيعات"].max_row == 1 + 5
     assert workbook["الأقساط"].max_row == 1 + 3 * 6
-    assert workbook["المبيعات"]["N2"].number_format == "dd/mm/yyyy"
+    assert workbook["المبيعات"]["O2"].number_format == "dd/mm/yyyy"  # purchase date
+    assert workbook["المبيعات"]["J1"].value == ar.PROD_TPL_INTERVAL
 
     with session_scope() as session, pytest.raises(auth.AuthorizationError):
         reports.export_full_workbook(session, tmp_path / "nope.xlsx", owner_user_id=shop["seller"])

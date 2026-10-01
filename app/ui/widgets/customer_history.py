@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from app.i18n import ar
 from app.services.customers import CustomerHistory, PurchaseRecord
 from app.services.status import Status
+from app.i18n.plan_text import plan_summary
 from app.ui.theme import qcolor
 
 _TYPE_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending"}
@@ -174,7 +175,7 @@ class CustomerHistoryPanel(QWidget):
         self.purchases_table.setRowCount(len(history.purchases))
         for row, purchase in enumerate(history.purchases):
             plan = (
-                ar.HIST_PLAN_MONTHLY.format(monthly=money(purchase.monthly_amount), months=purchase.months)
+                plan_summary(purchase.monthly_amount or 0, purchase.payment_interval, purchase.payment_count)
                 if purchase.sale_type == "installment" and purchase.months
                 else ar.HIST_PLAN_CASH if purchase.sale_type == "cash"
                 else ar.HIST_PLAN_CREDIT

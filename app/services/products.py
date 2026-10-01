@@ -1,7 +1,9 @@
 """Owner-managed product price book for sales entry.
 
 A product needs only a name and a selling (cash) price; the wholesale price
-is optional and stored as 0 when unknown. The catalog can also be filled
+is optional and stored as 0 when unknown. Each product also carries a default
+installment plan (duration, months between payments, optional rate) that the
+sale forms start from; every sale can still use its own plan. The catalog can also be filled
 from an Excel sheet: :func:`write_product_template` creates the sheet,
 :func:`preview_product_workbook` checks every row without touching the
 database, and :func:`import_products` saves the valid rows.
@@ -9,13 +11,13 @@ database, and :func:`import_products` saves the valid rows.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import importlib
 from pathlib import Path
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
@@ -26,12 +28,80 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import Product, Sale
-from app.services import auth
-from app.services.importer import _is_blank, _normalize_header, _western_digits
+from app.services import auth, calc
+from app.services.spreadsheet import is_blank as _is_blank
+from app.services.spreadsheet import normalize_header as _normalize_header
+from app.services.spreadsheet import western_digits as _western_digits
 
 
 class ProductNameTakenError(ValueError):
     """Another catalog product already has this name."""
+
+
+DEFAULT_PLAN_MONTHS = 6
+
+
+@dataclass(frozen=True)
+class ProductPlan:
+    """A product's default installment plan.
+
+    ``interval`` is the number of months between payments (1 = monthly).
+    ``rate`` None means "use the shop's rate preset for this duration".
+    """
+
+    months: int = DEFAULT_PLAN_MONTHS
+    interval: int = 1
+    rate: int | None = None
+
+    def resolved_rate(self, presets: dict[int, int]) -> int | None:
+        """The product's own rate, else the preset for its duration, else None."""
+        return self.rate if self.rate is not None else presets.get(self.months)
+
+    def payment_count(self) -> int:
+        """Number of payments in this plan."""
+        return len(calc.payment_offsets(self.months, self.interval))
+
+
+class CatalogEntry(NamedTuple):
+    """What a sale form needs to offer one product with its default plan."""
+
+    name: str
+    cash_price: int
+    wholesale_price: int
+    months: int = DEFAULT_PLAN_MONTHS
+    interval: int = 1
+    rate: int | None = None
+
+
+def plan_of(product: Product) -> ProductPlan:
+    """The default plan stored on a product."""
+    return ProductPlan(
+        months=product.default_months or DEFAULT_PLAN_MONTHS,
+        interval=product.payment_interval or 1,
+        rate=product.default_rate,
+    )
+
+
+def catalog_entries(session: Session, presets: dict[int, int]) -> list[CatalogEntry]:
+    """Active products with their default plan and the rate that plan resolves to."""
+    entries = []
+    for product in list_products(session):
+        plan = plan_of(product)
+        entries.append(CatalogEntry(
+            product.name, product.cash_price, product.wholesale_price,
+            plan.months, plan.interval, plan.resolved_rate(presets),
+        ))
+    return entries
+
+
+def _validate_plan(plan: ProductPlan) -> ProductPlan:
+    """Check duration, interval and optional rate of a default plan."""
+    calc.validate_plan(plan.months, plan.interval)
+    if plan.rate is not None and (
+        isinstance(plan.rate, bool) or not isinstance(plan.rate, int) or not 0 <= plan.rate <= 100
+    ):
+        raise ValueError("Plan rate must be a whole number between 0 and 100")
+    return plan
 
 
 def list_products(session: Session, *, include_inactive: bool = False) -> list[Product]:
@@ -49,19 +119,25 @@ def create_product(
     name: str,
     cash_price: int,
     wholesale_price: int = 0,
+    plan: ProductPlan | None = None,
 ) -> Product:
     """Create a catalog product after verifying the active owner account.
 
-    Name and selling price are required; the wholesale price defaults to 0.
+    Name and selling price are required; the wholesale price defaults to 0
+    and the plan to 6 months paid monthly at the preset rate.
     """
     auth.require_owner(session, owner_user_id)
     clean_name = _validate_name(name)
     _validate_amount("wholesale price", wholesale_price)
     _validate_price(cash_price)
+    clean_plan = _validate_plan(plan or ProductPlan())
     product = Product(
         name=clean_name,
         wholesale_price=wholesale_price,
         cash_price=cash_price,
+        default_months=clean_plan.months,
+        payment_interval=clean_plan.interval,
+        default_rate=clean_plan.rate,
         active=True,
     )
     session.add(product)
@@ -80,10 +156,11 @@ def update_product(
     name: str,
     cash_price: int,
     wholesale_price: int | None = None,
+    plan: ProductPlan | None = None,
 ) -> Product:
     """Update the active catalog price while old sales keep their stored snapshot.
 
-    ``wholesale_price=None`` keeps the stored wholesale price.
+    ``wholesale_price=None`` and ``plan=None`` keep the stored values.
     """
     auth.require_owner(session, owner_user_id)
     product = session.get(Product, product_id)
@@ -93,11 +170,19 @@ def update_product(
     if wholesale_price is not None:
         product.wholesale_price = _validate_amount("wholesale price", wholesale_price)
     product.cash_price = _validate_price(cash_price)
+    if plan is not None:
+        _set_plan(product, _validate_plan(plan))
     try:
         session.flush()
     except IntegrityError as error:
         raise ProductNameTakenError("A catalog product already uses this name") from error
     return product
+
+
+def _set_plan(product: Product, plan: ProductPlan) -> None:
+    product.default_months = plan.months
+    product.payment_interval = plan.interval
+    product.default_rate = plan.rate
 
 
 def set_product_active(
@@ -190,11 +275,26 @@ _EXTRA_ALIASES: dict[str, tuple[str, ...]] = {
         "wholesale", "wholesale price", "cost", "cost price", "purchase price",
         "prix de gros", "prix d'achat", "gros",
     ),
+    "months": (
+        "مدة التقسيط", "عدد الأشهر", "عدد أشهر التقسيط", "الأشهر", "المدة",
+        "months", "duration", "installment months", "mois", "durée", "nombre de mois",
+    ),
+    "interval": (
+        "الدفع كل", "يدفع كل", "كل كم شهر", "الدفع كل أشهر",
+        "every", "pay every", "payment every", "interval", "payment interval",
+        "tous les", "paiement tous les", "périodicité",
+    ),
+    "rate": (
+        "النسبة", "نسبة التقسيط", "الفائدة %", "rate", "installment rate", "taux", "taux de crédit",
+    ),
 }
 _TEMPLATE_KEYS = {
     "name": ("PROD_TPL_NAME", "SET_PRODUCT_NAME"),
     "price": ("PROD_TPL_PRICE", "SET_PRODUCT_CASH"),
     "wholesale": ("PROD_TPL_WHOLESALE", "SET_PRODUCT_WHOLESALE"),
+    "months": ("PROD_TPL_MONTHS",),
+    "interval": ("PROD_TPL_INTERVAL",),
+    "rate": ("PROD_TPL_RATE",),
 }
 
 # Row problems, as codes the UI translates.
@@ -204,6 +304,9 @@ ERROR_PRICE_MISSING = "price_missing"
 ERROR_PRICE_INVALID = "price_invalid"
 ERROR_WHOLESALE_INVALID = "wholesale_invalid"
 ERROR_DUPLICATE = "duplicate_in_file"
+ERROR_MONTHS_INVALID = "months_invalid"
+ERROR_INTERVAL_INVALID = "interval_invalid"
+ERROR_RATE_INVALID = "rate_invalid"
 WARNING_NO_WHOLESALE = "no_wholesale"
 WARNING_BELOW_WHOLESALE = "below_wholesale"
 
@@ -228,7 +331,7 @@ class ProductWorkbookError(ValueError):
 
 @dataclass(frozen=True)
 class ProductImportRow:
-    """One checked spreadsheet row. ``wholesale_price`` is None when the cell was blank."""
+    """One checked spreadsheet row; optional values are None when the cell was blank."""
 
     row_number: int
     name: str
@@ -238,6 +341,17 @@ class ProductImportRow:
     warnings: tuple[str, ...]
     action: str
     existing_id: int | None = None
+    months: int | None = None
+    interval: int | None = None
+    rate: int | None = None
+
+    def plan_over(self, base: ProductPlan) -> ProductPlan:
+        """The plan after applying this row's filled plan cells to ``base``."""
+        return ProductPlan(
+            months=self.months if self.months is not None else base.months,
+            interval=self.interval if self.interval is not None else base.interval,
+            rate=self.rate if self.rate is not None else base.rate,
+        )
 
     @property
     def valid(self) -> bool:
@@ -292,8 +406,8 @@ class ProductImportResult:
 def write_product_template(path: str | Path) -> Path:
     """Write an empty product sheet plus an instructions sheet, in the UI language.
 
-    Only the name and price columns are required; the wholesale column may
-    stay empty.
+    Only the name and price columns are required; the wholesale price and
+    the default plan (months, payment every N months, rate) may stay empty.
     """
     from app.i18n import ar, is_rtl
 
@@ -307,6 +421,9 @@ def write_product_template(path: str | Path) -> Path:
         (f"{ar.PROD_TPL_NAME} *", "0758CD", ar.PROD_TPL_NAME_NOTE, 34),
         (f"{ar.PROD_TPL_PRICE} *", "0758CD", ar.PROD_TPL_PRICE_NOTE, 22),
         (f"{ar.PROD_TPL_WHOLESALE} ({ar.PROD_TPL_OPTIONAL})", "5B6577", ar.PROD_TPL_WHOLESALE_NOTE, 28),
+        (f"{ar.PROD_TPL_MONTHS} ({ar.PROD_TPL_OPTIONAL})", "5B6577", ar.PROD_TPL_MONTHS_NOTE, 26),
+        (f"{ar.PROD_TPL_INTERVAL} ({ar.PROD_TPL_OPTIONAL})", "5B6577", ar.PROD_TPL_INTERVAL_NOTE, 26),
+        (f"{ar.PROD_TPL_RATE} ({ar.PROD_TPL_OPTIONAL})", "5B6577", ar.PROD_TPL_RATE_NOTE, 22),
     )
     for column, (label, color, note, width) in enumerate(headers, start=1):
         cell = sheet.cell(row=1, column=column, value=label)
@@ -331,6 +448,16 @@ def write_product_template(path: str | Path) -> Path:
     wholesale_rule.showErrorMessage = True
     sheet.add_data_validation(wholesale_rule)
     wholesale_rule.add(f"C2:C{_TEMPLATE_ROWS + 1}")
+    for letter, low, high, note in (
+        ("D", 1, calc.MAX_PLAN_MONTHS, ar.PROD_TPL_MONTHS_NOTE),
+        ("E", 1, calc.MAX_PLAN_MONTHS, ar.PROD_TPL_INTERVAL_NOTE),
+        ("F", 0, 100, ar.PROD_TPL_RATE_NOTE),
+    ):
+        rule = DataValidation(type="whole", operator="between", formula1=str(low), formula2=str(high), allow_blank=True)
+        rule.error = note
+        rule.showErrorMessage = True
+        sheet.add_data_validation(rule)
+        rule.add(f"{letter}2:{letter}{_TEMPLATE_ROWS + 1}")
 
     help_sheet = workbook.create_sheet(_sheet_title(ar.PROD_TPL_HELP_SHEET))
     help_sheet.sheet_view.rightToLeft = is_rtl()
@@ -339,12 +466,14 @@ def write_product_template(path: str | Path) -> Path:
         ar.PROD_TPL_HELP_TITLE,
         ar.PROD_TPL_HELP_REQUIRED,
         ar.PROD_TPL_HELP_OPTIONAL,
+        ar.PROD_TPL_HELP_PLAN,
         ar.PROD_TPL_HELP_NUMBERS,
         ar.PROD_TPL_HELP_EXISTING,
         "",
         ar.PROD_TPL_HELP_EXAMPLE,
-        "iPhone 13 — 110000 — 90000",
+        "iPhone 13 — 110000 — 90000 — 10 — 2",
         "Redmi Note 13 — 32000",
+        "Galaxy A05 — 21000 — 18000 — 3 — 1 — 20",
     )
     for index, line in enumerate(lines, start=1):
         cell = help_sheet.cell(row=index, column=1, value=line)
@@ -414,17 +543,19 @@ def import_products(
             product = create_product(
                 session, owner_user_id,
                 name=row.name, cash_price=row.cash_price, wholesale_price=row.wholesale_price or 0,
+                plan=row.plan_over(ProductPlan()),
             )
             existing[_name_key(product.name)] = product
             created += 1
             continue
-        action = _action_for(product, row.cash_price, row.wholesale_price)
+        action = _action_for(product, row)
         if action == ACTION_UNCHANGED:
             unchanged += 1
             continue
         product.cash_price = _validate_price(row.cash_price)
         if row.wholesale_price is not None:
             product.wholesale_price = _validate_amount("wholesale price", row.wholesale_price)
+        _set_plan(product, _validate_plan(row.plan_over(plan_of(product))))
         if not product.active:
             product.active = True
             restored += 1
@@ -466,41 +597,71 @@ def _check_row(
         wholesale_price = _parse_amount(wholesale_cell)
         if wholesale_price is None:
             errors.append(ERROR_WHOLESALE_INVALID)
+    months = _optional_whole(cells.get("months"), 1, calc.MAX_PLAN_MONTHS, ERROR_MONTHS_INVALID, errors)
+    interval = _optional_whole(cells.get("interval"), 1, calc.MAX_PLAN_MONTHS, ERROR_INTERVAL_INVALID, errors)
+    rate_cell = cells.get("rate")
+    rate = _optional_whole(
+        rate_cell.replace("%", "") if isinstance(rate_cell, str) else rate_cell, 0, 100, ERROR_RATE_INVALID, errors
+    )
     key = _name_key(name)
     if name and key in seen:
         errors.append(ERROR_DUPLICATE)
     elif name:
         seen.add(key)
     product = existing.get(key) if name else None
+    if not errors and (months is not None or interval is not None):
+        base = plan_of(product) if product is not None else ProductPlan()
+        plan_months = months if months is not None else base.months
+        plan_interval = interval if interval is not None else base.interval
+        if plan_interval > plan_months:
+            errors.append(ERROR_INTERVAL_INVALID)
+    row = ProductImportRow(
+        row_number=row_number,
+        name=name,
+        cash_price=cash_price,
+        wholesale_price=wholesale_price,
+        errors=(),
+        warnings=(),
+        action=ACTION_INVALID,
+        existing_id=product.id if product is not None else None,
+        months=months,
+        interval=interval,
+        rate=rate,
+    )
     if errors:
         action = ACTION_INVALID
     elif product is None:
         action = ACTION_CREATE
     else:
-        action = _action_for(product, cash_price, wholesale_price)
+        action = _action_for(product, row)
     known_wholesale = wholesale_price if wholesale_price is not None else (product.wholesale_price if product else 0)
     if not errors and not known_wholesale:
         warnings.append(WARNING_NO_WHOLESALE)
     elif not errors and cash_price is not None and cash_price < known_wholesale:
         warnings.append(WARNING_BELOW_WHOLESALE)
-    return ProductImportRow(
-        row_number=row_number,
-        name=name,
-        cash_price=cash_price,
-        wholesale_price=wholesale_price,
-        errors=tuple(errors),
-        warnings=tuple(warnings),
-        action=action,
-        existing_id=product.id if product is not None else None,
-    )
+    return replace(row, errors=tuple(errors), warnings=tuple(warnings), action=action)
 
 
-def _action_for(product: Product, cash_price: int | None, wholesale_price: int | None) -> str:
-    """What saving these prices would do to an existing product."""
+def _action_for(product: Product, row: ProductImportRow) -> str:
+    """What saving this row would do to an existing product."""
     if not product.active:
         return ACTION_RESTORE
-    same_wholesale = wholesale_price is None or wholesale_price == product.wholesale_price
-    return ACTION_UNCHANGED if cash_price == product.cash_price and same_wholesale else ACTION_UPDATE
+    same_wholesale = row.wholesale_price is None or row.wholesale_price == product.wholesale_price
+    current_plan = plan_of(product)
+    same_plan = row.plan_over(current_plan) == current_plan
+    unchanged = row.cash_price == product.cash_price and same_wholesale and same_plan
+    return ACTION_UNCHANGED if unchanged else ACTION_UPDATE
+
+
+def _optional_whole(value: Any, low: int, high: int, error: str, errors: list[str]) -> int | None:
+    """A blank cell gives None; anything else must be a whole number in ``low..high``."""
+    if _is_blank(value):
+        return None
+    number = _parse_amount(value)
+    if number is None or not low <= number <= high:
+        errors.append(error)
+        return None
+    return number
 
 
 def _find_product_sheet(

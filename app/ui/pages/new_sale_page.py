@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -45,6 +46,10 @@ from app.services import products as product_service
 from app.services import schedule
 from app.services.settings import get_rate_presets, get_value
 from app.ui.events import events
+from app.i18n.plan_text import amount_label, plan_description
+
+
+_PLAN_ROLE = Qt.ItemDataRole.UserRole + 3  # (months, interval, rate) of a catalog product
 
 
 class NewSalePage(QWidget):
@@ -830,11 +835,18 @@ class NewSalePage(QWidget):
         if self.current_user.role != "owner":
             self.cash_price.setEnabled(False)
         self.rate = QSpinBox(page)
-        self.rate.setRange(0, 50)
+        self.rate.setRange(0, 100)
         self.down_payment = self._money_input(page)
         self.months = QSpinBox(page)
-        self.months.setRange(2, 24)
-        self.months.setValue(6)
+        self.months.setRange(1, calc.MAX_PLAN_MONTHS)
+        self.months.setValue(product_service.DEFAULT_PLAN_MONTHS)
+        self.interval = QSpinBox(page)
+        self.interval.setRange(1, calc.MAX_PLAN_MONTHS)
+        self.interval.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.interval.setSpecialValueText(ar.PLAN_EVERY_1)
+        self.plan_hint = QLabel(page)
+        self.plan_hint.setObjectName("sectionHint")
+        self.plan_hint.setWordWrap(True)
         self.purchase_date = QDateEdit(QDate.currentDate(), page)
         self.purchase_date.setDisplayFormat("dd/MM/yyyy")
         self.purchase_date.setCalendarPopup(True)
@@ -853,6 +865,8 @@ class NewSalePage(QWidget):
         sale_form.addRow(ar.RATE, self.rate)
         sale_form.addRow(ar.DOWN_PAYMENT, self.down_payment)
         sale_form.addRow(ar.MONTHS, self.months)
+        sale_form.addRow(ar.PLAN_INTERVAL, self.interval)
+        sale_form.addRow("", self.plan_hint)
         sale_form.addRow(ar.PURCHASE_DATE, self.purchase_date)
         sale_form.addRow("", self.expected_date_enabled)
         sale_form.addRow(ar.EXPECTED_PAY_DATE, self.expected_date)
@@ -860,6 +874,7 @@ class NewSalePage(QWidget):
             "rate": sale_form.labelForField(self.rate),
             "down_payment": sale_form.labelForField(self.down_payment),
             "months": sale_form.labelForField(self.months),
+            "interval": sale_form.labelForField(self.interval),
             "expected_date": sale_form.labelForField(self.expected_date),
         }
         left_layout.addLayout(sale_form)
@@ -915,6 +930,7 @@ class NewSalePage(QWidget):
         tile3_layout = QVBoxLayout(tile3)
         tile3_layout.setContentsMargins(10, 8, 10, 8)
         tile3_lbl = QLabel(ar.MONTHLY_AMOUNT, tile3)
+        self.monthly_caption = tile3_lbl
         tile3_lbl.setObjectName("summaryTileTitle")
         self.monthly_value = QLabel("—", tile3)
         self.monthly_value.setObjectName("summaryTileValue")
@@ -958,6 +974,7 @@ class NewSalePage(QWidget):
         self.schedule_table = QTableWidget(0, 3, preview)
         self.schedule_table.setHorizontalHeaderLabels(("#", ar.DUE_DATE, ar.MONTHLY_AMOUNT))
         self.schedule_table.horizontalHeader().setStretchLastSection(True)
+        self.schedule_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.schedule_table.verticalHeader().setVisible(False)
         self.schedule_table.setAlternatingRowColors(True)
         self.schedule_table.setShowGrid(False)
@@ -983,6 +1000,8 @@ class NewSalePage(QWidget):
 
         self.sale_type.currentIndexChanged.connect(self._update_sale_type)
         self.months.valueChanged.connect(self._month_changed)
+        self.months.valueChanged.connect(self.interval.setMaximum)
+        self.interval.valueChanged.connect(self._update_preview)
         self.product.currentTextChanged.connect(self._product_changed)
         for control in (self.wholesale_price, self.cash_price, self.rate, self.down_payment):
             control.valueChanged.connect(self._update_preview)
@@ -1040,6 +1059,8 @@ class NewSalePage(QWidget):
             idx = self.product.count() - 1
             self.product.setItemData(idx, entry.wholesale_price, Qt.ItemDataRole.UserRole + 1)
             self.product.setItemData(idx, entry.cash_price, Qt.ItemDataRole.UserRole + 2)
+            plan = product_service.plan_of(entry)
+            self.product.setItemData(idx, (plan.months, plan.interval, plan.rate), _PLAN_ROLE)
 
             if hasattr(self, "cash_product"):
                 self.cash_product.addItem(entry.name, entry.id)
@@ -1073,9 +1094,25 @@ class NewSalePage(QWidget):
             return None
         return int(wholesale), int(cash)
 
+    def _product_plan(self, name: str) -> tuple[int, int, int | None] | None:
+        """The catalog product's default (months, interval, rate), if it is in the catalog."""
+        index = self.product.findText(name, Qt.MatchFlag.MatchExactly)
+        plan = self.product.itemData(index, _PLAN_ROLE) if index >= 0 else None
+        return tuple(plan) if plan else None
+
     def _product_changed(self, name: str) -> None:
-        """Fill prices when a catalog product is selected."""
+        """Fill prices and the product's default plan when a catalog product is selected."""
         prices = self._product_prices(name)
+        plan = self._product_plan(name)
+        if plan is not None:
+            months, interval, _rate = plan
+            self.months.setValue(months)
+            self.interval.setValue(min(interval, months))
+            self._month_changed(months)
+            self.plan_hint.setText(ar.PLAN_FROM_PRODUCT.format(plan=plan_description(months, interval)))
+        else:
+            self.plan_hint.setText("")
+        self.plan_hint.setVisible(bool(self.plan_hint.text()) and self.sale_type.currentData() == "installment")
         if prices is not None:
             self.wholesale_price.setValue(prices[0])
             self.cash_price.setValue(prices[1])
@@ -1141,7 +1178,14 @@ class NewSalePage(QWidget):
         with session_scope() as session:
             presets = get_rate_presets(session)
         self._rate_presets = presets
-        self.rate.setValue(presets.get(months, 0))
+        self.rate.setValue(self._rate_for(months))
+
+    def _rate_for(self, months: int) -> int:
+        """The product's own rate for its default duration, else the preset for ``months``."""
+        plan = self._product_plan(self.product.currentText()) if hasattr(self, "product") else None
+        if plan is not None and plan[2] is not None and plan[0] == months:
+            return int(plan[2])
+        return self._rate_presets.get(months, 0)
 
     def _update_sale_type(self, _index: int | None = None) -> None:
         sale_type = self.sale_type.currentData()
@@ -1149,11 +1193,14 @@ class NewSalePage(QWidget):
         credit = sale_type == "credit"
         self.rate.setVisible(installment)
         self.months.setVisible(installment)
+        self.interval.setVisible(installment)
+        self.plan_hint.setVisible(installment and bool(self.plan_hint.text()))
         self.down_payment.setVisible(installment or credit)
         self.expected_date_enabled.setVisible(credit)
         self.expected_date.setVisible(credit)
         self._set_field_label_visible("rate", installment)
         self._set_field_label_visible("months", installment)
+        self._set_field_label_visible("interval", installment)
         self._set_field_label_visible("down_payment", installment or credit)
         self._set_field_label_visible("expected_date", credit)
         if sale_type == "cash":
@@ -1162,7 +1209,7 @@ class NewSalePage(QWidget):
         elif credit:
             self.rate.setValue(0)
         elif installment:
-            self.rate.setValue(self._rate_presets.get(self.months.value(), 0))
+            self.rate.setValue(self._rate_for(self.months.value()))
         self._update_preview()
 
     def _set_field_label_visible(self, name: str, visible: bool) -> None:
@@ -1177,6 +1224,7 @@ class NewSalePage(QWidget):
         rate = self.rate.value() if sale_type == "installment" else 0
         down_payment = self.down_payment.value() if sale_type != "cash" else 0
         months = self.months.value() if sale_type == "installment" else None
+        interval = self._interval() if sale_type == "installment" else 1
         product_prices = self._product_prices(self.product.currentText())
         wholesale = (
             self.wholesale_price.value()
@@ -1192,10 +1240,13 @@ class NewSalePage(QWidget):
                 wholesale=wholesale,
                 sale_type=sale_type,
                 purchase_date=self.purchase_date.date().toPython(),
+                interval=interval,
             )
         except (TypeError, ValueError):
             self._clear_preview()
             return
+        self.monthly_caption.setText(amount_label(interval))
+        self.schedule_table.horizontalHeaderItem(2).setText(amount_label(interval))
 
         self.total_value.setText(f"{result.total:,} {ar.CURRENCY_SUFFIX}")
         self.financed_value.setText(f"{result.financed:,} {ar.CURRENCY_SUFFIX}")
@@ -1218,6 +1269,7 @@ class NewSalePage(QWidget):
                 SimpleNamespace(
                     sale_type=sale_type,
                     months=months,
+                    payment_interval=interval,
                     financed=result.financed,
                     monthly_list=result.monthly_list,
                     purchase_date=self.purchase_date.date().toPython(),
@@ -1270,6 +1322,7 @@ class NewSalePage(QWidget):
                     rate=self.rate.value() if sale_type == "installment" else 0,
                     down_payment=self.down_payment.value() if sale_type != "cash" else 0,
                     months=self.months.value() if sale_type == "installment" else None,
+                    payment_interval=self._interval() if sale_type == "installment" else 1,
                     purchase_date=self.purchase_date.date().toPython(),
                     expected_pay_date=(
                         self.expected_date.date().toPython()
@@ -1325,6 +1378,7 @@ class NewSalePage(QWidget):
                     rate=self.rate.value() if sale_type == "installment" else 0,
                     down_payment=self.down_payment.value() if sale_type != "cash" else 0,
                     months=self.months.value() if sale_type == "installment" else None,
+                    payment_interval=self._interval() if sale_type == "installment" else 1,
                     purchase_date=self.purchase_date.date().toPython(),
                     expected_pay_date=(
                         self.expected_date.date().toPython()
@@ -1337,6 +1391,10 @@ class NewSalePage(QWidget):
             self._show_error(ar.FORM_SAVE_ERROR)
             return
         self._sale_saved(sale_id, int(customer_id))
+
+    def _interval(self) -> int:
+        """Months between payments, never longer than the plan."""
+        return min(self.interval.value(), self.months.value())
 
     def _sale_wholesale_price(self, session: Session) -> int:
         if self.current_user.role == "owner":
@@ -1368,8 +1426,9 @@ class NewSalePage(QWidget):
         self.cash_price.setValue(0)
         self.rate.setValue(0)
         self.down_payment.setValue(0)
-        self.months.setValue(6)
-        self._month_changed(6)
+        self.months.setValue(product_service.DEFAULT_PLAN_MONTHS)
+        self.interval.setValue(1)
+        self._month_changed(product_service.DEFAULT_PLAN_MONTHS)
         self.purchase_date.setDate(QDate.currentDate())
         self.expected_date_enabled.setChecked(False)
         self.expected_date.setDate(QDate.currentDate())

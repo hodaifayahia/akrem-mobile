@@ -871,11 +871,8 @@ class CustomersPage(QWidget):
 
     def _purchase_section(self) -> FirstPurchaseSection:
         with session_scope() as session:
-            catalog = [
-                (item.name, item.cash_price, item.wholesale_price)
-                for item in products.list_products(session)
-            ]
             presets = get_rate_presets(session)
+            catalog = products.catalog_entries(session, presets)
         return FirstPurchaseSection(catalog, presets, is_owner=self._is_owner)
 
     def save_new_customer(

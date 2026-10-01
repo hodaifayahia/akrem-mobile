@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from app.db.models import Sale
 from app.i18n import ar
+from app.services import calc
 
 
 class SaleEditDialog(QDialog):
@@ -41,12 +42,18 @@ class SaleEditDialog(QDialog):
         self.wholesale_price = self._money_input(self, sale.wholesale_price)
         self.cash_price = self._money_input(self, sale.cash_price)
         self.rate = QSpinBox(self)
-        self.rate.setRange(0, max(50, sale.rate))
+        self.rate.setRange(0, 100)
         self.rate.setValue(sale.rate)
         self.down_payment = self._money_input(self, sale.down_payment)
         self.months = QSpinBox(self)
-        self.months.setRange(1, max(12, sale.months or 0))
+        self.months.setRange(1, max(calc.MAX_PLAN_MONTHS, sale.months or 0))
         self.months.setValue(sale.months or 6)
+        self.interval = QSpinBox(self)
+        self.interval.setRange(1, self.months.value())
+        self.interval.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.interval.setSpecialValueText(ar.PLAN_EVERY_1)
+        self.interval.setValue(sale.payment_interval or 1)
+        self.months.valueChanged.connect(self.interval.setMaximum)
         self.purchase_date = QDateEdit(self)
         self.purchase_date.setCalendarPopup(True)
         self.purchase_date.setDisplayFormat("dd/MM/yyyy")
@@ -69,6 +76,7 @@ class SaleEditDialog(QDialog):
         self.form.addRow(ar.RATE, self.rate)
         self.form.addRow(ar.DOWN_PAYMENT, self.down_payment)
         self.form.addRow(ar.MONTHS, self.months)
+        self.form.addRow(ar.PLAN_INTERVAL, self.interval)
         self.form.addRow(ar.PURCHASE_DATE, self.purchase_date)
         self.form.addRow("", self.expected_date_enabled)
         self.form.addRow(ar.EXPECTED_PAY_DATE, self.expected_date)
@@ -76,6 +84,7 @@ class SaleEditDialog(QDialog):
             "rate": self.form.labelForField(self.rate),
             "down_payment": self.form.labelForField(self.down_payment),
             "months": self.form.labelForField(self.months),
+            "interval": self.form.labelForField(self.interval),
             "expected_date": self.form.labelForField(self.expected_date),
         }
         layout.addLayout(self.form)
@@ -112,12 +121,14 @@ class SaleEditDialog(QDialog):
         credit = sale_type == "credit"
         self.rate.setVisible(installment)
         self.months.setVisible(installment)
+        self.interval.setVisible(installment)
         self.down_payment.setVisible(installment or credit)
         self.expected_date_enabled.setVisible(credit)
         self.expected_date.setVisible(credit)
         for name, visible in (
             ("rate", installment),
             ("months", installment),
+            ("interval", installment),
             ("down_payment", installment or credit),
             ("expected_date", credit),
         ):
@@ -142,6 +153,7 @@ class SaleEditDialog(QDialog):
             "rate": rate,
             "down_payment": self.down_payment.value() if sale_type != "cash" else 0,
             "months": self.months.value() if sale_type == "installment" else None,
+            "payment_interval": min(self.interval.value(), self.months.value()) if sale_type == "installment" else 1,
             "purchase_date": self.purchase_date.date().toPython(),
             "expected_pay_date": (
                 self.expected_date.date().toPython()

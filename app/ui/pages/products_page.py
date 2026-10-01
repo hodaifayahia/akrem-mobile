@@ -42,14 +42,14 @@ from app.services.settings import get_rate_presets
 from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
+from app.i18n.plan_text import every_text, plan_description, plan_summary
 from app.ui.theme import qcolor, repolish
 
 _LOG = logging.getLogger(__name__)
-QUOTE_MONTHS = 6
 
 
 class ProductDialog(QDialog):
-    """Name and selling price (required) plus an optional wholesale price."""
+    """Name and selling price (required), optional wholesale price and default plan."""
 
     def __init__(self, *, title: str, product: Product | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -73,11 +73,39 @@ class ProductDialog(QDialog):
             self.name.setText(product.name)
             self.wholesale_price.setValue(product.wholesale_price)
             self.cash_price.setValue(product.cash_price)
+        self.plan_months = QSpinBox(self)
+        self.plan_months.setRange(1, calc.MAX_PLAN_MONTHS)
+        self.plan_months.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.plan_interval = QSpinBox(self)
+        self.plan_interval.setRange(1, calc.MAX_PLAN_MONTHS)
+        self.plan_interval.setSuffix(f" {ar.PURCHASE_MONTHS_SUFFIX}")
+        self.plan_interval.setSpecialValueText(ar.PLAN_EVERY_1)
+        self.plan_rate = QSpinBox(self)
+        self.plan_rate.setRange(-1, 100)
+        self.plan_rate.setSuffix(" %")
+        self.plan_rate.setSpecialValueText(ar.PLAN_RATE_AUTO)
+        self.plan_months.valueChanged.connect(self.plan_interval.setMaximum)
+        plan = products.plan_of(product) if product is not None else products.ProductPlan()
+        self.plan_months.setValue(plan.months)
+        self.plan_interval.setValue(plan.interval)
+        self.plan_rate.setValue(-1 if plan.rate is None else plan.rate)
         form = QFormLayout()
         form.addRow(f"{ar.SET_PRODUCT_NAME} *", self.name)
         form.addRow(f"{ar.SET_PRODUCT_CASH} *", self.cash_price)
         form.addRow(f"{ar.SET_PRODUCT_WHOLESALE} ({ar.PROD_OPTIONAL})", self.wholesale_price)
         layout.addLayout(form)
+        plan_title = QLabel(ar.PLAN_SECTION, self)
+        plan_title.setObjectName("sectionTitle")
+        layout.addWidget(plan_title)
+        plan_hint = QLabel(ar.PLAN_SECTION_HINT, self)
+        plan_hint.setObjectName("sectionHint")
+        plan_hint.setWordWrap(True)
+        layout.addWidget(plan_hint)
+        plan_form = QFormLayout()
+        plan_form.addRow(ar.PLAN_MONTHS, self.plan_months)
+        plan_form.addRow(ar.PLAN_INTERVAL, self.plan_interval)
+        plan_form.addRow(ar.PLAN_RATE, self.plan_rate)
+        layout.addLayout(plan_form)
         self.error = InlineError(self)
         layout.addWidget(self.error)
         self.name.textEdited.connect(self.error.clear)
@@ -99,6 +127,15 @@ class ProductDialog(QDialog):
             return ar.PROD_PRICE_REQUIRED
         return None
 
+    def plan(self) -> products.ProductPlan:
+        """The default installment plan entered in the dialog."""
+        rate = self.plan_rate.value()
+        return products.ProductPlan(
+            months=self.plan_months.value(),
+            interval=min(self.plan_interval.value(), self.plan_months.value()),
+            rate=None if rate < 0 else rate,
+        )
+
     def _money_input(self) -> QSpinBox:
         editor = QSpinBox(self)
         editor.setRange(0, 2_000_000_000)
@@ -110,8 +147,8 @@ class ProductDialog(QDialog):
 class ProductsPage(QWidget):
     """Browse and (for the owner) manage the product catalog."""
 
-    COLUMNS_OWNER = ("name", "wholesale", "cash", "margin", "quote", "sold", "last_sold", "state")
-    COLUMNS_SELLER = ("name", "cash", "quote", "sold", "state")
+    COLUMNS_OWNER = ("name", "wholesale", "cash", "margin", "plan", "quote", "sold", "last_sold", "state")
+    COLUMNS_SELLER = ("name", "cash", "plan", "quote", "sold", "state")
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -224,7 +261,8 @@ class ProductsPage(QWidget):
             "wholesale": ar.SET_PRODUCT_WHOLESALE,
             "cash": ar.SET_PRODUCT_CASH,
             "margin": ar.PROD_COL_MARGIN,
-            "quote": ar.PROD_COL_INSTALLMENT.format(months=QUOTE_MONTHS),
+            "plan": ar.PROD_COL_PLAN,
+            "quote": ar.INSTALLMENT_AMOUNT,
             "sold": ar.PROD_COL_SOLD,
             "last_sold": ar.PROD_COL_LAST_SOLD,
             "state": ar.SET_PRODUCT_ACTIVE,
@@ -237,7 +275,7 @@ class ProductsPage(QWidget):
             with session_scope() as session:
                 catalog = products.list_products(session, include_inactive=self._is_owner)
                 self._sold = products.sales_by_product(session)
-                self._quote_rate = get_rate_presets(session).get(QUOTE_MONTHS)
+                self._presets = get_rate_presets(session)
         except SQLAlchemyError:
             _LOG.exception("Product catalog refresh failed")
             return
@@ -268,6 +306,8 @@ class ProductsPage(QWidget):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if key == "state" and not product.active:
                     item.setForeground(self.palette().placeholderText())
+                if key == "quote" and self._plan_rate(product) is None:
+                    item.setToolTip(ar.PLAN_NO_RATE.format(months=products.plan_of(product).months))
                 self.table.setItem(row, column, item)
         active = sum(1 for product in getattr(self, "_catalog", []) if product.active)
         self.count_label.setText(ar.PROD_COUNT.format(count=active))
@@ -284,6 +324,11 @@ class ProductsPage(QWidget):
             return _money(product.cash_price)
         if key == "margin":
             return _money(product.cash_price - product.wholesale_price) if product.wholesale_price else "—"
+        if key == "plan":
+            plan = products.plan_of(product)
+            text = plan_description(plan.months, plan.interval)
+            rate = self._plan_rate(product)
+            return text if rate is None else f"{text} · {rate}%"
         if key == "quote":
             return self._quote(product)
         if key == "sold":
@@ -293,15 +338,20 @@ class ProductsPage(QWidget):
             return last.strftime("%d/%m/%Y") if last else "—"
         return ar.SET_USER_ACTIVE if product.active else ar.SET_PRODUCT_ARCHIVED
 
+    def _plan_rate(self, product: Product) -> int | None:
+        return products.plan_of(product).resolved_rate(getattr(self, "_presets", {}))
+
     def _quote(self, product: Product) -> str:
-        """Monthly amount for a 6-month installment with no down payment."""
-        if self._quote_rate is None:
+        """Installment amount of the product's default plan, with no down payment."""
+        rate = self._plan_rate(product)
+        if rate is None:
             return "—"
+        plan = products.plan_of(product)
         result = calc.compute_sale(
-            cash_price=product.cash_price, rate=self._quote_rate, down_payment=0,
-            months=QUOTE_MONTHS, wholesale=product.wholesale_price, sale_type="installment",
+            cash_price=product.cash_price, rate=rate, down_payment=0, months=plan.months,
+            wholesale=product.wholesale_price, sale_type="installment", interval=plan.interval,
         )
-        return ar.PROD_INSTALLMENT_VALUE.format(monthly=_money(result.monthly_list[0]))
+        return plan_summary(result.monthly_list[0], plan.interval, result.payment_count)
 
     # --------------------------------------------------------------- actions
     def selected_product(self) -> Product | None:
@@ -342,6 +392,7 @@ class ProductsPage(QWidget):
             "name": dialog.name.text(),
             "wholesale_price": dialog.wholesale_price.value(),
             "cash_price": dialog.cash_price.value(),
+            "plan": dialog.plan(),
         }
         try:
             with session_scope() as session:
@@ -482,7 +533,7 @@ class ProductImportDialog(QDialog):
 
         headers = [
             ar.PROD_UPLOAD_COL_ROW, ar.SET_PRODUCT_NAME, ar.SET_PRODUCT_CASH, ar.SET_PRODUCT_WHOLESALE,
-            ar.PROD_UPLOAD_COL_RESULT, ar.PROD_UPLOAD_COL_NOTES,
+            ar.PROD_UPLOAD_COL_RESULT, ar.PROD_UPLOAD_COL_NOTES, ar.PROD_COL_PLAN,
         ]
         self.table = QTableWidget(len(preview.rows), len(headers), self)
         self.table.setHorizontalHeaderLabels(headers)
@@ -494,7 +545,7 @@ class ProductImportDialog(QDialog):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
         for row, item in enumerate(preview.rows):
             tone = _ACTION_TONES[item.action]
             notes = [_problem_text(code) for code in item.errors + item.warnings]
@@ -505,10 +556,11 @@ class ProductImportDialog(QDialog):
                 _money(item.wholesale_price) if item.wholesale_price is not None else "—",
                 action_label(item.action),
                 " · ".join(notes),
+                _row_plan_text(item),
             )
             for column, text in enumerate(cells):
                 cell = QTableWidgetItem(text)
-                if column != 1 and column != 5:
+                if column not in (1, 5):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if column == 4 or (column == 5 and item.errors):
                     cell.setForeground(qcolor(tone))
@@ -565,9 +617,24 @@ def _problem_text(code: str) -> str:
         products.ERROR_PRICE_INVALID: ar.PROD_ERR_PRICE_INVALID,
         products.ERROR_WHOLESALE_INVALID: ar.PROD_ERR_WHOLESALE_INVALID,
         products.ERROR_DUPLICATE: ar.PROD_ERR_DUPLICATE,
+        products.ERROR_MONTHS_INVALID: ar.PROD_ERR_MONTHS_INVALID,
+        products.ERROR_INTERVAL_INVALID: ar.PROD_ERR_INTERVAL_INVALID,
+        products.ERROR_RATE_INVALID: ar.PROD_ERR_RATE_INVALID,
         products.WARNING_NO_WHOLESALE: ar.PROD_WARN_NO_WHOLESALE,
         products.WARNING_BELOW_WHOLESALE: ar.PROD_WARN_BELOW_WHOLESALE,
     }.get(code, code)
+
+
+def _row_plan_text(row: products.ProductImportRow) -> str:
+    """The plan cells a row fills in, or a dash when it leaves the plan alone."""
+    parts = []
+    if row.months is not None:
+        parts.append(ar.MONTHS_COUNT.format(count=row.months))
+    if row.interval is not None:
+        parts.append(every_text(row.interval))
+    if row.rate is not None:
+        parts.append(f"{row.rate}%")
+    return " · ".join(parts) or "—"
 
 
 def _money(amount: int) -> str:

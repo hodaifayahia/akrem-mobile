@@ -36,6 +36,7 @@ from app.db.models import Customer, Installment, Payment, Sale, User
 from app.config import data_dir, ensure_data_dirs
 from app.db.session import session_scope
 from app.i18n import ar
+from app.i18n.plan_text import amount_label, every_text
 from app.services import auth, customers, payments, sales as sales_service
 from app.services import schedule
 from app.services.sales import PaidInstallmentEditError
@@ -462,7 +463,10 @@ class CustomerDetailsDialog(QDialog):
         cash_price_text = self._money(sale.cash_price)
         rate_text = f"{sale.rate}%"
         total_text = self._money(sale.total)
+        interval = sale.payment_interval or 1
         monthly_text = self._money(sale.monthly_amount)
+        if sale.monthly_amount is not None and interval > 1:
+            monthly_text = f"{monthly_text} {every_text(interval)}"
         months_text = ar.MONTHS_COUNT.format(count=sale.months) if sale.months is not None else "—"
         profit_text = self._money(sale.profit) if is_owner else "—"
 
@@ -500,10 +504,12 @@ class CustomerDetailsDialog(QDialog):
                 (ar.RATE, f"{sale.rate}%"),
                 (ar.DOWN_PAYMENT, self._money(sale.down_payment)),
                 (ar.TOTAL_PRICE, self._money(sale.total)),
-                (ar.MONTHLY_AMOUNT, self._money(sale.monthly_amount)),
+                (amount_label(sale.payment_interval or 1), self._money(sale.monthly_amount)),
                 (ar.MONTHS, "—" if sale.months is None else str(sale.months)),
             )
         )
+        if sale.sale_type == "installment":
+            fields.append((ar.PLAN_INTERVAL, every_text(sale.payment_interval or 1)))
         if self.current_user.role == "owner":
             fields.append((ar.PROFIT, self._money(sale.profit)))
         fields.extend(

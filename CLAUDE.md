@@ -28,7 +28,8 @@ Dark by default. Tokens: bg `#05070B`, surface `#0E141D`, surface-2 `#121A2C`, b
 
 - Customer categories: `أساتذة`, `منحة البطالة`, `عسكري`, `أعمال حرة`, `غير مصنف`. The owner can add, rename, or delete categories; deletion is allowed only when unused.
 - Customer: full name, phone, category, ID/licence number, ID issue date and place, address, profession, CCP account number, cheque count, notes.
-- Sale: customer, product, type (`كاش` cash / `بالتقسيط` installment / `كريدي` credit), wholesale price, cash price, rate %, down payment, months, purchase date. Computed values: total, financed, monthly schedule, profit, end date.
+- Sale: customer, product, type (`كاش` cash / `بالتقسيط` installment / `كريدي` credit), wholesale price, cash price, rate %, down payment, months, payment interval (months between payments, 1 = monthly), purchase date. Computed values: total, financed, payment schedule, profit, end date.
+- Product: name and selling price are required; wholesale price is optional (0 when unknown). Each product has a default installment plan (months, default 6; payment interval, default 1; optional rate, blank = rate preset for the months). Sale forms start from the product's plan and every sale may use its own plan.
 - Installment: sale, index 1..N, due date, amount due, amount paid, paid date, method (`cash`, `CCP`, `BaridiMob`), note.
 - Payment: each amount received, linked to an installment; supports partial payments.
 - Credit down payment means money already paid. Credit has no monthly schedule; payments reduce the remaining balance and an expected payment date is optional.
@@ -37,13 +38,15 @@ Dark by default. Tokens: bg `#05070B`, surface `#0E141D`, surface-2 `#121A2C`, b
 
 - `total = cash_price * (1 + rate / 100)`
 - `financed = total - down_payment`
-- For installments, round each month down to a whole dinar and add the remainder to the last month so the schedule totals exactly `financed`.
+- Installment plans run 1 to 60 months. With payment interval `n`, payments fall at month offsets `n, 2n, …` and the last payment is always at `months` (5 months every 2 → offsets 2, 4, 5); `n` cannot exceed `months`.
+- For installments, round each payment down to a whole dinar and add the remainder to the last payment so the schedule totals exactly `financed`.
 - `profit = total - wholesale_price`
 - `end_date = purchase_date + months` (Excel `EDATE` behavior).
 - Cash sale: no schedule, rate 0, total = cash price, profit = cash price - wholesale price.
-- Due-date setting `due_mode` defaults to `first_of_month`: installment k is due on the 1st of purchase month + k. `purchase_day` is the alternate mode. `grace_days` defaults to 5.
+- Due-date setting `due_mode` defaults to `first_of_month`: installment k is due on the 1st of purchase month + its offset (k × interval, capped at months). `purchase_day` is the alternate mode. `grace_days` defaults to 5.
 - Status is evaluated for the selected month (current month by default): PAID when all installments due that month are fully paid; FAILED when any installment due that month or earlier is still unpaid after its due date plus grace days; PENDING when something is due that month and is not late; otherwise NONE. A past overdue installment keeps the customer FAILED even if the current month's installment is paid.
-- Rate presets, editable by the owner: 4->35, 5->35, 6->35, 7->35, 10->40, 12->45.
+- Rate presets, editable by the owner (1 to 60 months, 0 to 100%): 4->35, 5->35, 6->35, 7->35, 10->40, 12->45.
+- Status, alerts and reminders follow the stored due dates, so a client paying every N months is only due (and notified) in their payment months.
 
 ## Code conventions
 
@@ -56,6 +59,7 @@ Dark by default. Tokens: bg `#05070B`, surface `#0E141D`, surface-2 `#121A2C`, b
 
 - Multi-PC deployment: the owner confirmed that multiple PCs must share records, but has not yet chosen/provided the shared server location. The blueprint says this needs a shared server and is outside the original SQLite contract. Do not connect clients to a shared SQLite file.
 - The owner confirmed the first-of-month / 5-day grace / overdue-status defaults and that a credit down payment is already paid.
+- The owner asked for flexible plans: any duration (1, 3, 5, … months), payment every N months, a default plan per product, and a different plan per client when needed.
 - The brief's rounding rule (round down each month, remainder in last month) and optional credit expected date are current defaults; confirm if the owner wants different behavior.
 - No extra customer categories were specified; start with the five defaults.
 - Assume the wholesale dashboard card covers all sales, as stated in the blueprint.

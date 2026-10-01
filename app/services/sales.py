@@ -23,6 +23,7 @@ _SALE_FIELDS = {
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
     "purchase_date",
     "expected_pay_date",
 }
@@ -32,6 +33,7 @@ _SCHEDULE_FIELDS = {
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
     "purchase_date",
 }
 _PRICING_FIELDS = {
@@ -40,6 +42,7 @@ _PRICING_FIELDS = {
     "rate",
     "down_payment",
     "months",
+    "payment_interval",
 }
 _DEFAULT_SCHEDULE_SETTINGS: dict[str, object] = {
     "due_mode": "first_of_month",
@@ -141,13 +144,15 @@ def create_sale(
     purchase_date: date | None = None,
     expected_pay_date: date | None = None,
     settings: Mapping[str, object] | None = None,
+    payment_interval: int = 1,
 ) -> Sale:
     """Calculate and save a sale with its schedule as one session transaction.
 
     The caller owns the outer session commit. A nested transaction keeps the sale
     and generated installment rows together if calculation or persistence fails.
     Cash and credit sales have no installment rows; ``expected_pay_date`` is only
-    accepted for credit sales.
+    accepted for credit sales. ``payment_interval`` is the number of months
+    between installment payments (1 = monthly) and must be 1 for cash/credit.
     """
     if session.get(Customer, customer_id) is None:
         raise ValueError("Customer not found")
@@ -161,6 +166,7 @@ def create_sale(
         rate=rate,
         down_payment=down_payment,
         months=months,
+        payment_interval=payment_interval,
         purchase_date=purchase_date,
         expected_pay_date=expected_pay_date,
     )
@@ -172,6 +178,7 @@ def create_sale(
         wholesale=values["wholesale_price"],
         sale_type=values["sale_type"],
         purchase_date=values["purchase_date"],
+        interval=values["payment_interval"],
     )
     resolved_settings = _schedule_settings(session, settings)
     with session.begin_nested():
@@ -185,6 +192,7 @@ def create_sale(
             rate=values["rate"],
             down_payment=values["down_payment"],
             months=values["months"],
+            payment_interval=values["payment_interval"],
             total=result.total,
             financed=result.financed,
             monthly_amount=result.monthly_list[0] if result.monthly_list else None,
@@ -236,6 +244,7 @@ def update_sale(
         "rate": sale.rate,
         "down_payment": sale.down_payment,
         "months": sale.months,
+        "payment_interval": sale.payment_interval,
         "purchase_date": sale.purchase_date,
         "expected_pay_date": sale.expected_pay_date,
     }
@@ -270,6 +279,7 @@ def update_sale(
             wholesale=values["wholesale_price"],
             sale_type=values["sale_type"],
             purchase_date=values["purchase_date"],
+            interval=values["payment_interval"],
         )
         if calculation_changed
         else None
@@ -355,6 +365,7 @@ def _validated_values(
     months: int | None,
     purchase_date: date,
     expected_pay_date: date | None,
+    payment_interval: int = 1,
 ) -> dict[str, Any]:
     """Normalize form values and reject invalid sale type/date combinations."""
     clean_product = product.strip()
@@ -368,6 +379,14 @@ def _validated_values(
         raise ValueError("Cash sales cannot have a rate, down payment, or installment months")
     if sale_type == "credit" and months is not None:
         raise ValueError("Credit sales do not have installment months")
+    if sale_type != "installment":
+        payment_interval = 1  # only installment plans have a payment rhythm
+    elif isinstance(payment_interval, bool) or not isinstance(payment_interval, int):
+        raise ValueError("Payment interval must be a whole number of months")
+    if sale_type == "installment":
+        if months is None:
+            raise ValueError("Installment sales require months")
+        calc.validate_plan(months, payment_interval)
     if not isinstance(purchase_date, date):
         raise ValueError("Purchase date is required")
     for field, value in (
@@ -387,6 +406,7 @@ def _validated_values(
         "rate": rate,
         "down_payment": down_payment,
         "months": months,
+        "payment_interval": payment_interval,
         "purchase_date": purchase_date,
         "expected_pay_date": expected_pay_date,
     }

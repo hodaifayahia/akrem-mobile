@@ -57,6 +57,10 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(180), nullable=False, unique=True)
     wholesale_price: Mapped[int] = mapped_column(Integer, nullable=False)
     cash_price: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Default installment plan offered for this product; each sale can differ.
+    default_months: Mapped[int] = mapped_column(Integer, nullable=False, default=6, server_default="6")
+    payment_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    default_rate: Mapped[int | None] = mapped_column(Integer)  # None: use the rate preset for the months
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
@@ -120,6 +124,8 @@ class Sale(Base):
     rate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     down_payment: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     months: Mapped[int | None] = mapped_column(Integer)
+    # Months between installment payments (1 = monthly, 2 = every two months, ...).
+    payment_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     financed: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_amount: Mapped[int | None] = mapped_column(Integer)

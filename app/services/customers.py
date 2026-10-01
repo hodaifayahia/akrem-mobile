@@ -132,6 +132,8 @@ class PurchaseRecord:
     profit: int
     status: Status
     overdue_installments: int
+    payment_interval: int = 1
+    payment_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +278,8 @@ def _purchase_record(sale: Sale, today: date, grace_days: int) -> PurchaseRecord
         profit=sale.profit,
         status=for_month(sale.installments, today.year, today.month, today, grace_days),
         overdue_installments=_overdue_count(sale, today, grace_days),
+        payment_interval=sale.payment_interval or 1,
+        payment_count=len(sale.installments),
     )
 
 

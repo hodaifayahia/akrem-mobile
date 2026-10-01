@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import Setting
+from app.services.calc import MAX_PLAN_MONTHS
 
 DEFAULT_RATE_PRESETS: dict[int, int] = {4: 35, 5: 35, 6: 35, 7: 35, 10: 40, 12: 45}
 
@@ -46,7 +47,7 @@ def get_rate_presets(session: Session) -> dict[int, int]:
             rate_percent = int(rate)
         except (TypeError, ValueError):
             continue
-        if 2 <= month_count <= 12 and 0 <= rate_percent <= 50:
+        if 1 <= month_count <= MAX_PLAN_MONTHS and 0 <= rate_percent <= 100:
             result[month_count] = rate_percent
     return result or DEFAULT_RATE_PRESETS.copy()
 

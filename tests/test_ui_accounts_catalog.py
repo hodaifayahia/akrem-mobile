@@ -374,3 +374,101 @@ def test_two_factor_setup_shows_a_qr_code_and_protects_sign_in(shop, monkeypatch
         auth.reset_two_factor(session, shop["owner"], shop["owner"])
     page._refresh_two_factor()
     assert page.tfa_status.text() == ar.TFA_STATUS_OFF
+
+
+# ------------------------------------------------------- flexible payment plans
+def test_product_dialog_saves_a_default_plan_shown_on_the_products_page(shop) -> None:
+    from app.ui.pages.products_page import ProductDialog, ProductsPage
+
+    page = ProductsPage(_user(shop["owner"]))
+    dialog = ProductDialog(title="x", parent=page)
+    assert (dialog.plan_months.value(), dialog.plan_interval.value(), dialog.plan_rate.value()) == (6, 1, -1)
+    assert dialog.plan_interval.text() == ar.PLAN_EVERY_1
+    dialog.name.setText("Pixel 8")
+    dialog.cash_price.setValue(100000)
+    dialog.plan_months.setValue(10)
+    dialog.plan_interval.setValue(2)
+    assert page.save_dialog(dialog)
+
+    with session_scope() as session:
+        saved = {p.name: p for p in products.list_products(session)}["Pixel 8"]
+        assert products.plan_of(saved) == products.ProductPlan(10, 2, None)
+    row = [page.table.item(r, 0).text() for r in range(page.table.rowCount())].index("Pixel 8")
+    plan_cell = page.table.item(row, page._columns.index("plan")).text()
+    assert "10" in plan_cell and ar.PLAN_EVERY_2 in plan_cell and "40%" in plan_cell
+    # 100,000 + 40% = 140,000 in 5 payments every 2 months
+    quote = page.table.item(row, page._columns.index("quote")).text()
+    assert quote.startswith("28,000") and ar.PLAN_EVERY_2 in quote and quote.endswith("× 5")
+
+    # Shrinking the plan below the interval caps the interval.
+    edit = ProductDialog(title="x", parent=page, product=saved)
+    edit.plan_months.setValue(1)
+    assert edit.plan().interval == 1
+
+
+def test_new_client_purchase_starts_from_the_product_plan_and_can_differ(shop) -> None:
+    from app.ui.pages.customers_page import CustomersPage
+
+    with session_scope() as session:
+        product = {p.name: p for p in products.list_products(session)}["Redmi 13"]
+        products.update_product(
+            session, shop["owner"], product.id, name="Redmi 13", cash_price=32000,
+            plan=products.ProductPlan(months=4, interval=2, rate=20),
+        )
+    page = CustomersPage(_user(shop["owner"]))
+    section = page._purchase_section()
+    section.product.setCurrentIndex(section.product.findData("Redmi 13"))
+    section.sale_type.setCurrentIndex(section.sale_type.findData("installment"))
+    assert (section.months.value(), section.interval.value(), section.rate.value()) == (4, 2, 20)
+    assert ar.PLAN_EVERY_2 in section.plan_hint.text()
+    assert "19,200" in section.summary.text()  # 38,400 in 2 payments
+
+    # This client pays monthly over 5 months instead (rate follows the preset).
+    section.months.setValue(5)
+    section.interval.setValue(1)
+    assert section.rate.value() == 35
+    values = section.sale_values()
+    assert (values["months"], values["payment_interval"]) == (5, 1)
+
+    section.months.setValue(6)
+    section.interval.setValue(3)
+    fallback_id = page._types[-1].id
+    customer_id = page.save_new_customer(
+        {"full_name": "زبون كل 3 أشهر", "phone": "0550000009", "category_id": fallback_id},
+        section.sale_values(),
+    )
+    with session_scope() as session:
+        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
+        assert (sale.months, sale.payment_interval, len(sale.installments)) == (6, 3, 2)
+
+
+def test_new_sale_page_applies_the_product_plan_and_saves_the_interval(shop, monkeypatch) -> None:
+    from app.ui.pages.new_sale_page import NewSalePage
+
+    with session_scope() as session:
+        product = {p.name: p for p in products.list_products(session)}["iPhone 13"]
+        products.update_product(
+            session, shop["owner"], product.id, name="iPhone 13", cash_price=110000,
+            plan=products.ProductPlan(months=12, interval=6),
+        )
+        customer = customers.create_customer(
+            session, full_name="زبون الصفحة", phone="0550000123", category_id=categories.get_fallback_type(session).id,
+        )
+        customer_id = customer.id
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    page = NewSalePage(current_user=_user(shop["owner"]))
+    page.sale_type.setCurrentIndex(page.sale_type.findData("installment"))
+    page.product.setCurrentText("iPhone 13")
+    assert (page.months.value(), page.interval.value(), page.rate.value()) == (12, 6, 45)
+    assert page.monthly_caption.text() == ar.INSTALLMENT_AMOUNT
+    assert page.schedule_table.rowCount() == 2  # 2 payments, every 6 months
+
+    page.interval.setValue(1)  # this client pays monthly instead
+    assert page.schedule_table.rowCount() == 12
+    assert page.monthly_caption.text() == ar.MONTHLY_AMOUNT
+    page.interval.setValue(4)
+    page._customer_id = customer_id
+    page._save_sale()
+    with session_scope() as session:
+        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
+        assert (sale.months, sale.payment_interval, len(sale.installments)) == (12, 4, 3)
