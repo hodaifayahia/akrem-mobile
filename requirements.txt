@@ -1,0 +1,15 @@
+# Python 3.12. Pins verified against the package maintainers' PyPI releases on 2026-09-30.
+PySide6==6.11.2
+SQLAlchemy==2.0.54
+psycopg[binary]==3.3.6
+alembic==1.20.0
+pandas==3.0.6
+openpyxl==3.1.5
+xlrd==2.0.2
+bcrypt==5.0.0
+pytest==9.1.1
+pytest-cov==7.1.0
+coverage==7.16.1
+PyInstaller==6.22.3
+Faker==40.39.0
+Pillow==12.3.0

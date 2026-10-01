@@ -1,0 +1,1 @@
+"""AkremMobile application package."""

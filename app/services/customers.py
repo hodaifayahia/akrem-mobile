@@ -1,0 +1,433 @@
+"""Customer workflows and validation."""
+
+from __future__ import annotations
+
+import re
+import json
+import unicodedata
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload, selectinload
+
+from app.db.models import Category, Customer, Installment, Sale, Setting
+from app.services import repositories
+from app.services.status import Status, for_customer
+
+_MOBILE_RE = re.compile(r"^0[567][0-9]{8}$")
+_CUSTOMER_FIELDS = {
+    "full_name",
+    "category_id",
+    "phone",
+    "id_number",
+    "id_issue_date",
+    "id_issue_place",
+    "address",
+    "profession",
+    "ccp_number",
+    "cheques_count",
+    "notes",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerSummary:
+    """Customer-list row with sale, status, and balance summaries."""
+
+    id: int
+    full_name: str
+    phone: str | None
+    category_id: int
+    category_name: str
+    products: tuple[str, ...]
+    purchase_dates: tuple[date, ...]
+    end_dates: tuple[date | None, ...]
+    monthly_amount: int
+    remaining_balance: int
+    status: Status
+    customer: Customer
+    sales: tuple[Sale, ...]
+
+    @property
+    def purchase_date(self) -> date | None:
+        """Return the latest purchase date, useful for a single table cell."""
+        return max(self.purchase_dates, default=None)
+
+    @property
+    def end_date(self) -> date | None:
+        """Return the latest known installment end date."""
+        return max((value for value in self.end_dates if value is not None), default=None)
+
+    @property
+    def credit_score(self) -> int:
+        """Calculate a 0-100 credit reliability index based on payment punctuality and defaults."""
+        if not self.sales:
+            return 100
+        if self.status == Status.FAILED:
+            return 35
+        if self.status == Status.PENDING:
+            return 80
+        if self.status == Status.PAID:
+            return 98
+        return 90
+
+    @property
+    def credit_badge(self) -> str:
+        """Human-readable executive credit reliability rating."""
+        score = self.credit_score
+        if score >= 90:
+            return "⭐⭐⭐⭐⭐ ممتاز"
+        elif score >= 75:
+            return "⭐⭐⭐⭐ جيد جداً"
+        elif score >= 50:
+            return "⭐⭐⭐ متوسط"
+        return "⚠️ عالي المخاطر"
+
+
+def normalize_search_text(value: str | None) -> str:
+    """Normalize Arabic text for search, ignoring diacritics and common variants.
+
+    Hamza-bearing alifs and standalone hamza become alif, taa marbuta becomes
+    haa, and Arabic-Indic digits become Western digits. NFKD also reduces
+    hamza-on-waw/yaa to their base letter before combining marks are removed.
+    """
+    if value is None:
+        return ""
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    result: list[str] = []
+    for char in normalized:
+        if unicodedata.category(char).startswith("M") or char == "ـ":
+            continue
+        if char in "أإآٱء":
+            result.append("ا")
+        elif char == "ة":
+            result.append("ه")
+        elif char.isdecimal():
+            try:
+                result.append(str(unicodedata.digit(char)))
+            except (TypeError, ValueError):
+                result.append(char)
+        else:
+            result.append(char)
+    return "".join(result).strip()
+
+
+def list_customers(
+    session: Session,
+    *,
+    year: int,
+    month: int,
+    today: date,
+    category_id: int | None = None,
+    status: Status | str | None = None,
+    search: str | None = None,
+) -> list[CustomerSummary]:
+    """Return customer rows with selected-month status and outstanding balances.
+
+    Customer names and phone numbers are narrowed in a lightweight first query
+    when searching. The final query eagerly loads categories, sales, schedules,
+    and payment rows, avoiding per-customer database queries for large lists.
+    """
+    selected_status = _coerce_customer_status(status)
+    search_key = normalize_search_text(search)
+    grace_days = _grace_days(session)
+    # Validate the selected period even when the query has no matching rows.
+    for_customer((), year, month, today, grace_days=grace_days)
+
+    base_query = select(Customer)
+    if category_id is not None:
+        base_query = base_query.where(Customer.category_id == category_id)
+
+    matching_ids: list[int] | None = None
+    if search_key:
+        candidates_query = select(Customer.id, Customer.full_name, Customer.phone)
+        if category_id is not None:
+            candidates_query = candidates_query.where(Customer.category_id == category_id)
+        matching_ids = [
+            customer_id
+            for customer_id, full_name, phone in session.execute(candidates_query)
+            if search_key in normalize_search_text(full_name)
+            or search_key in normalize_search_text(phone)
+        ]
+        if not matching_ids:
+            return []
+
+    eager_options = (
+        joinedload(Customer.category),
+        selectinload(Customer.sales).selectinload(Sale.installments).selectinload(
+            Installment.payments
+        ),
+        selectinload(Customer.sales).selectinload(Sale.credit_payments),
+    )
+    if matching_ids is not None and len(matching_ids) > 900:
+        # Keep the customer ID filter under older SQLite bind-parameter limits.
+        rows = []
+        for offset in range(0, len(matching_ids), 900):
+            query = (
+                select(Customer)
+                .where(Customer.id.in_(matching_ids[offset : offset + 900]))
+                .options(*eager_options)
+                .order_by(Customer.full_name, Customer.id)
+            )
+            rows.extend(session.scalars(query).all())
+        rows.sort(key=lambda customer: (customer.full_name, customer.id))
+    else:
+        if matching_ids is not None:
+            base_query = base_query.where(Customer.id.in_(matching_ids))
+        rows = session.scalars(
+            base_query.options(*eager_options).order_by(Customer.full_name, Customer.id)
+        ).all()
+    result: list[CustomerSummary] = []
+    for customer in rows:
+        customer_sales = tuple(sorted(
+            customer.sales,
+            key=lambda sale: (sale.purchase_date, sale.id),
+        ))
+        customer_status = for_customer(
+            customer_sales, year, month, today, grace_days=grace_days
+        )
+        if selected_status is not None and customer_status != selected_status:
+            continue
+
+        monthly_amount = sum(
+            installment.amount_due
+            for sale in customer_sales
+            for installment in sale.installments
+            if installment.due_date.year == year and installment.due_date.month == month
+        )
+        remaining_balance = 0
+        for sale in customer_sales:
+            if sale.sale_type == "credit":
+                paid = sum(payment.amount for payment in sale.credit_payments)
+                remaining_balance += max(0, sale.financed - paid)
+            elif sale.sale_type == "installment":
+                for installment in sale.installments:
+                    paid = max(
+                        installment.amount_paid,
+                        sum(payment.amount for payment in installment.payments),
+                    )
+                    remaining_balance += max(0, installment.amount_due - paid)
+
+        summary = CustomerSummary(
+            id=customer.id,
+            full_name=customer.full_name,
+            phone=customer.phone,
+            category_id=customer.category_id,
+            category_name=customer.category.name,
+            products=tuple(sale.product for sale in customer_sales),
+            purchase_dates=tuple(sale.purchase_date for sale in customer_sales),
+            end_dates=tuple(sale.end_date for sale in customer_sales),
+            monthly_amount=monthly_amount,
+            remaining_balance=remaining_balance,
+            status=customer_status,
+            customer=customer,
+            sales=customer_sales,
+        )
+        result.append(summary)
+    return result
+
+
+def get_customer_details(session: Session, customer_id: int) -> Customer:
+    """Load a customer and all sale/payment relationships for its detail view."""
+    customer = session.scalar(
+        select(Customer)
+        .where(Customer.id == customer_id)
+        .options(
+            joinedload(Customer.category),
+            selectinload(Customer.sales).selectinload(Sale.installments).selectinload(
+                Installment.payments
+            ),
+            selectinload(Customer.sales).selectinload(Sale.credit_payments),
+        )
+    )
+    if customer is None:
+        raise ValueError("Customer not found")
+    return customer
+
+
+def count_overdue_installments(
+    session: Session,
+    customer_id: int,
+    *,
+    today: date,
+) -> int:
+    """Count unpaid installment months past the configured grace period."""
+    if session.get(Customer, customer_id) is None:
+        raise ValueError("Customer not found")
+    cutoff = today - timedelta(days=_grace_days(session))
+    rows = session.scalars(
+        select(Installment)
+        .join(Sale, Sale.id == Installment.sale_id)
+        .options(selectinload(Installment.payments))
+        .where(
+            Sale.customer_id == customer_id,
+            Installment.due_date < cutoff,
+        )
+    ).all()
+    return sum(
+        1
+        for installment in rows
+        if max(
+            installment.amount_paid,
+            sum(payment.amount for payment in installment.payments),
+        ) < installment.amount_due
+    )
+
+
+def _coerce_customer_status(status: Status | str | None) -> Status | None:
+    """Normalize an optional status filter and reject unknown values."""
+    if status is None or status == "":
+        return None
+    if isinstance(status, Status):
+        return status
+    try:
+        return Status(status.upper())
+    except (AttributeError, ValueError) as error:
+        raise ValueError(f"Unsupported customer status: {status}") from error
+
+
+def _grace_days(session: Session) -> int:
+    """Read the configured grace period, using the business default of five days."""
+    setting = session.get(Setting, "grace_days")
+    if setting is None:
+        return 5
+    try:
+        value = json.loads(setting.value)
+    except (TypeError, json.JSONDecodeError):
+        return 5
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 5
+    return value
+
+
+class DuplicateCustomerPhoneError(ValueError):
+    """Raised when a phone is already used and explicit confirmation is needed."""
+
+    def __init__(self, phone: str, matches: list[Customer]) -> None:
+        self.phone = phone
+        self.matches = tuple(matches)
+        names = ", ".join(customer.full_name for customer in matches)
+        super().__init__(f"Phone number {phone} is already used by: {names}")
+
+
+def normalize_phone(phone: str | None) -> str | None:
+    """Return a canonical local mobile number, or ``None`` for an empty value.
+
+    Algerian mobile numbers are stored as 10 digits beginning with 05, 06, or 07.
+    Arabic-Indic digits are converted to Western digits before validation.
+    """
+    if phone is None:
+        return None
+    clean_phone = "".join(
+        str(unicodedata.digit(char)) if char.isdecimal() else char for char in phone
+    ).strip()
+    if not clean_phone:
+        return None
+    if not _MOBILE_RE.fullmatch(clean_phone):
+        raise ValueError("Phone must be an Algerian mobile number: 10 digits starting 05, 06, or 07")
+    return clean_phone
+
+
+def find_duplicate_phones(
+    session: Session,
+    phone: str | None,
+    *,
+    exclude_customer_id: int | None = None,
+) -> list[Customer]:
+    """Find customers already using a valid mobile number.
+
+    Use this before saving to display a non-blocking duplicate warning. Create and
+    update workflows repeat the check and require ``allow_duplicate_phone=True``
+    before accepting a duplicate, avoiding a race between warning and save.
+    """
+    clean_phone = normalize_phone(phone)
+    if clean_phone is None:
+        return []
+    query = select(Customer).where(Customer.phone == clean_phone).order_by(Customer.id)
+    if exclude_customer_id is not None:
+        query = query.where(Customer.id != exclude_customer_id)
+    return list(session.scalars(query))
+
+
+def create_customer(
+    session: Session,
+    *,
+    full_name: str,
+    category_id: int,
+    phone: str | None = None,
+    allow_duplicate_phone: bool = False,
+    **details: Any,
+) -> Customer:
+    """Validate and create a customer; duplicate phone use needs confirmation."""
+    clean_name = full_name.strip()
+    if not clean_name:
+        raise ValueError("Customer name cannot be empty")
+    if session.get(Category, category_id) is None:
+        raise ValueError("Customer category not found")
+    _validate_fields(details)
+    clean_phone = normalize_phone(phone)
+    if clean_phone and not allow_duplicate_phone:
+        matches = find_duplicate_phones(session, clean_phone)
+        if matches:
+            raise DuplicateCustomerPhoneError(clean_phone, matches)
+    if "cheques_count" in details:
+        _validate_cheques_count(details["cheques_count"])
+    return repositories.create_customer(
+        session,
+        full_name=clean_name,
+        category_id=category_id,
+        phone=clean_phone,
+        **details,
+    )
+
+
+def update_customer(
+    session: Session,
+    customer_id: int,
+    *,
+    allow_duplicate_phone: bool = False,
+    **changes: Any,
+) -> Customer:
+    """Validate and update supplied customer fields.
+
+    Pass ``allow_duplicate_phone=True`` after the UI has shown the duplicate
+    warning and the user has chosen to continue.
+    """
+    customer = session.get(Customer, customer_id)
+    if customer is None:
+        raise ValueError("Customer not found")
+    _validate_fields(changes)
+    clean_changes = dict(changes)
+    if "full_name" in clean_changes:
+        clean_changes["full_name"] = clean_changes["full_name"].strip()
+        if not clean_changes["full_name"]:
+            raise ValueError("Customer name cannot be empty")
+    if "category_id" in clean_changes and session.get(Category, clean_changes["category_id"]) is None:
+        raise ValueError("Customer category not found")
+    if "phone" in clean_changes:
+        clean_phone = normalize_phone(clean_changes["phone"])
+        clean_changes["phone"] = clean_phone
+        if clean_phone and not allow_duplicate_phone:
+            matches = find_duplicate_phones(
+                session, clean_phone, exclude_customer_id=customer_id
+            )
+            if matches:
+                raise DuplicateCustomerPhoneError(clean_phone, matches)
+    if "cheques_count" in clean_changes:
+        _validate_cheques_count(clean_changes["cheques_count"])
+    return repositories.update_customer(session, customer_id, **clean_changes)
+
+
+def _validate_fields(fields: dict[str, Any]) -> None:
+    """Reject accidental writes to relationships and generated model fields."""
+    unsupported = sorted(set(fields) - _CUSTOMER_FIELDS)
+    if unsupported:
+        raise ValueError(f"Unsupported customer field: {unsupported[0]}")
+
+
+def _validate_cheques_count(value: int | None) -> None:
+    """Check that an optional cheque count is a nonnegative integer."""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        raise ValueError("Cheque count must be a nonnegative whole number")
