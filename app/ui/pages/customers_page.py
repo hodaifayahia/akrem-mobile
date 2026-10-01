@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableView,
     QVBoxLayout,
+    QSizePolicy,
     QWidget,
     QStyledItemDelegate,
     QStyle,
@@ -590,21 +591,28 @@ class CustomersPage(QWidget):
         date_row.addStretch(1)
         layout.addLayout(date_row)
 
-        legend = QHBoxLayout()
+        # A fixed-height strip: when the list is empty the free space must go
+        # to the empty-state card, not stretch the status pills.
+        legend_bar = QWidget(self)
+        legend_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        legend = QHBoxLayout(legend_bar)
+        legend.setContentsMargins(0, 0, 0, 0)
         legend.setSpacing(8)
         for text, pill in (
             (ar.CUST_FILTER_PAID, "paid"),
             (ar.CUST_FILTER_PENDING, "pending"),
             (ar.CUST_FILTER_FAILED, "failed"),
         ):
-            badge = QLabel(text, self)
+            badge = QLabel(f"●  {text}", legend_bar)  # same dot as the status column
             badge.setProperty("pill", pill)
-            legend.addWidget(badge)
+            badge.setMinimumHeight(24)
+            badge.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            legend.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         legend.addStretch(1)
-        hint = QLabel(ar.CUST_CLICK_HINT, self)
+        hint = QLabel(ar.CUST_CLICK_HINT, legend_bar)
         hint.setObjectName("sectionHint")
-        legend.addWidget(hint)
-        layout.addLayout(legend)
+        legend.addWidget(hint, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(legend_bar)
 
         self.table = QTableView(self)
         self.table.setModel(self._proxy)
