@@ -72,6 +72,10 @@ _PATHS: dict[str, str] = {
     "trend-up": '<path d="M3.5 17l6-6 4 4 7-7.5"/><path d="M15 7.5h5.5V13"/>',
     "cash": '<rect x="2.5" y="6" width="19" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/>'
     '<path d="M6 9.5v5M18 9.5v5"/>',
+    "upload": '<path d="M12 15.5v-11"/><path d="M7.5 9l4.5-4.5 4.5 4.5"/>'
+    '<path d="M4 15.5v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+    "sheet": '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
+    '<path d="M8.5 12.5h7M8.5 16h7M12 11v7"/>',
     "drag": '<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/>',
 }
 

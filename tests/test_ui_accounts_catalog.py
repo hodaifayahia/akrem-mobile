@@ -101,14 +101,100 @@ def test_products_page_lists_prices_quote_and_hides_wholesale_from_sellers(shop)
 
     duplicate = ProductDialog(title="x", parent=page)
     duplicate.name.setText("Galaxy A15")
+    duplicate.cash_price.setValue(27000)
     assert not page.save_dialog(duplicate)
-    assert duplicate.error.text.text() == ar.SET_PRODUCT_ERROR
+    assert duplicate.error.text.text() == ar.PROD_DUPLICATE_NAME
 
     seller_page = ProductsPage(_user(shop["seller"]))
     seller_headers = [seller_page.table.horizontalHeaderItem(c).text()
                       for c in range(seller_page.table.columnCount())]
     assert ar.SET_PRODUCT_WHOLESALE not in seller_headers
-    assert seller_page.add_button.isHidden()
+    for button in (seller_page.add_button, seller_page.template_button, seller_page.upload_button):
+        assert button.isHidden()
+
+
+def test_product_dialog_requires_only_name_and_price(shop) -> None:
+    from app.ui.pages.products_page import ProductDialog, ProductsPage
+
+    page = ProductsPage(_user(shop["owner"]))
+    dialog = ProductDialog(title="x", parent=page)
+    assert dialog.wholesale_price.specialValueText() == ar.PROD_OPTIONAL
+
+    assert not page.save_dialog(dialog)
+    assert dialog.error.text.text() == ar.PROD_NAME_REQUIRED
+    dialog.name.setText("Nokia 105")
+    assert not page.save_dialog(dialog)
+    assert dialog.error.text.text() == ar.PROD_PRICE_REQUIRED
+
+    dialog.cash_price.setValue(4500)  # wholesale left empty
+    assert page.save_dialog(dialog)
+    row = [page.table.item(r, 0).text() for r in range(page.table.rowCount())].index("Nokia 105")
+    assert page.table.item(row, page._columns.index("wholesale")).text() == "—"
+    assert page.table.item(row, page._columns.index("margin")).text() == "—"
+    with session_scope() as session:
+        saved = {p.name: p for p in products.list_products(session)}["Nokia 105"]
+        assert (saved.cash_price, saved.wholesale_price) == (4500, 0)
+
+
+def test_products_page_downloads_template_and_uploads_products(shop, monkeypatch) -> None:
+    from openpyxl import load_workbook
+    from PySide6.QtWidgets import QFileDialog
+
+    from app.ui.pages import products_page
+    from app.ui.pages.products_page import ProductImportDialog, ProductsPage
+
+    page = ProductsPage(_user(shop["owner"]))
+    assert page.template_button.isVisibleTo(page) and page.upload_button.isVisibleTo(page)
+
+    target = Path(shop["tmp"]) / "out" / "products"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+    page.template_button.click()
+    template = target.with_suffix(".xlsx")
+    assert template.exists()
+
+    workbook = load_workbook(template)
+    sheet = workbook.worksheets[0]
+    sheet.append(["Redmi 13", 33000, None])        # price update, wholesale kept
+    sheet.append(["Galaxy A05", "21,000 دج", None])  # new product without wholesale
+    sheet.append(["Bad row", None, 1000])            # rejected: no price
+    workbook.save(template)
+
+    shown: list[ProductImportDialog] = []
+
+    def fake_exec(dialog):
+        shown.append(dialog)
+        assert dialog.import_button.isEnabled()
+        dialog.import_button.click()
+        return 1
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(template), ""))
+    monkeypatch.setattr(ProductImportDialog, "exec", fake_exec)
+    page.upload_button.click()
+
+    dialog = shown[0]
+    results = [dialog.table.item(r, 4).text() for r in range(dialog.table.rowCount())]
+    assert results == [ar.PROD_ACTION_UPDATE, ar.PROD_ACTION_CREATE, ar.PROD_ACTION_INVALID]
+    assert ar.PROD_ERR_PRICE_MISSING in dialog.table.item(2, 5).text()
+    assert dialog.result() == 1
+    with session_scope() as session:
+        catalog = {p.name: p for p in products.list_products(session)}
+        assert (catalog["Redmi 13"].cash_price, catalog["Redmi 13"].wholesale_price) == (33000, 25000)
+        assert (catalog["Galaxy A05"].cash_price, catalog["Galaxy A05"].wholesale_price) == (21000, 0)
+        assert "Bad row" not in catalog
+    names = [page.table.item(r, 0).text() for r in range(page.table.rowCount())]
+    assert "Galaxy A05" in names
+
+    # A sheet without product columns is refused with a clear message.
+    other = Path(shop["tmp"]) / "customers.xlsx"
+    from openpyxl import Workbook
+    book = Workbook()
+    book.active.append(["الاسم واللقب", "الهاتف"])
+    book.active.append(["علي", "0550"])
+    book.save(other)
+    warnings: list[str] = []
+    monkeypatch.setattr(products_page.QMessageBox, "warning", lambda _p, _t, text: warnings.append(text))
+    assert page.preview_upload(other) is None
+    assert warnings == [ar.PROD_UPLOAD_NO_HEADER]
 
 
 # ----------------------------------------------------- new client + purchase

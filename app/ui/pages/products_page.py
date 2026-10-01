@@ -1,19 +1,22 @@
 """Product catalog: prices, an installment quote, sales count, archive state.
 
 Everyone can browse active products and their selling price (sellers use
-them to quote customers). Wholesale prices, margins, editing and archiving
-are owner-only, and the product service re-checks the owner role.
+them to quote customers). Wholesale prices, margins, editing, archiving and
+the Excel template/upload are owner-only, and the product service re-checks
+the owner role. A product needs only a name and a selling price.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -39,13 +42,14 @@ from app.services.settings import get_rate_presets
 from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
+from app.ui.theme import qcolor, repolish
 
 _LOG = logging.getLogger(__name__)
 QUOTE_MONTHS = 6
 
 
 class ProductDialog(QDialog):
-    """Name, wholesale price and selling price of a catalog product."""
+    """Name and selling price (required) plus an optional wholesale price."""
 
     def __init__(self, *, title: str, product: Product | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -56,28 +60,44 @@ class ProductDialog(QDialog):
         heading = QLabel(title, self)
         heading.setObjectName("sectionTitle")
         layout.addWidget(heading)
+        hint = QLabel(ar.PROD_REQUIRED_HINT, self)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         self.name = QLineEdit(self)
         self.name.setMaxLength(180)
-        self.wholesale_price = self._money_input()
         self.cash_price = self._money_input()
+        self.wholesale_price = self._money_input()
+        self.wholesale_price.setSpecialValueText(ar.PROD_OPTIONAL)
         if product is not None:
             self.name.setText(product.name)
             self.wholesale_price.setValue(product.wholesale_price)
             self.cash_price.setValue(product.cash_price)
         form = QFormLayout()
-        form.addRow(ar.SET_PRODUCT_NAME, self.name)
-        form.addRow(ar.SET_PRODUCT_WHOLESALE, self.wholesale_price)
-        form.addRow(ar.SET_PRODUCT_CASH, self.cash_price)
+        form.addRow(f"{ar.SET_PRODUCT_NAME} *", self.name)
+        form.addRow(f"{ar.SET_PRODUCT_CASH} *", self.cash_price)
+        form.addRow(f"{ar.SET_PRODUCT_WHOLESALE} ({ar.PROD_OPTIONAL})", self.wholesale_price)
         layout.addLayout(form)
         self.error = InlineError(self)
         layout.addWidget(self.error)
+        self.name.textEdited.connect(self.error.clear)
+        self.cash_price.valueChanged.connect(self.error.clear)
         buttons = QDialogButtonBox(self)
         self.save_button = buttons.addButton(ar.USER_SAVE, QDialogButtonBox.ButtonRole.AcceptRole)
         cancel = buttons.addButton(ar.USER_CANCEL, QDialogButtonBox.ButtonRole.RejectRole)
         cancel.setProperty("variant", "secondary")
+        repolish(cancel)
         cancel.clicked.connect(self.reject)
         layout.addWidget(buttons)
         self.name.setFocus()
+
+    def missing_field_message(self) -> str | None:
+        """The message for the first empty required field, or None when complete."""
+        if not self.name.text().strip():
+            return ar.PROD_NAME_REQUIRED
+        if self.cash_price.value() <= 0:
+            return ar.PROD_PRICE_REQUIRED
+        return None
 
     def _money_input(self) -> QSpinBox:
         editor = QSpinBox(self)
@@ -119,13 +139,21 @@ class ProductsPage(QWidget):
         titles.addWidget(title)
         titles.addWidget(self.count_label)
         header.addLayout(titles, 1)
+        self.template_button = self._action(ar.PROD_TEMPLATE_BUTTON, "sheet", "secondary")
+        self.template_button.setToolTip(ar.PROD_TEMPLATE_TOOLTIP)
+        self.template_button.clicked.connect(self._download_template)
+        self.upload_button = self._action(ar.PROD_UPLOAD_BUTTON, "upload", "secondary")
+        self.upload_button.setToolTip(ar.PROD_UPLOAD_TOOLTIP)
+        self.upload_button.clicked.connect(self._upload)
         self.edit_button = self._action(ar.SET_PRODUCT_EDIT, "edit", "secondary")
         self.edit_button.clicked.connect(self._edit_selected)
         self.archive_button = self._action(ar.SET_PRODUCT_ARCHIVE, "tray", "secondary")
         self.archive_button.clicked.connect(self._toggle_selected)
         self.add_button = self._action(ar.SET_PRODUCT_ADD, "plus", None)
         self.add_button.clicked.connect(self._create)
-        for button in (self.edit_button, self.archive_button, self.add_button):
+        for button in (
+            self.template_button, self.upload_button, self.edit_button, self.archive_button, self.add_button,
+        ):
             button.setVisible(self._is_owner)
             header.addWidget(button)
         layout.addLayout(header)
@@ -251,11 +279,11 @@ class ProductsPage(QWidget):
         if key == "name":
             return product.name
         if key == "wholesale":
-            return _money(product.wholesale_price)
+            return _money(product.wholesale_price) if product.wholesale_price else "—"
         if key == "cash":
             return _money(product.cash_price)
         if key == "margin":
-            return _money(product.cash_price - product.wholesale_price)
+            return _money(product.cash_price - product.wholesale_price) if product.wholesale_price else "—"
         if key == "quote":
             return self._quote(product)
         if key == "sold":
@@ -305,6 +333,11 @@ class ProductsPage(QWidget):
 
     def save_dialog(self, dialog: ProductDialog, product_id: int | None = None) -> bool:
         """Create or update from a filled dialog; errors stay inline."""
+        missing = dialog.missing_field_message()
+        if missing is not None:
+            dialog.error.show_message(missing)
+            (dialog.name if missing == ar.PROD_NAME_REQUIRED else dialog.cash_price).setFocus()
+            return False
         values = {
             "name": dialog.name.text(),
             "wholesale_price": dialog.wholesale_price.value(),
@@ -319,6 +352,9 @@ class ProductsPage(QWidget):
         except auth.AuthorizationError:
             dialog.error.show_message(ar.SET_OWNER_ONLY)
             return False
+        except products.ProductNameTakenError:
+            dialog.error.show_message(ar.PROD_DUPLICATE_NAME)
+            return False
         except (ValueError, SQLAlchemyError):
             dialog.error.show_message(ar.SET_PRODUCT_ERROR)
             return False
@@ -326,6 +362,79 @@ class ProductsPage(QWidget):
         events.data_changed.emit()
         events.notify.emit("success", ar.NAV_PRODUCTS, ar.SET_PRODUCT_SAVED, 3000)
         return True
+
+    # ------------------------------------------------------------ Excel
+    def _download_template(self) -> None:
+        selected, _filter = QFileDialog.getSaveFileName(
+            self, ar.PROD_TEMPLATE_BUTTON, ar.PROD_TEMPLATE_FILE, ar.IMP_TEMPLATE_FILTER
+        )
+        if selected:
+            self.save_template(selected)
+
+    def save_template(self, destination: str | Path) -> Path | None:
+        """Write the product template; returns its path, or None after showing the error."""
+        path = Path(destination)
+        if path.suffix.casefold() != ".xlsx":
+            path = path.with_suffix(".xlsx")
+        try:
+            products.write_product_template(path)
+        except OSError:
+            _LOG.exception("Product template could not be written")
+            QMessageBox.warning(self, ar.ERROR_TITLE, ar.PROD_TEMPLATE_ERROR)
+            return None
+        events.notify.emit("success", ar.NAV_PRODUCTS, ar.PROD_TEMPLATE_SAVED.format(path=path), 5000)
+        return path
+
+    def _upload(self) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(self, ar.PROD_UPLOAD_CHOOSE, "", ar.IMP_TEMPLATE_FILTER)
+        if not selected:
+            return
+        preview = self.preview_upload(selected)
+        if preview is None:
+            return
+        dialog = ProductImportDialog(preview, parent=self)
+        dialog.import_button.clicked.connect(lambda: self.import_preview(dialog))
+        dialog.exec()
+
+    def preview_upload(self, source: str | Path) -> products.ProductImportPreview | None:
+        """Read and check an uploaded sheet; shows why when it cannot be used."""
+        try:
+            with session_scope() as session:
+                return products.preview_product_workbook(session, source)
+        except products.ProductWorkbookError as error:
+            message = {
+                "unreadable": ar.PROD_UPLOAD_UNREADABLE,
+                "no_header": ar.PROD_UPLOAD_NO_HEADER,
+                "empty": ar.PROD_UPLOAD_EMPTY,
+                "too_many_rows": ar.PROD_UPLOAD_TOO_MANY.format(limit=products.MAX_IMPORT_ROWS),
+            }.get(error.code, ar.PROD_UPLOAD_UNREADABLE)
+        except SQLAlchemyError:
+            _LOG.exception("Product upload preview failed")
+            message = ar.PROD_UPLOAD_FAILED
+        QMessageBox.warning(self, ar.PROD_UPLOAD_TITLE, message)
+        return None
+
+    def import_preview(self, dialog: "ProductImportDialog") -> products.ProductImportResult | None:
+        """Save the valid rows shown in the preview dialog; all or nothing."""
+        try:
+            with session_scope() as session:
+                result = products.import_products(session, self.current_user.id, dialog.preview.rows)
+        except auth.AuthorizationError:
+            dialog.error.show_message(ar.SET_OWNER_ONLY)
+            return None
+        except (ValueError, SQLAlchemyError):
+            _LOG.exception("Product upload failed")
+            dialog.error.show_message(ar.PROD_UPLOAD_FAILED)
+            return None
+        dialog.accept()
+        events.data_changed.emit()
+        events.notify.emit(
+            "success",
+            ar.NAV_PRODUCTS,
+            ar.PROD_UPLOAD_DONE.format(created=result.created, updated=result.updated, restored=result.restored),
+            5000,
+        )
+        return result
 
     def _toggle_selected(self) -> None:
         product = self.selected_product()
@@ -338,6 +447,127 @@ class ProductsPage(QWidget):
             QMessageBox.warning(self, ar.ERROR_TITLE, ar.SET_PRODUCT_ERROR)
             return
         events.data_changed.emit()
+
+
+class ProductImportDialog(QDialog):
+    """Row-by-row preview of an uploaded product sheet before anything is saved."""
+
+    def __init__(self, preview: products.ProductImportPreview, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.preview = preview
+        self.setWindowTitle(ar.PROD_UPLOAD_TITLE)
+        self.setMinimumSize(760, 480)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(8)
+        heading = QLabel(ar.PROD_UPLOAD_TITLE, self)
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+        source = QLabel(ar.PROD_UPLOAD_FILE.format(name=preview.path.name, sheet=preview.sheet_name), self)
+        source.setObjectName("sectionHint")
+        layout.addWidget(source)
+        self.summary = QLabel(ar.PROD_UPLOAD_SUMMARY.format(
+            create=preview.count(products.ACTION_CREATE),
+            update=preview.count(products.ACTION_UPDATE),
+            restore=preview.count(products.ACTION_RESTORE),
+            unchanged=preview.count(products.ACTION_UNCHANGED),
+            invalid=preview.count(products.ACTION_INVALID),
+        ), self)
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        hint = QLabel(ar.PROD_UPLOAD_HINT, self)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        headers = [
+            ar.PROD_UPLOAD_COL_ROW, ar.SET_PRODUCT_NAME, ar.SET_PRODUCT_CASH, ar.SET_PRODUCT_WHOLESALE,
+            ar.PROD_UPLOAD_COL_RESULT, ar.PROD_UPLOAD_COL_NOTES,
+        ]
+        self.table = QTableWidget(len(preview.rows), len(headers), self)
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setStretchLastSection(True)
+        for row, item in enumerate(preview.rows):
+            tone = _ACTION_TONES[item.action]
+            notes = [_problem_text(code) for code in item.errors + item.warnings]
+            cells = (
+                str(item.row_number),
+                item.name or "—",
+                _money(item.cash_price) if item.cash_price is not None else "—",
+                _money(item.wholesale_price) if item.wholesale_price is not None else "—",
+                action_label(item.action),
+                " · ".join(notes),
+            )
+            for column, text in enumerate(cells):
+                cell = QTableWidgetItem(text)
+                if column != 1 and column != 5:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 4 or (column == 5 and item.errors):
+                    cell.setForeground(qcolor(tone))
+                self.table.setItem(row, column, cell)
+        layout.addWidget(self.table, 1)
+
+        self.error = InlineError(self)
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(self)
+        importable = sum(
+            1 for item in preview.rows
+            if item.action in (products.ACTION_CREATE, products.ACTION_UPDATE, products.ACTION_RESTORE)
+        )
+        self.import_button = buttons.addButton(
+            ar.PROD_UPLOAD_CONFIRM.format(count=importable), QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.import_button.setIcon(icons.icon("upload", "#FFFFFF", 16))
+        self.import_button.setEnabled(preview.has_changes)
+        cancel = buttons.addButton(ar.USER_CANCEL, QDialogButtonBox.ButtonRole.RejectRole)
+        cancel.setProperty("variant", "secondary")
+        repolish(cancel)
+        cancel.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+        if not preview.has_changes:
+            self.error.show_message(ar.PROD_UPLOAD_NOTHING)
+
+
+_ACTION_TONES = {
+    products.ACTION_CREATE: "paid",
+    products.ACTION_UPDATE: "primary-glow",
+    products.ACTION_RESTORE: "primary-glow",
+    products.ACTION_UNCHANGED: "text-muted",
+    products.ACTION_INVALID: "failed",
+}
+
+
+def action_label(action: str) -> str:
+    """Localized result of importing one row."""
+    return {
+        products.ACTION_CREATE: ar.PROD_ACTION_CREATE,
+        products.ACTION_UPDATE: ar.PROD_ACTION_UPDATE,
+        products.ACTION_RESTORE: ar.PROD_ACTION_RESTORE,
+        products.ACTION_UNCHANGED: ar.PROD_ACTION_UNCHANGED,
+        products.ACTION_INVALID: ar.PROD_ACTION_INVALID,
+    }[action]
+
+
+def _problem_text(code: str) -> str:
+    """Localized row error or warning."""
+    return {
+        products.ERROR_NAME_MISSING: ar.PROD_ERR_NAME_MISSING,
+        products.ERROR_NAME_TOO_LONG: ar.PROD_ERR_NAME_TOO_LONG,
+        products.ERROR_PRICE_MISSING: ar.PROD_ERR_PRICE_MISSING,
+        products.ERROR_PRICE_INVALID: ar.PROD_ERR_PRICE_INVALID,
+        products.ERROR_WHOLESALE_INVALID: ar.PROD_ERR_WHOLESALE_INVALID,
+        products.ERROR_DUPLICATE: ar.PROD_ERR_DUPLICATE,
+        products.WARNING_NO_WHOLESALE: ar.PROD_WARN_NO_WHOLESALE,
+        products.WARNING_BELOW_WHOLESALE: ar.PROD_WARN_BELOW_WHOLESALE,
+    }.get(code, code)
 
 
 def _money(amount: int) -> str:
