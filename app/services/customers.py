@@ -17,6 +17,9 @@ from app.services import repositories
 from app.services.status import Status, for_customer
 
 _MOBILE_RE = re.compile(r"^0[567][0-9]{8}$")
+PAYMENT_KINDS = ("cash", "installment", "credit")
+PAYMENT_FILTERS = ("cash", "facilities", "installment", "credit")
+BALANCE_FILTERS = ("open", "settled")
 _CUSTOMER_FIELDS = {
     "full_name",
     "category_id",
@@ -59,6 +62,21 @@ class CustomerSummary:
     def end_date(self) -> date | None:
         """Return the latest known installment end date."""
         return max((value for value in self.end_dates if value is not None), default=None)
+
+    @property
+    def sale_types(self) -> tuple[str, ...]:
+        """Distinct sale types of this customer, in cash/installment/credit order."""
+        present = {sale.sale_type for sale in self.sales}
+        return tuple(kind for kind in PAYMENT_KINDS if kind in present)
+
+    @property
+    def payment_profile(self) -> str:
+        """``"cash"`` when every purchase was paid in full, ``"facilities"`` when any
+        purchase is paid over time (installment or credit), ``"none"`` without sales."""
+        kinds = self.sale_types
+        if not kinds:
+            return "none"
+        return "cash" if kinds == ("cash",) else "facilities"
 
     @property
     def credit_score(self) -> int:
@@ -123,14 +141,26 @@ def list_customers(
     category_id: int | None = None,
     status: Status | str | None = None,
     search: str | None = None,
+    payment_kind: str | None = None,
+    balance: str | None = None,
 ) -> list[CustomerSummary]:
     """Return customer rows with selected-month status and outstanding balances.
+
+    ``payment_kind``: ``"cash"`` keeps customers who paid every purchase in
+    full; ``"facilities"`` keeps customers paying at least one purchase over
+    time; ``"installment"`` / ``"credit"`` keep customers with such a sale. ``balance`` keeps customers who still
+    owe money (``"open"``) or have nothing left to pay (``"settled"``).
+    The search text matches names, phone numbers and product names.
 
     Customer names and phone numbers are narrowed in a lightweight first query
     when searching. The final query eagerly loads categories, sales, schedules,
     and payment rows, avoiding per-customer database queries for large lists.
     """
     selected_status = _coerce_customer_status(status)
+    if payment_kind not in (None, "", *PAYMENT_FILTERS):
+        raise ValueError(f"Unsupported payment kind: {payment_kind}")
+    if balance not in (None, "", *BALANCE_FILTERS):
+        raise ValueError(f"Unsupported balance filter: {balance}")
     search_key = normalize_search_text(search)
     grace_days = _grace_days(session)
     # Validate the selected period even when the query has no matching rows.
@@ -145,12 +175,21 @@ def list_customers(
         candidates_query = select(Customer.id, Customer.full_name, Customer.phone)
         if category_id is not None:
             candidates_query = candidates_query.where(Customer.category_id == category_id)
-        matching_ids = [
+        matching = {
             customer_id
             for customer_id, full_name, phone in session.execute(candidates_query)
             if search_key in normalize_search_text(full_name)
             or search_key in normalize_search_text(phone)
-        ]
+        }
+        product_query = select(Sale.customer_id, Sale.product)
+        if category_id is not None:
+            product_query = product_query.join(Customer).where(Customer.category_id == category_id)
+        matching.update(
+            customer_id
+            for customer_id, product in session.execute(product_query)
+            if search_key in normalize_search_text(product)
+        )
+        matching_ids = sorted(matching)
         if not matching_ids:
             return []
 
@@ -190,6 +229,8 @@ def list_customers(
         )
         if selected_status is not None and customer_status != selected_status:
             continue
+        if payment_kind and not _matches_payment_kind(customer_sales, payment_kind):
+            continue
 
         monthly_amount = sum(
             installment.amount_due
@@ -210,6 +251,11 @@ def list_customers(
                     )
                     remaining_balance += max(0, installment.amount_due - paid)
 
+        if balance == "open" and remaining_balance <= 0:
+            continue
+        if balance == "settled" and remaining_balance > 0:
+            continue
+
         summary = CustomerSummary(
             id=customer.id,
             full_name=customer.full_name,
@@ -227,6 +273,15 @@ def list_customers(
         )
         result.append(summary)
     return result
+
+
+def _matches_payment_kind(sales: tuple[Sale, ...], payment_kind: str) -> bool:
+    kinds = {sale.sale_type for sale in sales}
+    if payment_kind == "cash":
+        return kinds == {"cash"}
+    if payment_kind == "facilities":
+        return bool(kinds & {"installment", "credit"})
+    return payment_kind in kinds
 
 
 def get_customer_details(session: Session, customer_id: int) -> Customer:

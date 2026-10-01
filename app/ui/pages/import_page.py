@@ -575,7 +575,7 @@ class ImportPage(QWidget):
         events.notify.emit(
             "success",
             ar.IMP_DONE_TITLE,
-            f"تم استيراد {result.imported} سجل بنجاح",
+            ar.IMP_DONE_TOAST.format(count=result.imported),
             5000,
         )
         summary = ar.IMP_DONE_SUMMARY.format(

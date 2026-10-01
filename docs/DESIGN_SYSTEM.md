@@ -193,6 +193,20 @@ with session_scope() as session:
     categories.delete_client_type(session, owner_id, old_type_id, reassign_to_id=teachers.id)
 ```
 
+### Cash vs installment customers
+
+A customer's *payment profile* is **cash** when every purchase was paid in full, and **facilities** when any purchase is paid over time (installment or credit). See `CustomerSummary.sale_types` and `CustomerSummary.payment_profile`.
+
+- **Customers page:**
+  - a *Payment* column shows one coloured tag per sale type (كاش green, بالتقسيط blue, كريدي amber)
+  - the *Payment* filter: All / Cash (paid in full) / Installments or credit / Installments / Credit
+  - the *Balance* filter: All / Still owes money / Fully paid
+  - search also matches product names
+  - a totals line shows the count, the amount due this month and the amount remaining for the filtered list
+  - **Export list to Excel** saves exactly what is on screen
+- **Dashboard:** a *Payment method* row shows cash customers and installment/credit customers (each opens the filtered list) and this month's sales split by type.
+- **Reports page (owner):** **Export all data** writes one workbook with sheets for customers, sales, installments, payments and client types. It uses real Excel dates (`dd/mm/yyyy`) and grouped dinar amounts.
+
 UI:
 
 - **Customers page:**
@@ -265,6 +279,17 @@ hub.post("warning", ar.NOTIF_NEW_OVERDUE_TITLE, body,
   - language switching (direction, lazy rebuild, per-PC storage), close-to-tray and the deferred lock
   - the client-type editor and filters
 - `tests/test_client_types.py` and `tests/test_alerts.py` cover the services.
+- `tests/test_owner_requirements.py` checks the owner's requirements end to end on a migrated SQLite file. It has one test per requirement:
+  - the categories, plus 12 extra types
+  - list columns
+  - orange, red and green monthly status
+  - the 7-field price table after clicking a name
+  - dashboard wholesale total and operation counts
+  - cash vs facilities
+  - Excel upload and template
+  - every Excel export
+  - backup and restore, and the automatic backup
+  - notification center and background monitor
 
 ### Manual checks on Windows
 

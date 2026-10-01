@@ -431,7 +431,7 @@ class CustomerDetailsDialog(QDialog):
         rate_text = f"{sale.rate}%"
         total_text = self._money(sale.total)
         monthly_text = self._money(sale.monthly_amount)
-        months_text = f"{sale.months} أشهر" if sale.months is not None else "—"
+        months_text = ar.MONTHS_COUNT.format(count=sale.months) if sale.months is not None else "—"
         profit_text = self._money(sale.profit) if is_owner else "—"
 
         values = [
@@ -858,7 +858,7 @@ class CustomerDetailsDialog(QDialog):
     @staticmethod
     def _money(amount: int | None) -> str:
         """Format integer DZD amounts without introducing floating point."""
-        return "—" if amount is None else f"{amount:,} دج"
+        return "—" if amount is None else f"{amount:,} {ar.CURRENCY_SUFFIX}"
 
     @staticmethod
     def _format_date(value: date | None) -> str:

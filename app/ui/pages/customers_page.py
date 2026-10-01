@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QDate, QSortFilterProxyModel, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QDate, QRectF, QSortFilterProxyModel, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -35,11 +36,13 @@ from sqlalchemy.orm import Session
 from app.db.models import Category, User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, categories, customers
+from app.config import data_dir
+from app.services import auth, categories, customers, reports
 from app.services.categories import ClientType, ClientTypeError
 from app.services.customers import CustomerSummary, DuplicateCustomerPhoneError
 from app.services.status import Status
 from app.ui import icons
+from app.ui.theme import qcolor
 from app.ui.dialogs.client_types_dialog import AssignTypeDialog, ClientTypesDialog, error_text
 from app.ui.events import events
 from app.ui.widgets.client_types import TypeFilterBar, TypeTagDelegate
@@ -52,6 +55,9 @@ _STATUS_COLORS = {
 }
 _LOG = logging.getLogger(__name__)
 TYPE_COLUMN = 6
+PAYMENT_COLUMN = 7
+MONTHLY_COLUMN = 8
+REMAINING_COLUMN = 9
 
 
 def _status_tooltips() -> dict[Status, str]:
@@ -74,6 +80,7 @@ def _headers() -> tuple[str, ...]:
         ar.CUST_COL_PURCHASE_DATE,
         ar.CUST_COL_END_DATE,
         ar.CUST_COL_CATEGORY,
+        ar.CUST_COL_PAYMENT_KIND,
         ar.CUST_COL_MONTHLY_DUE,
         ar.CUST_COL_REMAINING,
     )
@@ -127,7 +134,7 @@ class _CustomerTableModel(QAbstractTableModel):
             return self.data(index, Qt.ItemDataRole.DisplayRole)
         if role == Qt.ItemDataRole.UserRole:
             return self._sort_value(summary, column)
-        if role == Qt.ItemDataRole.TextAlignmentRole and column in {0, 4, 5, 7, 8}:
+        if role == Qt.ItemDataRole.TextAlignmentRole and column in {0, 4, 5, MONTHLY_COLUMN, REMAINING_COLUMN}:
             return int(Qt.AlignmentFlag.AlignCenter)
         if role != Qt.ItemDataRole.DisplayRole:
             return None
@@ -145,9 +152,11 @@ class _CustomerTableModel(QAbstractTableModel):
             return self._date_text(summary.end_date)
         if column == 6:
             return summary.category_name
-        if column == 7:
+        if column == PAYMENT_COLUMN:
+            return " · ".join(_payment_label(kind) for kind in summary.sale_types)
+        if column == MONTHLY_COLUMN:
             return self._money_text(summary.monthly_amount)
-        if column == 8:
+        if column == REMAINING_COLUMN:
             return self._money_text(summary.remaining_balance)
         return None
 
@@ -192,11 +201,54 @@ class _CustomerTableModel(QAbstractTableModel):
             return summary.end_date or date.min
         if column == 6:
             return summary.category_name.casefold()
-        if column == 7:
+        if column == PAYMENT_COLUMN:
+            return summary.payment_profile + ",".join(summary.sale_types)
+        if column == MONTHLY_COLUMN:
             return summary.monthly_amount
-        if column == 8:
+        if column == REMAINING_COLUMN:
             return summary.remaining_balance
         return ""
+
+
+_PAYMENT_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending"}
+
+
+def _payment_label(kind: str) -> str:
+    return {"cash": ar.SALE_CASH, "installment": ar.SALE_INSTALLMENT, "credit": ar.SALE_CREDIT}.get(kind, kind)
+
+
+class _PaymentKindDelegate(QStyledItemDelegate):
+    """Draw one small coloured pill per sale type: cash, installment, credit."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        base = QStyleOptionViewItem(option)
+        self.initStyleOption(base, index)
+        base.text = ""
+        style = base.widget.style() if base.widget is not None else self.parent().style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, base, painter, base.widget)
+        summary = index.data(_CustomerTableModel.SUMMARY_ROLE)
+        if summary is None:
+            return
+        rtl = option.direction == Qt.LayoutDirection.RightToLeft
+        metrics = option.fontMetrics
+        x = option.rect.right() - 6 if rtl else option.rect.left() + 6
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for kind in summary.sale_types:
+            text = _payment_label(kind)
+            width = metrics.horizontalAdvance(text) + 16
+            left = x - width if rtl else x
+            rect = QRectF(left, option.rect.center().y() - 10, width, 20)
+            color = qcolor(_PAYMENT_TONES.get(kind, "text-muted"))
+            fill = QColor(color)
+            fill.setAlpha(38)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 10, 10)
+            painter.setPen(color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            x = left - 4 if rtl else left + width + 4
+        painter.restore()
 
 
 class _StatusDotDelegate(QStyledItemDelegate):
@@ -400,6 +452,13 @@ class CustomersPage(QWidget):
         titles.addWidget(self.count_label)
         title_row.addLayout(titles, 1)
 
+        self.export_button = QPushButton(ar.CUST_EXPORT, self)
+        self.export_button.setProperty("variant", "secondary")
+        self.export_button.setIcon(icons.icon("import", "text", 16))
+        self.export_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_button.clicked.connect(self._export_list)
+        title_row.addWidget(self.export_button)
+
         self.assign_type_button = QPushButton(ar.CT_ASSIGN, self)
         self.assign_type_button.setProperty("variant", "secondary")
         self.assign_type_button.setIcon(icons.icon("tag", "text", 16))
@@ -453,6 +512,32 @@ class CustomersPage(QWidget):
             self.status_filter.addItem(label, value)
         self.status_filter.currentIndexChanged.connect(self.refresh)
         filter_row.addWidget(self.status_filter)
+        payment_label = QLabel(ar.CUST_PAYMENT_FILTER, self)
+        payment_label.setObjectName("sectionHint")
+        filter_row.addWidget(payment_label)
+        self.payment_filter = QComboBox(self)
+        for label, value in (
+            (ar.CUST_PAY_ALL, None),
+            (ar.CUST_PAY_CASH, "cash"),
+            (ar.CUST_PAY_FACILITIES, "facilities"),
+            (ar.CUST_PAY_INSTALLMENT, "installment"),
+            (ar.CUST_PAY_CREDIT, "credit"),
+        ):
+            self.payment_filter.addItem(label, value)
+        self.payment_filter.currentIndexChanged.connect(self.refresh)
+        filter_row.addWidget(self.payment_filter)
+        balance_label = QLabel(ar.CUST_BALANCE_FILTER, self)
+        balance_label.setObjectName("sectionHint")
+        filter_row.addWidget(balance_label)
+        self.balance_filter = QComboBox(self)
+        for label, value in (
+            (ar.CUST_BALANCE_ALL, None),
+            (ar.CUST_BALANCE_OPEN, "open"),
+            (ar.CUST_BALANCE_SETTLED, "settled"),
+        ):
+            self.balance_filter.addItem(label, value)
+        self.balance_filter.currentIndexChanged.connect(self.refresh)
+        filter_row.addWidget(self.balance_filter)
         month_label = QLabel(ar.DASHBOARD_MONTH, self)
         month_label.setObjectName("sectionHint")
         filter_row.addWidget(month_label)
@@ -500,12 +585,13 @@ class CustomersPage(QWidget):
         header.setMinimumSectionSize(48)
         header.setSectionResizeMode(0, header.ResizeMode.Fixed)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
-        for column, width in {0: 56, 2: 115, 3: 135, 4: 100, 5: 110, 6: 140, 7: 120, 8: 120}.items():
+        for column, width in {0: 52, 2: 108, 3: 120, 4: 92, 5: 100, 6: 122, 7: 100, 8: 108, 9: 112}.items():
             self.table.setColumnWidth(column, width)
         self.table.setItemDelegateForColumn(0, _StatusDotDelegate(self.table))
         self.table.setItemDelegateForColumn(
             TYPE_COLUMN, TypeTagDelegate(_CustomerTableModel.TYPE_COLOR_ROLE, self.table)
         )
+        self.table.setItemDelegateForColumn(PAYMENT_COLUMN, _PaymentKindDelegate(self.table))
         self.table.clicked.connect(self._cell_clicked)
         self.table.doubleClicked.connect(self._open_row)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
@@ -561,6 +647,8 @@ class CustomersPage(QWidget):
                     category_id=preferred_type,
                     status=self.status_filter.currentData(),
                     search=self.search.text().strip() or None,
+                    payment_kind=self.payment_filter.currentData(),
+                    balance=self.balance_filter.currentData(),
                 )
         except (ValueError, RuntimeError, SQLAlchemyError):
             # Refreshes run in response to events; a modal box here could
@@ -574,7 +662,11 @@ class CustomersPage(QWidget):
         self._model.replace_rows(summaries)
         header = self.table.horizontalHeader()
         self.table.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
-        self.count_label.setText(ar.CT_COUNT.format(count=len(summaries)))
+        self.count_label.setText(ar.CUST_SUMMARY.format(
+            count=len(summaries),
+            monthly=_CustomerTableModel._money_text(sum(item.monthly_amount for item in summaries)),
+            remaining=_CustomerTableModel._money_text(sum(item.remaining_balance for item in summaries)),
+        ))
         is_empty = len(summaries) == 0
         self.empty_card.setVisible(is_empty)
         self.table.setVisible(not is_empty)
@@ -589,6 +681,42 @@ class CustomersPage(QWidget):
         index = self.status_filter.findData(value)
         if index >= 0:
             self.status_filter.setCurrentIndex(index)
+
+    def set_payment_filter(self, kind: str | None) -> None:
+        """Select a payment filter (``cash``, ``facilities``, ...); ``None`` for all."""
+        index = self.payment_filter.findData(kind) if kind else 0
+        if index >= 0:
+            self.payment_filter.setCurrentIndex(index)
+
+    def visible_summaries(self) -> list[CustomerSummary]:
+        """Return the rows in their on-screen (sorted) order."""
+        return [
+            summary for row in range(self._proxy.rowCount())
+            if (summary := self._summary_from_proxy_row(row)) is not None
+        ]
+
+    def _export_list(self) -> None:
+        """Save the customers currently listed (with all filters) as an Excel file."""
+        default = str(data_dir() / "exports" / ar.CUST_EXPORT_FILENAME)
+        selected, _filter = QFileDialog.getSaveFileName(
+            self, ar.CUST_EXPORT_TITLE, default, ar.IMP_TEMPLATE_FILTER
+        )
+        if not selected:
+            return
+        self.export_to(selected)
+
+    def export_to(self, destination: str) -> bool:
+        """Write the visible list to ``destination``; returns success."""
+        rows = self.visible_summaries()
+        path = destination if destination.casefold().endswith(".xlsx") else destination + ".xlsx"
+        try:
+            reports.export_customers_xlsx(rows, path)
+        except OSError:
+            _LOG.exception("Customer export failed")
+            self._show_error(ar.CUST_EXPORT_ERROR)
+            return False
+        events.notify.emit("success", ar.CUST_EXPORT_TITLE, ar.CUST_EXPORT_DONE.format(count=len(rows)), 4000)
+        return True
 
     def edit_customer_by_id(self, customer_id: int) -> None:
         """Open the owner edit form for a customer from another screen."""
@@ -607,6 +735,8 @@ class CustomersPage(QWidget):
         """Clear the search, status and type filters."""
         self.search.clear()
         self.status_filter.setCurrentIndex(0)
+        self.payment_filter.setCurrentIndex(0)
+        self.balance_filter.setCurrentIndex(0)
         self.type_filter.set_types(self._types, None)
         self.refresh()
 

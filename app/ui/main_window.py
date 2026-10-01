@@ -157,6 +157,7 @@ class MainWindow(QMainWindow):
         setattr(self, self._PAGE_ATTRIBUTES[index], page)
         if index == PAGE_DASHBOARD:
             page.status_filter_requested.connect(self._show_customer_status)
+            page.payment_filter_requested.connect(self._show_customer_payment_kind)
             page.open_customer_requested.connect(self._open_customer_details)
             page.view_overdue_requested.connect(lambda: self._select_page(PAGE_PAYMENTS))
         elif index == PAGE_CUSTOMERS:
@@ -222,6 +223,14 @@ class MainWindow(QMainWindow):
         if month is not None:
             self.customers_page.month_selector.setDate(month)
         self.customers_page.set_status_filter(status)
+
+    def _show_customer_payment_kind(self, kind: str) -> None:
+        """Open the customer list filtered to cash or installment/credit customers."""
+        if self.customers_page is None:
+            return
+        self._select_page(PAGE_CUSTOMERS)
+        self.customers_page.set_status_filter("ALL")
+        self.customers_page.set_payment_filter(kind)
 
     def _open_customer_details(self, customer_id: int) -> None:
         """Open the selected customer's sale and payment history."""

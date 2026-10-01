@@ -16,6 +16,8 @@ Arabic, right-to-left Windows desktop application for managing customers, phone 
 - Owner settings for users, product prices, installment rules, local backups, and restore.
 - Arabic (right-to-left), English and French (left-to-right) interface with live switching; the layout, icons and charts mirror with the language. The language is saved per PC.
 - Client types: four defaults plus a protected "غير مصنف" type; the owner can add, rename, recolour, reorder and delete types (moving their customers), filter the customer list by type and assign a type to several customers at once.
+- Cash vs. installment customers: the customer list shows each customer's payment method (cash / installment / credit) and filters cash-only customers, customers paying little by little, installment or credit customers, and customers who still owe money or are fully paid; search also matches product names. The dashboard counts cash and installment/credit customers and this month's sales by type.
+- Excel exports: the filtered customer list, monthly collection, overdue list, profit by month, and (owner only) a full workbook with customers, sales, installments, payments and client types.
 - Runs in the Windows system tray: closing the window keeps the app (and its collection monitor and backups) running; a second launch brings the existing window forward.
 - Notifications: an in-app notification center (overdue, upcoming, activity) and native Windows toasts for the daily collection digest and newly overdue installments while the window is in the background.
 

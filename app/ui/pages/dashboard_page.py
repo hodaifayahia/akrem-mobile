@@ -97,6 +97,7 @@ class DashboardPage(QWidget):
     """High-level sales and collection figures for a selected month."""
 
     status_filter_requested = Signal(str)
+    payment_filter_requested = Signal(str)
     open_customer_requested = Signal(int)
     view_overdue_requested = Signal()
 
@@ -144,6 +145,22 @@ class DashboardPage(QWidget):
         self.failed_card.clicked.connect(lambda: self.status_filter_requested.emit("FAILED"))
         self.wholesale_card.clicked.connect(lambda: self.status_filter_requested.emit("ALL"))
         layout.addWidget(self.status_grid)
+
+        layout.addWidget(self._section_title(ar.DASH_SECTION_MIX))
+        self.mix_grid = ResponsiveGrid(max_columns=3, parent=body)
+        self.cash_customers_card = StatCard(ar.DASH_MIX_CASH_CUSTOMERS, color="paid", icon="cash",
+                                            subtitle=ar.DASH_MIX_CASH_CAPTION)
+        self.facility_customers_card = StatCard(ar.DASH_MIX_FACILITY_CUSTOMERS, color="primary-glow",
+                                                icon="calendar", subtitle=ar.DASH_MIX_FACILITY_CAPTION)
+        self.month_mix_card = StatCard(ar.DASH_MIX_MONTH_SALES, color="highlight", icon="cart",
+                                       clickable=False)
+        for card in (self.cash_customers_card, self.facility_customers_card, self.month_mix_card):
+            self.mix_grid.add(card)
+        self.cash_customers_card.clicked.connect(lambda: self.payment_filter_requested.emit("cash"))
+        self.facility_customers_card.clicked.connect(
+            lambda: self.payment_filter_requested.emit("facilities")
+        )
+        layout.addWidget(self.mix_grid)
 
         charts = QHBoxLayout()
         charts.setSpacing(16)
@@ -279,6 +296,16 @@ class DashboardPage(QWidget):
         self.collected_card.set_value(summary.collected_this_month, currency=True)
         self.profit_card.set_value(summary.total_profit or 0, currency=True)
         self.remaining_card.set_value(summary.remaining_balance, currency=True)
+        self.cash_customers_card.set_value(summary.cash_customers)
+        self.facility_customers_card.set_value(summary.facility_customers)
+        self.month_mix_card.set_value(
+            summary.month_cash_sales + summary.month_installment_sales + summary.month_credit_sales
+        )
+        self.month_mix_card.set_subtitle(ar.DASH_MIX_MONTH_CAPTION.format(
+            cash=summary.month_cash_sales,
+            installment=summary.month_installment_sales,
+            credit=summary.month_credit_sales,
+        ))
         self.daily_register.update_metrics(
             collected=summary.today_collected,
             sales_count=summary.today_sales_count,

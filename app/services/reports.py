@@ -292,3 +292,191 @@ def _sale_type_label(value: str) -> str:
         "installment": ar.SALE_INSTALLMENT,
         "credit": ar.SALE_CREDIT,
     }.get(value, value)
+
+
+# --- Customer list and full data exports ---------------------------------------
+
+_DATE_FORMAT = "dd/mm/yyyy"
+_MONEY_FORMAT = "#,##0"
+
+
+def export_customers_xlsx(
+    summaries: Iterable[object],
+    destination: str | Path,
+    *,
+    status_labels: dict[Status, str] | None = None,
+) -> Path:
+    """Write the (filtered) customer list shown on the Customers screen."""
+    from app.i18n import ar
+
+    labels = status_labels or {
+        Status.PAID: ar.CUST_STATUS_TIP_PAID,
+        Status.FAILED: ar.CUST_STATUS_TIP_FAILED,
+        Status.PENDING: ar.CUST_STATUS_TIP_PENDING,
+        Status.NONE: ar.CUST_STATUS_TIP_NONE,
+    }
+    header = [
+        ar.CUST_COL_NAME, ar.CUST_COL_PHONE, ar.CUST_COL_CATEGORY, ar.CUST_COL_PAYMENT_KIND,
+        ar.CUST_COL_PRODUCTS, ar.CUST_COL_PURCHASE_DATE, ar.CUST_COL_END_DATE,
+        ar.CUST_COL_STATUS, ar.CUST_COL_MONTHLY_DUE, ar.CUST_COL_REMAINING,
+    ]
+    rows = [
+        [
+            summary.full_name,
+            summary.phone or "",
+            summary.category_name,
+            "، ".join(_sale_type_label(kind) for kind in summary.sale_types),
+            "، ".join(summary.products),
+            summary.purchase_date,
+            summary.end_date,
+            labels[summary.status],
+            summary.monthly_amount,
+            summary.remaining_balance,
+        ]
+        for summary in summaries
+    ]
+    return _write_workbook(destination, [(ar.CUST_PAGE_TITLE, header, rows, {5, 6}, {8, 9})])
+
+
+def export_full_workbook(session: Session, destination: str | Path, *, owner_user_id: int) -> Path:
+    """Export every customer, client type, sale, installment and payment (owner only).
+
+    The workbook contains wholesale prices and profit, so it is restricted to
+    an active owner like the profit report.
+    """
+    from app.db.models import Category, Customer, Payment
+    from app.i18n import ar
+
+    auth.require_owner(session, owner_user_id)
+    customers = session.scalars(
+        select(Customer).options(joinedload(Customer.category)).order_by(Customer.full_name, Customer.id)
+    ).all()
+    sales = session.scalars(
+        select(Sale).options(joinedload(Sale.customer)).order_by(Sale.purchase_date, Sale.id)
+    ).all()
+    installments = session.scalars(
+        select(Installment)
+        .options(joinedload(Installment.sale).joinedload(Sale.customer))
+        .order_by(Installment.sale_id, Installment.installment_index)
+    ).all()
+    payments = session.scalars(
+        select(Payment)
+        .options(
+            joinedload(Payment.installment).joinedload(Installment.sale).joinedload(Sale.customer),
+            joinedload(Payment.sale).joinedload(Sale.customer),
+        )
+        .order_by(Payment.payment_date, Payment.id)
+    ).all()
+    type_rows = session.execute(
+        select(Category.name, Category.color, Category.is_system).order_by(Category.sort_order, Category.name)
+    ).all()
+    type_counts: dict[str, int] = {}
+    for customer in customers:
+        type_counts[customer.category.name] = type_counts.get(customer.category.name, 0) + 1
+
+    sheets = [
+        (
+            ar.EXPORT_SHEET_CUSTOMERS,
+            [ar.EXPORT_COL_ID, ar.CUST_COL_NAME, ar.CUST_COL_PHONE, ar.CUST_COL_CATEGORY,
+             ar.CUST_ID_NUMBER, ar.CUST_ID_ISSUE_DATE, ar.CUST_ID_ISSUE_PLACE, ar.CUST_ADDRESS,
+             ar.CUST_PROFESSION, ar.CUST_CCP_NUMBER, ar.CUST_CHEQUES_COUNT, ar.CUST_NOTES],
+            [[c.id, c.full_name, c.phone or "", c.category.name, c.id_number or "", c.id_issue_date,
+              c.id_issue_place or "", c.address or "", c.profession or "", c.ccp_number or "",
+              c.cheques_count, c.notes or ""] for c in customers],
+            {5}, set(),
+        ),
+        (
+            ar.EXPORT_SHEET_SALES,
+            [ar.EXPORT_COL_ID, ar.CUST_COL_NAME, ar.REPORT_PRODUCT, ar.REPORT_TYPE,
+             ar.REPORT_WHOLESALE, ar.CASH_PRICE_DETAIL, ar.RATE, ar.EXPORT_COL_DOWN_PAYMENT,
+             ar.MONTHS_DURATION, ar.TOTAL_AFTER_INSTALLMENT, ar.EXPORT_COL_FINANCED,
+             ar.MONTHLY_AMOUNT, ar.TOTAL_PROFIT, ar.CUST_COL_PURCHASE_DATE, ar.CUST_COL_END_DATE,
+             ar.EXPORT_COL_EXPECTED_DATE],
+            [[s.id, s.customer.full_name, s.product, _sale_type_label(s.sale_type), s.wholesale_price,
+              s.cash_price, s.rate, s.down_payment, s.months, s.total, s.financed, s.monthly_amount,
+              s.profit, s.purchase_date, s.end_date, s.expected_pay_date] for s in sales],
+            {13, 14, 15}, {4, 5, 7, 9, 10, 11, 12},
+        ),
+        (
+            ar.EXPORT_SHEET_INSTALLMENTS,
+            [ar.EXPORT_COL_SALE_ID, ar.CUST_COL_NAME, ar.REPORT_PRODUCT, ar.EXPORT_COL_INDEX,
+             ar.REPORT_DUE_DATE, ar.REPORT_DUE, ar.REPORT_PAID, ar.REPORT_REMAINING,
+             ar.EXPORT_COL_PAID_DATE, ar.EXPORT_COL_METHOD],
+            [[i.sale_id, i.sale.customer.full_name, i.sale.product, i.installment_index, i.due_date,
+              i.amount_due, i.amount_paid, max(0, i.amount_due - i.amount_paid), i.paid_date,
+              i.method or ""] for i in installments],
+            {4, 8}, {5, 6, 7},
+        ),
+        (
+            ar.EXPORT_SHEET_PAYMENTS,
+            [ar.EXPORT_COL_ID, ar.CUST_COL_NAME, ar.REPORT_PRODUCT, ar.REPORT_TYPE, ar.EXPORT_COL_AMOUNT,
+             ar.EXPORT_COL_PAID_DATE, ar.EXPORT_COL_METHOD, ar.CUST_NOTES],
+            [_payment_row(payment) for payment in payments],
+            {5}, {4},
+        ),
+        (
+            ar.CT_TITLE,
+            [ar.CT_NAME, ar.CT_COLOR, ar.EXPORT_COL_CUSTOMERS],
+            [[name, color, type_counts.get(name, 0)] for name, color, _system in type_rows],
+            set(), set(),
+        ),
+    ]
+    return _write_workbook(destination, sheets)
+
+
+def _payment_row(payment: object) -> list[object]:
+    sale = payment.installment.sale if payment.installment is not None else payment.sale
+    return [
+        payment.id,
+        sale.customer.full_name if sale is not None else "",
+        sale.product if sale is not None else "",
+        _sale_type_label(sale.sale_type) if sale is not None else "",
+        payment.amount,
+        payment.payment_date,
+        payment.method,
+        payment.note or "",
+    ]
+
+
+def _write_workbook(
+    destination: str | Path,
+    sheets: list[tuple[str, list[str], list[list[object]], set[int], set[int]]],
+) -> Path:
+    """Write right-to-left sheets with real Excel dates and grouped whole-dinar amounts.
+
+    Each sheet is ``(title, header, rows, date_columns, money_columns)`` with
+    zero-based column indexes.
+    """
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for title, header, rows, date_columns, money_columns in sheets:
+        worksheet = workbook.create_sheet(_sheet_title(title))
+        worksheet.sheet_view.rightToLeft = True
+        worksheet.append(header)
+        for row in rows:
+            worksheet.append(row)
+        for column_index in date_columns | money_columns:
+            letter = get_column_letter(column_index + 1)
+            number_format = _DATE_FORMAT if column_index in date_columns else _MONEY_FORMAT
+            for cell in worksheet[letter][1:]:
+                cell.number_format = number_format
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(fill_type="solid", fgColor="0758CD")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for column in worksheet.columns:
+            values = [len(str(cell.value or "")) for cell in column]
+            width = min(40, max(12, max(values, default=0) + 2))
+            worksheet.column_dimensions[get_column_letter(column[0].column)].width = width
+    workbook.save(path)
+    return path
+
+
+def _sheet_title(title: str) -> str:
+    """Excel sheet names: at most 31 characters and none of []:*?/\\."""
+    clean = "".join(" " if char in '[]:*?/\\' else char for char in title)
+    return clean[:31] or "Sheet"
