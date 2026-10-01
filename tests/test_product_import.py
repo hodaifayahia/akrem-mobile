@@ -98,14 +98,16 @@ def test_template_marks_name_and_price_required_and_reads_back(tmp_path: Path, s
     workbook = load_workbook(path)
     sheet = workbook.worksheets[0]
     headers = [cell.value for cell in sheet[1]]
+    # Same order as the shop's sheet: product, wholesale, cash price, then the phone's details.
     assert headers[0] == f"{ar.PROD_TPL_NAME} *"
-    assert headers[1] == f"{ar.PROD_TPL_PRICE} *"
-    assert ar.PROD_TPL_OPTIONAL in headers[2] and "*" not in headers[2]
+    assert ar.PROD_TPL_OPTIONAL in headers[1] and "*" not in headers[1]
+    assert headers[2] == f"{ar.PROD_TPL_PRICE} *"
+    assert sum(1 for header in headers if header.endswith("*")) == 2  # only name and price required
     assert sheet.sheet_view.rightToLeft is True
     assert len(workbook.worksheets) == 2  # products + instructions
 
-    sheet.append(["iPhone 13", 110_000, 90_000])
-    sheet.append(["Redmi Note 13", 32_000, None])
+    sheet.append(["iPhone 13", 90_000, 110_000])
+    sheet.append(["Redmi Note 13", None, 32_000])
     workbook.save(path)
     preview = products.preview_product_workbook(session, path)
     assert [(row.name, row.cash_price, row.wholesale_price) for row in preview.rows] == [
@@ -128,7 +130,7 @@ def test_template_follows_the_interface_language(tmp_path: Path, session: Sessio
     sheet = workbook.worksheets[0]
     assert sheet.sheet_view.rightToLeft is False
     assert sheet["A1"].value == expected_header
-    sheet.append(["Galaxy A05", 21_000])
+    sheet.append(["Galaxy A05", None, 21_000])
     workbook.save(path)
 
     # Read back while the interface is in Arabic: headers of every language are recognised.

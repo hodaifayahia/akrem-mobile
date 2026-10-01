@@ -317,7 +317,7 @@ def test_every_excel_export_opens_with_the_expected_data(shop, tmp_path, monkeyp
     reports_page = ReportsPage(_user(shop["owner"]))
     assert reports_page.export_everything_to(str(tmp_path / "all.xlsx"))
     workbook = load_workbook(tmp_path / "all.xlsx")
-    assert workbook.sheetnames == ["الزبائن", "المبيعات", "الأقساط", "الدفعات", "أنواع الزبائن"]
+    assert workbook.sheetnames == ["الزبائن", "المبيعات", "الأقساط", "الدفعات", "أنواع الزبائن", "المخزون"]
     assert workbook["الزبائن"].max_row == 1 + 5
     assert workbook["المبيعات"].max_row == 1 + 5
     assert workbook["الأقساط"].max_row == 1 + 3 * 6

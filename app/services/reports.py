@@ -339,7 +339,7 @@ def export_customers_xlsx(
 
 
 def export_full_workbook(session: Session, destination: str | Path, *, owner_user_id: int) -> Path:
-    """Export every customer, client type, sale, installment and payment (owner only).
+    """Export every customer, client type, sale, installment, payment and stock phone (owner only).
 
     The workbook contains wholesale prices and profit, so it is restricted to
     an active owner like the profit report.
@@ -367,6 +367,9 @@ def export_full_workbook(session: Session, destination: str | Path, *, owner_use
         )
         .order_by(Payment.payment_date, Payment.id)
     ).all()
+    from app.services import stock
+
+    units = stock.list_units(session)
     type_rows = session.execute(
         select(Category.name, Category.color, Category.is_system).order_by(Category.sort_order, Category.name)
     ).all()
@@ -391,12 +394,15 @@ def export_full_workbook(session: Session, destination: str | Path, *, owner_use
              ar.REPORT_WHOLESALE, ar.CASH_PRICE_DETAIL, ar.RATE, ar.EXPORT_COL_DOWN_PAYMENT,
              ar.MONTHS_DURATION, ar.PROD_TPL_INTERVAL, ar.TOTAL_AFTER_INSTALLMENT, ar.EXPORT_COL_FINANCED,
              ar.INSTALLMENT_AMOUNT, ar.TOTAL_PROFIT, ar.CUST_COL_PURCHASE_DATE, ar.CUST_COL_END_DATE,
-             ar.EXPORT_COL_EXPECTED_DATE],
+             ar.EXPORT_COL_EXPECTED_DATE, ar.PROD_TPL_COLOR, ar.PROD_TPL_BATTERY, ar.PROD_TPL_IMEI,
+             ar.PROD_TPL_REF],
             [[s.id, s.customer.full_name, s.product, _sale_type_label(s.sale_type), s.wholesale_price,
               s.cash_price, s.rate, s.down_payment, s.months,
               s.payment_interval if s.sale_type == "installment" else None,
               s.total, s.financed, s.monthly_amount,
-              s.profit, s.purchase_date, s.end_date, s.expected_pay_date] for s in sales],
+              s.profit, s.purchase_date, s.end_date, s.expected_pay_date,
+              s.color, "*" if s.is_new else (f"{s.battery_health}%" if s.battery_health is not None else None),
+              s.imei, s.reference] for s in sales],
             {14, 15, 16}, {4, 5, 7, 10, 11, 12, 13},
         ),
         (
@@ -422,8 +428,28 @@ def export_full_workbook(session: Session, destination: str | Path, *, owner_use
             [[name, color, type_counts.get(name, 0)] for name, color, _system in type_rows],
             set(), set(),
         ),
+        (
+            ar.PROD_TAB_STOCK,
+            [ar.PROD_TPL_REF, ar.PROD_TPL_NAME, ar.PROD_TPL_WHOLESALE, ar.PROD_TPL_PRICE, ar.PROD_TPL_BATTERY,
+             ar.PROD_TPL_COLOR, ar.PROD_TPL_IMEI, ar.PROD_TPL_NOTE, ar.STOCK_COL_STATUS, ar.STOCK_COL_SOLD_TO,
+             ar.STOCK_COL_SOLD_ON],
+            [_stock_row(unit, ar) for unit in units],
+            {10}, {2, 3},
+        ),
     ]
     return _write_workbook(destination, sheets)
+
+
+def _stock_row(unit: object, ar: object) -> list[object]:
+    sale = unit.sale
+    battery = "*" if unit.is_new else (f"{unit.battery_health}%" if unit.battery_health is not None else None)
+    return [
+        unit.reference, unit.product.name, unit.wholesale_price, unit.cash_price, battery, unit.color,
+        unit.imei, unit.note,
+        ar.STOCK_STATUS_SOLD if unit.status == "sold" else ar.STOCK_STATUS_AVAILABLE,
+        sale.customer.full_name if sale is not None else None,
+        unit.sold_at,
+    ]
 
 
 def _payment_row(payment: object) -> list[object]:

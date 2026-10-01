@@ -556,6 +556,40 @@ class CustomersPage(QWidget):
         filter_row.addWidget(self.month_selector)
         layout.addLayout(filter_row)
 
+        # Filters on the installment sheet's purchase and end-of-deduction dates.
+        date_row = QHBoxLayout()
+        date_row.setSpacing(10)
+        purchased_label = QLabel(ar.CUST_PURCHASED_FILTER, self)
+        purchased_label.setObjectName("sectionHint")
+        date_row.addWidget(purchased_label)
+        self.purchased_filter = QComboBox(self)
+        for label, value in (
+            (ar.CUST_PURCHASED_ANY, None),
+            (ar.CUST_PURCHASED_THIS_MONTH, "this_month"),
+            (ar.CUST_PURCHASED_LAST_MONTH, "last_month"),
+            (ar.CUST_PURCHASED_LAST_3_MONTHS, "last_3_months"),
+            (ar.CUST_PURCHASED_THIS_YEAR, "this_year"),
+        ):
+            self.purchased_filter.addItem(label, value)
+        self.purchased_filter.currentIndexChanged.connect(self.refresh)
+        date_row.addWidget(self.purchased_filter)
+        deduction_label = QLabel(ar.CUST_DEDUCTION_FILTER, self)
+        deduction_label.setObjectName("sectionHint")
+        date_row.addWidget(deduction_label)
+        self.deduction_filter = QComboBox(self)
+        for label, value in (
+            (ar.CUST_DEDUCTION_ANY, None),
+            (ar.CUST_DEDUCTION_THIS_MONTH, "ends_this_month"),
+            (ar.CUST_DEDUCTION_NEXT_MONTH, "ends_next_month"),
+            (ar.CUST_DEDUCTION_ONGOING, "ongoing"),
+            (ar.CUST_DEDUCTION_FINISHED, "finished"),
+        ):
+            self.deduction_filter.addItem(label, value)
+        self.deduction_filter.currentIndexChanged.connect(self.refresh)
+        date_row.addWidget(self.deduction_filter)
+        date_row.addStretch(1)
+        layout.addLayout(date_row)
+
         legend = QHBoxLayout()
         legend.setSpacing(8)
         for text, pill in (
@@ -656,6 +690,8 @@ class CustomersPage(QWidget):
                     search=self.search.text().strip() or None,
                     payment_kind=self.payment_filter.currentData(),
                     balance=self.balance_filter.currentData(),
+                    purchased=self.purchased_filter.currentData(),
+                    deduction=self.deduction_filter.currentData(),
                 )
         except (ValueError, RuntimeError, SQLAlchemyError):
             # Refreshes run in response to events; a modal box here could
@@ -744,6 +780,8 @@ class CustomersPage(QWidget):
         self.status_filter.setCurrentIndex(0)
         self.payment_filter.setCurrentIndex(0)
         self.balance_filter.setCurrentIndex(0)
+        self.purchased_filter.setCurrentIndex(0)
+        self.deduction_filter.setCurrentIndex(0)
         self.type_filter.set_types(self._types, None)
         self.refresh()
 

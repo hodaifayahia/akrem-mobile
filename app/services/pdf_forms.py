@@ -184,6 +184,22 @@ def _commitment_schedule(sale: Sale) -> dict[int, tuple[date, int]]:
     return fallback
 
 
+def _product_with_details(sale: Sale) -> str:
+    """Product name plus the phone's colour, battery, IMEI and REF when recorded."""
+    from app.i18n.stock_text import battery_text
+
+    parts = [sale.product]
+    if sale.color:
+        parts.append(sale.color)
+    if sale.is_new or sale.battery_health is not None:
+        parts.append(battery_text(sale.is_new, sale.battery_health))
+    if sale.imei:
+        parts.append(f"IMEI {sale.imei}")
+    if sale.reference:
+        parts.append(sale.reference)
+    return " · ".join(parts)
+
+
 def _commitment_html(
     customer: Customer,
     sale: Sale,
@@ -208,7 +224,7 @@ def _commitment_html(
          _missing(customer.ccp_number)),
     ]
     sale_details: list[tuple[str, str, str, str]] = [
-        (ar.PDF_PRODUCT, sale.product, ar.PDF_SALE_TYPE, _sale_type(sale.sale_type)),
+        (ar.PDF_PRODUCT, _product_with_details(sale), ar.PDF_SALE_TYPE, _sale_type(sale.sale_type)),
         (ar.PDF_CASH_PRICE, _money(sale.cash_price), ar.PDF_RATE, f"{sale.rate}%"),
         (ar.PDF_TOTAL_PRICE, _money(sale.total), ar.PDF_DOWN_PAYMENT, _money(sale.down_payment)),
         (ar.PDF_FINANCED_AMOUNT, _money(sale.financed), ar.PDF_MONTHLY_AMOUNT,

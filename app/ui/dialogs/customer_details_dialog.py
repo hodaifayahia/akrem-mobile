@@ -37,6 +37,7 @@ from app.config import data_dir, ensure_data_dirs
 from app.db.session import session_scope
 from app.i18n import ar
 from app.i18n.plan_text import amount_label, every_text
+from app.i18n.stock_text import battery_text, ltr_text
 from app.services import auth, customers, payments, sales as sales_service
 from app.services import schedule
 from app.services.sales import PaidInstallmentEditError
@@ -510,6 +511,13 @@ class CustomerDetailsDialog(QDialog):
         )
         if sale.sale_type == "installment":
             fields.append((ar.PLAN_INTERVAL, every_text(sale.payment_interval or 1)))
+        if sale.is_new or sale.battery_health is not None:
+            fields.append((ar.PROD_TPL_BATTERY, battery_text(sale.is_new, sale.battery_health)))
+        for label, value in (
+            (ar.PROD_TPL_COLOR, sale.color), (ar.PROD_TPL_IMEI, sale.imei), (ar.PROD_TPL_REF, sale.reference),
+        ):
+            if value:
+                fields.append((label, ltr_text(value)))
         if self.current_user.role == "owner":
             fields.append((ar.PROFIT, self._money(sale.profit)))
         fields.extend(

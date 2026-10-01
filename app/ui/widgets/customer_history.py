@@ -26,6 +26,7 @@ from app.i18n import ar
 from app.services.customers import CustomerHistory, PurchaseRecord
 from app.services.status import Status
 from app.i18n.plan_text import plan_summary
+from app.i18n.stock_text import battery_text, ltr_text
 from app.ui.theme import qcolor
 
 _TYPE_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending"}
@@ -45,6 +46,18 @@ def status_label(status: Status) -> str:
         Status.FAILED: ar.CUST_STATUS_TIP_FAILED,
         Status.NONE: ar.HIST_STATUS_NONE,
     }[status]
+
+
+def _product_text(purchase: PurchaseRecord) -> str:
+    """Product name with the phone's colour, battery and REF when recorded."""
+    parts = [ltr_text(purchase.product)]
+    if purchase.color:
+        parts.append(ltr_text(purchase.color))
+    if purchase.is_new or purchase.battery_health is not None:
+        parts.append(battery_text(purchase.is_new, purchase.battery_health))
+    if purchase.reference:
+        parts.append(ltr_text(purchase.reference))
+    return " · ".join(parts)
 
 
 def money(amount: int | None) -> str:
@@ -182,7 +195,7 @@ class CustomerHistoryPanel(QWidget):
             )
             cells = [
                 (purchase.purchase_date.strftime("%d/%m/%Y"), None),
-                (purchase.product, None),
+                (_product_text(purchase), None),
                 (type_label(purchase.sale_type), _TYPE_TONES.get(purchase.sale_type)),
                 (money(purchase.total), None),
                 (money(purchase.paid), "paid" if purchase.paid else None),

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import Category, Customer, Installment, Payment, Sale, Setting
 from app.services import repositories
+from app.services.calc import add_months
 from app.services.settings import get_grace_days
 from app.services.status import Status, for_customer, for_month
 
@@ -21,6 +22,8 @@ _MOBILE_RE = re.compile(r"^0[567][0-9]{8}$")
 PAYMENT_KINDS = ("cash", "installment", "credit")
 PAYMENT_FILTERS = ("cash", "facilities", "installment", "credit")
 BALANCE_FILTERS = ("open", "settled")
+PURCHASE_FILTERS = ("this_month", "last_month", "last_3_months", "this_year")
+DEDUCTION_FILTERS = ("ends_this_month", "ends_next_month", "finished", "ongoing")
 _CUSTOMER_FIELDS = {
     "full_name",
     "category_id",
@@ -134,6 +137,11 @@ class PurchaseRecord:
     overdue_installments: int
     payment_interval: int = 1
     payment_count: int = 0
+    color: str | None = None
+    battery_health: int | None = None
+    is_new: bool = False
+    imei: str | None = None
+    reference: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +288,11 @@ def _purchase_record(sale: Sale, today: date, grace_days: int) -> PurchaseRecord
         overdue_installments=_overdue_count(sale, today, grace_days),
         payment_interval=sale.payment_interval or 1,
         payment_count=len(sale.installments),
+        color=sale.color,
+        battery_health=sale.battery_health,
+        is_new=sale.is_new,
+        imei=sale.imei,
+        reference=sale.reference,
     )
 
 
@@ -346,6 +359,8 @@ def list_customers(
     search: str | None = None,
     payment_kind: str | None = None,
     balance: str | None = None,
+    purchased: str | None = None,
+    deduction: str | None = None,
 ) -> list[CustomerSummary]:
     """Return customer rows with selected-month status and outstanding balances.
 
@@ -353,7 +368,12 @@ def list_customers(
     full; ``"facilities"`` keeps customers paying at least one purchase over
     time; ``"installment"`` / ``"credit"`` keep customers with such a sale. ``balance`` keeps customers who still
     owe money (``"open"``) or have nothing left to pay (``"settled"``).
-    The search text matches names, phone numbers and product names.
+    ``purchased`` keeps customers who bought something in that period
+    (``this_month``, ``last_month``, ``last_3_months``, ``this_year``,
+    relative to ``today``). ``deduction`` looks at installment end dates (the
+    sheet's "تاريخ انتهاء الاقتطاع"): ``ends_this_month``, ``ends_next_month``,
+    ``finished`` (every plan ended) or ``ongoing`` (a plan still running).
+    The search text matches names, phone numbers, product names, IMEI and REF.
 
     Customer names and phone numbers are narrowed in a lightweight first query
     when searching. The final query eagerly loads categories, sales, schedules,
@@ -364,6 +384,10 @@ def list_customers(
         raise ValueError(f"Unsupported payment kind: {payment_kind}")
     if balance not in (None, "", *BALANCE_FILTERS):
         raise ValueError(f"Unsupported balance filter: {balance}")
+    if purchased not in (None, "", *PURCHASE_FILTERS):
+        raise ValueError(f"Unsupported purchase period: {purchased}")
+    if deduction not in (None, "", *DEDUCTION_FILTERS):
+        raise ValueError(f"Unsupported deduction filter: {deduction}")
     search_key = normalize_search_text(search)
     grace_days = _grace_days(session)
     # Validate the selected period even when the query has no matching rows.
@@ -384,13 +408,15 @@ def list_customers(
             if search_key in normalize_search_text(full_name)
             or search_key in normalize_search_text(phone)
         }
-        product_query = select(Sale.customer_id, Sale.product)
+        product_query = select(Sale.customer_id, Sale.product, Sale.imei, Sale.reference)
         if category_id is not None:
             product_query = product_query.join(Customer).where(Customer.category_id == category_id)
         matching.update(
             customer_id
-            for customer_id, product in session.execute(product_query)
+            for customer_id, product, imei, reference in session.execute(product_query)
             if search_key in normalize_search_text(product)
+            or search_key in normalize_search_text(imei or "")
+            or search_key in normalize_search_text(reference or "")
         )
         matching_ids = sorted(matching)
         if not matching_ids:
@@ -433,6 +459,10 @@ def list_customers(
         if selected_status is not None and customer_status != selected_status:
             continue
         if payment_kind and not _matches_payment_kind(customer_sales, payment_kind):
+            continue
+        if purchased and not _bought_in(customer_sales, purchased, today):
+            continue
+        if deduction and not _matches_deduction(customer_sales, deduction, today):
             continue
 
         monthly_amount = sum(
@@ -689,6 +719,39 @@ def _validate_cheques_count(value: int | None) -> None:
     """Check that an optional cheque count is a nonnegative integer."""
     if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
         raise ValueError("Cheque count must be a nonnegative whole number")
+
+
+def purchase_period(period: str, today: date) -> tuple[date, date]:
+    """First and last day of a ``PURCHASE_FILTERS`` period, relative to ``today``."""
+    month_start = today.replace(day=1)
+    if period == "this_month":
+        return month_start, add_months(month_start, 1) - timedelta(days=1)
+    if period == "last_month":
+        start = add_months(month_start, -1)
+        return start, month_start - timedelta(days=1)
+    if period == "last_3_months":
+        return add_months(month_start, -2), today
+    if period == "this_year":
+        return today.replace(month=1, day=1), today.replace(month=12, day=31)
+    raise ValueError(f"Unsupported purchase period: {period}")
+
+
+def _bought_in(customer_sales: tuple[Sale, ...], period: str, today: date) -> bool:
+    start, end = purchase_period(period, today)
+    return any(start <= sale.purchase_date <= end for sale in customer_sales)
+
+
+def _matches_deduction(customer_sales: tuple[Sale, ...], kind: str, today: date) -> bool:
+    """Match installment end dates against the end-of-deduction filter."""
+    ends = [sale.end_date for sale in customer_sales if sale.sale_type == "installment" and sale.end_date]
+    if not ends:
+        return False
+    if kind in ("ends_this_month", "ends_next_month"):
+        target = today if kind == "ends_this_month" else add_months(today.replace(day=1), 1)
+        return any((end.year, end.month) == (target.year, target.month) for end in ends)
+    if kind == "finished":
+        return all(end < today for end in ends)
+    return any(end >= today for end in ends)  # ongoing
 
 
 def delete_customer(session: Session, customer_id: int) -> None:

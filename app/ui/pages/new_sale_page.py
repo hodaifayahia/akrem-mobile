@@ -46,10 +46,21 @@ from app.services import products as product_service
 from app.services import schedule
 from app.services.settings import get_rate_presets, get_value
 from app.ui.events import events
+from app.ui.widgets.phone_details import PhoneDetailsSection
 from app.i18n.plan_text import amount_label, plan_description
 
 
 _PLAN_ROLE = Qt.ItemDataRole.UserRole + 3  # (months, interval, rate) of a catalog product
+
+
+def _scrolling(widget: QWidget) -> QScrollArea:
+    """Let a long form scroll instead of squeezing on small screens."""
+    area = QScrollArea(widget.parentWidget())
+    area.setWidget(widget)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return area
 
 
 class NewSalePage(QWidget):
@@ -297,9 +308,17 @@ class NewSalePage(QWidget):
         inputs_form.addRow(ar.PURCHASE_DATE, self.cash_date)
 
         form_layout.addLayout(inputs_form)
+        cash_details_title = QLabel(ar.SALE_DETAILS_SECTION, form_card)
+        cash_details_title.setObjectName("sectionTitle")
+        form_layout.addWidget(cash_details_title)
+        self.cash_details = PhoneDetailsSection(
+            can_create_products=self.current_user.role == "owner", parent=form_card
+        )
+        self.cash_details.unit_selected.connect(self._on_cash_unit_selected)
+        form_layout.addWidget(self.cash_details)
         form_layout.addStretch(1)
 
-        layout.addWidget(form_card, 3)
+        layout.addWidget(_scrolling(form_card), 3)
 
         # ---------------------------------------------------------------------
         # Right Side: Register Reconciliation & Receipt Generator
@@ -475,6 +494,16 @@ class NewSalePage(QWidget):
         elif self.cash_product.isEditable() and self.cash_product.currentIndex() < 0:
             self.cash_wholesale.setValue(0)
             self.cash_total.setValue(0)
+        if hasattr(self, "cash_details"):
+            self.cash_details.set_product(name)
+        self._update_cash_calculations()
+
+    def _on_cash_unit_selected(self, unit: dict | None) -> None:
+        """A phone picked from stock is sold at its own price."""
+        if unit is None:
+            return
+        self.cash_total.setValue(unit["cash_price"])
+        self.cash_wholesale.setValue(unit["wholesale_price"])
         self._update_cash_calculations()
 
     def _refresh_cash_customers(self) -> None:
@@ -520,6 +549,10 @@ class NewSalePage(QWidget):
         if total <= 0:
             self._show_error("يرجى إدخال مبلغ صحيح للبيع.")
             return
+        details_error = self.cash_details.error_message()
+        if details_error is not None:
+            self._show_error(details_error)
+            return
 
         wholesale = (
             self.cash_wholesale.value()
@@ -559,6 +592,7 @@ class NewSalePage(QWidget):
                     months=None,
                     purchase_date=self.cash_date.date().toPython(),
                     expected_pay_date=expected_date,
+                    **self.cash_details.values(),
                 )
                 self._last_saved_cash_sale_id = saved_sale.id
                 sale_id = saved_sale.id
@@ -597,6 +631,8 @@ class NewSalePage(QWidget):
         self.cash_total.setValue(0)
         self.cash_amount_paid.setValue(0)
         self.cash_wholesale.setValue(0)
+        self.cash_details.clear()
+        self.cash_details.set_product(self.cash_product.currentText())
         self._update_cash_calculations()
 
     def _export_cash_receipt(self) -> None:
@@ -878,8 +914,16 @@ class NewSalePage(QWidget):
             "expected_date": sale_form.labelForField(self.expected_date),
         }
         left_layout.addLayout(sale_form)
+        details_title = QLabel(ar.SALE_DETAILS_SECTION, left_container)
+        details_title.setObjectName("sectionTitle")
+        left_layout.addWidget(details_title)
+        self.sale_details = PhoneDetailsSection(
+            can_create_products=self.current_user.role == "owner", parent=left_container
+        )
+        self.sale_details.unit_selected.connect(self._on_sale_unit_selected)
+        left_layout.addWidget(self.sale_details)
         left_layout.addStretch(1)
-        content.addWidget(left_container, 2)
+        content.addWidget(_scrolling(left_container), 2)
 
         # Right Column: Financial Preview Card
         preview = QFrame(page)
@@ -1113,12 +1157,22 @@ class NewSalePage(QWidget):
         else:
             self.plan_hint.setText("")
         self.plan_hint.setVisible(bool(self.plan_hint.text()) and self.sale_type.currentData() == "installment")
+        if hasattr(self, "sale_details"):
+            self.sale_details.set_product(name)
         if prices is not None:
             self.wholesale_price.setValue(prices[0])
             self.cash_price.setValue(prices[1])
         elif self.product.isEditable() and self.product.currentIndex() < 0:
             self.wholesale_price.setValue(0)
             self.cash_price.setValue(0)
+        self._update_preview()
+
+    def _on_sale_unit_selected(self, unit: dict | None) -> None:
+        """A phone picked from stock is sold at its own price."""
+        if unit is None:
+            return
+        self.cash_price.setValue(unit["cash_price"])
+        self.wholesale_price.setValue(unit["wholesale_price"])
         self._update_preview()
 
     def _toggle_new_customer(self, enabled: bool) -> None:
@@ -1303,6 +1357,10 @@ class NewSalePage(QWidget):
             self._show_error(ar.SELLER_SELECT_CATALOG_PRODUCT)
             return
         sale_type = self.sale_type.currentData()
+        details_error = self.sale_details.error_message()
+        if details_error is not None:
+            self._show_error(details_error)
+            return
         try:
             with session_scope() as session:
                 customer_id = self._customer_id
@@ -1323,6 +1381,7 @@ class NewSalePage(QWidget):
                     down_payment=self.down_payment.value() if sale_type != "cash" else 0,
                     months=self.months.value() if sale_type == "installment" else None,
                     payment_interval=self._interval() if sale_type == "installment" else 1,
+                    **self.sale_details.values(),
                     purchase_date=self.purchase_date.date().toPython(),
                     expected_pay_date=(
                         self.expected_date.date().toPython()
@@ -1379,6 +1438,7 @@ class NewSalePage(QWidget):
                     down_payment=self.down_payment.value() if sale_type != "cash" else 0,
                     months=self.months.value() if sale_type == "installment" else None,
                     payment_interval=self._interval() if sale_type == "installment" else 1,
+                    **self.sale_details.values(),
                     purchase_date=self.purchase_date.date().toPython(),
                     expected_pay_date=(
                         self.expected_date.date().toPython()
@@ -1429,6 +1489,8 @@ class NewSalePage(QWidget):
         self.months.setValue(product_service.DEFAULT_PLAN_MONTHS)
         self.interval.setValue(1)
         self._month_changed(product_service.DEFAULT_PLAN_MONTHS)
+        self.sale_details.clear()
+        self.sale_details.set_product(self.product.currentText())
         self.purchase_date.setDate(QDate.currentDate())
         self.expected_date_enabled.setChecked(False)
         self.expected_date.setDate(QDate.currentDate())

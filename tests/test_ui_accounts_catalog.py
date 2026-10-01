@@ -10,7 +10,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QMessageBox
 from sqlalchemy import select
 
-from app.db.models import Customer, Sale, User
+from app.db.models import Customer, Sale, StockItem, User
 from app.db.session import dispose_database_engines, session_scope
 from app.i18n import ar
 from app.services import auth, backup, categories, customers, payments, products, sales, two_factor
@@ -46,6 +46,11 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qapp) -> dict:
         ids = {"owner": owner.id, "seller": seller.id, "tmp": str(tmp_path)}
     yield ids
     dispose_database_engines()
+
+
+def _plain(text: str) -> str:
+    """Cell text without the left-to-right isolate marks used for Latin names in RTL tables."""
+    return text.replace("\u2066", "").replace("\u2069", "")
 
 
 def _user(user_id: int) -> User:
@@ -86,7 +91,7 @@ def test_products_page_lists_prices_quote_and_hides_wholesale_from_sellers(shop)
     page = ProductsPage(_user(shop["owner"]))
     headers = [page.table.horizontalHeaderItem(c).text() for c in range(page.table.columnCount())]
     assert ar.SET_PRODUCT_WHOLESALE in headers
-    names = [page.table.item(r, 0).text() for r in range(page.table.rowCount())]
+    names = [_plain(page.table.item(r, 0).text()) for r in range(page.table.rowCount())]
     assert names == ["iPhone 13", "Redmi 13"]
     quote_column = page._columns.index("quote")
     # 110,000 + 35% = 148,500 over 6 months
@@ -128,7 +133,7 @@ def test_product_dialog_requires_only_name_and_price(shop) -> None:
 
     dialog.cash_price.setValue(4500)  # wholesale left empty
     assert page.save_dialog(dialog)
-    row = [page.table.item(r, 0).text() for r in range(page.table.rowCount())].index("Nokia 105")
+    row = [_plain(page.table.item(r, 0).text()) for r in range(page.table.rowCount())].index("Nokia 105")
     assert page.table.item(row, page._columns.index("wholesale")).text() == "—"
     assert page.table.item(row, page._columns.index("margin")).text() == "—"
     with session_scope() as session:
@@ -152,11 +157,12 @@ def test_products_page_downloads_template_and_uploads_products(shop, monkeypatch
     template = target.with_suffix(".xlsx")
     assert template.exists()
 
+    # The template is the shop's stock sheet: product, wholesale, cash price, battery, colour...
     workbook = load_workbook(template)
     sheet = workbook.worksheets[0]
-    sheet.append(["Redmi 13", 33000, None])        # price update, wholesale kept
-    sheet.append(["Galaxy A05", "21,000 دج", None])  # new product without wholesale
-    sheet.append(["Bad row", None, 1000])            # rejected: no price
+    sheet.append(["Redmi 13", None, 33000, 0.9, "Blue"])   # one more phone of an existing product
+    sheet.append(["Galaxy A05", None, "21,000 دج", "*"])    # new product, new phone, no wholesale
+    sheet.append(["Bad row", 1000, None])                  # rejected: no price
     workbook.save(template)
 
     shown: list[ProductImportDialog] = []
@@ -172,16 +178,26 @@ def test_products_page_downloads_template_and_uploads_products(shop, monkeypatch
     page.upload_button.click()
 
     dialog = shown[0]
-    results = [dialog.table.item(r, 4).text() for r in range(dialog.table.rowCount())]
-    assert results == [ar.PROD_ACTION_UPDATE, ar.PROD_ACTION_CREATE, ar.PROD_ACTION_INVALID]
-    assert ar.PROD_ERR_PRICE_MISSING in dialog.table.item(2, 5).text()
+    assert dialog.preview.is_stock
+    results = [dialog.cell_text(r, "result") for r in range(dialog.table.rowCount())]
+    assert results == [ar.PROD_ACTION_EXISTING, ar.PROD_ACTION_CREATE, ar.PROD_ACTION_INVALID]
+    assert [dialog.cell_text(r, "stock") for r in range(2)] == [ar.PROD_UNIT_ADD.format(count=1)] * 2
+    assert dialog.cell_text(0, "battery") == "90%" and dialog.cell_text(1, "battery") == ar.STOCK_BATTERY_NEW
+    assert ar.PROD_ERR_PRICE_MISSING in dialog.cell_text(2, "notes")
     assert dialog.result() == 1
+    from app.services import stock
+
     with session_scope() as session:
         catalog = {p.name: p for p in products.list_products(session)}
-        assert (catalog["Redmi 13"].cash_price, catalog["Redmi 13"].wholesale_price) == (33000, 25000)
+        # Stock rows never change catalog prices; each phone keeps its own price.
+        assert (catalog["Redmi 13"].cash_price, catalog["Redmi 13"].wholesale_price) == (32000, 25000)
         assert (catalog["Galaxy A05"].cash_price, catalog["Galaxy A05"].wholesale_price) == (21000, 0)
         assert "Bad row" not in catalog
-    names = [page.table.item(r, 0).text() for r in range(page.table.rowCount())]
+        units = {unit.product.name: unit for unit in stock.list_units(session)}
+        assert (units["Redmi 13"].cash_price, units["Redmi 13"].battery_health, units["Redmi 13"].color) == (33000, 90, "Blue")
+        assert units["Galaxy A05"].is_new
+    assert page.stock_panel.table.rowCount() == 2
+    names = [_plain(page.table.item(r, 0).text()) for r in range(page.table.rowCount())]
     assert "Galaxy A05" in names
 
     # A sheet without product columns is refused with a clear message.
@@ -265,7 +281,7 @@ def test_clicking_a_client_shows_their_full_history(shop) -> None:
 
     panel = dialog.history_panel
     assert panel.purchases_table.rowCount() == 2
-    assert panel.purchases_table.item(0, 1).text() == "Redmi 13"  # newest first
+    assert _plain(panel.purchases_table.item(0, 1).text()) == "Redmi 13"  # newest first
     assert panel.purchases_table.item(0, 2).text() == ar.SALE_CASH
     assert panel.payments_table.rowCount() == 1
     assert panel.payments_table.item(0, 2).text() == "CCP"
@@ -393,7 +409,7 @@ def test_product_dialog_saves_a_default_plan_shown_on_the_products_page(shop) ->
     with session_scope() as session:
         saved = {p.name: p for p in products.list_products(session)}["Pixel 8"]
         assert products.plan_of(saved) == products.ProductPlan(10, 2, None)
-    row = [page.table.item(r, 0).text() for r in range(page.table.rowCount())].index("Pixel 8")
+    row = [_plain(page.table.item(r, 0).text()) for r in range(page.table.rowCount())].index("Pixel 8")
     plan_cell = page.table.item(row, page._columns.index("plan")).text()
     assert "10" in plan_cell and ar.PLAN_EVERY_2 in plan_cell and "40%" in plan_cell
     # 100,000 + 40% = 140,000 in 5 payments every 2 months
@@ -472,3 +488,171 @@ def test_new_sale_page_applies_the_product_plan_and_saves_the_interval(shop, mon
     with session_scope() as session:
         sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
         assert (sale.months, sale.payment_interval, len(sale.installments)) == (12, 4, 3)
+
+
+# ------------------------------------------------------------ stock (phones)
+def test_stock_tab_adds_edits_filters_and_removes_phones(shop, monkeypatch) -> None:
+    from app.services import stock
+    from app.ui.pages.products_page import ProductsPage
+
+    page = ProductsPage(_user(shop["owner"]))
+    panel = page.stock_panel
+    assert page.tabs.currentWidget() is panel and panel.empty_card.isVisibleTo(panel)
+
+    dialog = panel.new_dialog()
+    dialog.product.setCurrentText("iphone 13")  # existing name, other case
+    assert dialog.product_state.text() == ar.SALE_PRODUCT_EXISTS
+    assert dialog.cash_price.value() == 110000  # catalog price filled in
+    dialog.battery.setValue(91)
+    dialog.color.setCurrentText("Blue")
+    dialog.imei.setText("35678901234567")
+    dialog.quantity.setValue(1)
+    assert panel.save_dialog(dialog)
+
+    dialog = panel.new_dialog()
+    dialog.product.setCurrentText("Galaxy S24")  # not in the catalog yet
+    assert dialog.product_state.text() == ar.SALE_PRODUCT_NEW
+    assert not panel.save_dialog(dialog)
+    assert dialog.error.text.text() == ar.PROD_PRICE_REQUIRED
+    dialog.cash_price.setValue(150000)
+    dialog.is_new.setChecked(True)
+    dialog.quantity.setValue(2)
+    assert panel.save_dialog(dialog)
+
+    panel.refresh()
+    assert panel.table.rowCount() == 3
+    assert "3" in page.count_label.text()
+    column = panel._columns.index
+    assert _plain(panel.table.item(0, column("product")).text()) == "iPhone 13"
+    assert panel.table.item(0, column("battery")).text() == "91%"
+    assert panel.table.item(1, column("battery")).text() == ar.STOCK_BATTERY_NEW
+
+    panel.condition_filter.setCurrentIndex(panel.condition_filter.findData(stock.CONDITION_NEW))
+    assert panel.table.rowCount() == 2
+    panel.condition_filter.setCurrentIndex(0)
+    panel.color_filter.setCurrentIndex(panel.color_filter.findData("Blue"))
+    assert panel.table.rowCount() == 1
+    panel.color_filter.setCurrentIndex(0)
+    panel.search.setText("4567")
+    assert panel.table.rowCount() == 1
+    panel.search.clear()
+
+    with session_scope() as session:
+        assert products.find_by_name(session, "galaxy s24").cash_price == 150000
+        unit = stock.list_units(session)[0]
+    edit = panel.new_dialog(unit)
+    assert edit.imei.text() == "35678901234567" and not edit._form.isRowVisible(edit.quantity)
+    edit.note.setText("small scratch")
+    assert panel.save_dialog(edit, unit.id)
+
+    panel.table.setCurrentCell(2, 0)
+    assert panel.delete_button.isEnabled()
+    assert panel.delete_unit(panel.selected_unit().id)
+    assert panel.table.rowCount() == 2
+
+    exported = page.export_stock(Path(shop["tmp"]) / "stock-out")
+    from openpyxl import load_workbook
+
+    assert load_workbook(exported).worksheets[0].max_row == 3
+
+    seller_page = ProductsPage(_user(shop["seller"]))
+    assert seller_page.stock_panel.add_button.isHidden()
+    assert "wholesale" not in seller_page.stock_panel._columns
+
+
+def test_new_sale_page_sells_a_phone_from_stock_with_its_details(shop, monkeypatch) -> None:
+    from app.services import stock
+    from app.ui.pages.new_sale_page import NewSalePage
+
+    with session_scope() as session:
+        product = products.find_by_name(session, "Redmi 13")
+        (unit,) = stock.add_units(
+            session, shop["owner"], product_id=product.id, cash_price=33000, wholesale_price=26000,
+            details=stock.UnitDetails(color="Black", battery_health=92),
+        )
+        unit_id, reference = unit.id, unit.reference
+        customer = customers.create_customer(
+            session, full_name="مشتري المخزون", phone="0550000444",
+            category_id=categories.get_fallback_type(session).id,
+        )
+        customer_id = customer.id
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    page = NewSalePage(current_user=_user(shop["owner"]))
+    page.sale_type.setCurrentIndex(page.sale_type.findData("installment"))
+    page.product.setCurrentText("Redmi 13")
+    details = page.sale_details
+    assert details.product_state.text() == ar.SALE_PRODUCT_EXISTS
+    assert details.unit.count() == 2  # "none" + the phone in stock
+    details.unit.setCurrentIndex(details.unit.findData(unit_id))
+    assert page.cash_price.value() == 33000 and page.wholesale_price.value() == 26000
+    assert details.reference.text() == reference and details.reference.isReadOnly()
+    page._customer_id = customer_id
+    page._save_sale()
+    with session_scope() as session:
+        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
+        assert (sale.cash_price, sale.color, sale.battery_health, sale.reference) == (33000, "Black", 92, reference)
+        sold = session.get(StockItem, unit_id)
+        assert sold.status == stock.STATUS_SOLD and sold.sale_id == sale.id
+
+    # The cash module records the same details and links a brand-new product name.
+    page.cash_product.setCurrentText("Tablet Modio")
+    assert page.cash_details.product_state.text() == ar.SALE_PRODUCT_NEW
+    page.cash_total.setValue(21000)
+    page.cash_details.color.setCurrentText("Grey")
+    page.cash_details.is_new.setChecked(True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    page._save_cash_sale()
+    with session_scope() as session:
+        cash_sale = session.scalar(select(Sale).where(Sale.product == "Tablet Modio"))
+        assert (cash_sale.color, cash_sale.is_new) == ("Grey", True)
+        assert cash_sale.product_id == products.find_by_name(session, "tablet modio").id
+
+
+def test_new_client_form_links_a_typed_product_and_records_phone_details(shop) -> None:
+    from app.ui.pages.customers_page import CustomersPage
+
+    page = CustomersPage(_user(shop["owner"]))
+    section = page._purchase_section()
+    assert section.product.isEditable()
+    section.product.setCurrentText("Honor X9D 12/256")
+    assert section.details.product_state.text() == ar.SALE_PRODUCT_NEW
+    section.sale_type.setCurrentIndex(section.sale_type.findData("cash"))
+    section.cash_price.setValue(82800)
+    section.details.battery.setValue(97)
+    section.details.color.setCurrentText("Black")
+    values = section.sale_values()
+    assert (values["product"], values["battery_health"], values["color"]) == ("Honor X9D 12/256", 97, "Black")
+    customer_id = page.save_new_customer(
+        {"full_name": "زبون هونر", "phone": "0550000555", "category_id": page._types[-1].id}, values
+    )
+    with session_scope() as session:
+        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
+        assert sale.product_id == products.find_by_name(session, "honor x9d 12/256").id
+        assert (sale.battery_health, sale.color) == (97, "Black")
+
+
+def test_clients_page_has_purchase_and_end_of_deduction_filters(shop) -> None:
+    from app.ui.pages.customers_page import CustomersPage
+
+    with session_scope() as session:
+        fallback = categories.get_fallback_type(session).id
+        recent = customers.create_customer(session, full_name="اشترى حديثاً", category_id=fallback)
+        sales.create_sale(session, customer_id=recent.id, product="X", sale_type="installment",
+                          wholesale_price=0, cash_price=6000, months=6, purchase_date=date.today())
+        old = customers.create_customer(session, full_name="قديم", category_id=fallback)
+        sales.create_sale(session, customer_id=old.id, product="X", sale_type="installment",
+                          wholesale_price=0, cash_price=6000, months=3, purchase_date=date(2024, 1, 10))
+    page = CustomersPage(_user(shop["owner"]))
+    page.purchased_filter.setCurrentIndex(page.purchased_filter.findData("this_month"))
+    assert "اشترى حديثاً" in _visible_names(page) and "قديم" not in _visible_names(page)
+    page.purchased_filter.setCurrentIndex(0)
+    page.deduction_filter.setCurrentIndex(page.deduction_filter.findData("finished"))
+    assert _visible_names(page) == {"قديم"}
+    page._reset_filters()
+    assert page.deduction_filter.currentIndex() == 0
+
+
+def _visible_names(page) -> set[str]:
+    """Customer names currently listed on the clients page."""
+    model = page.table.model()
+    return {model.index(row, 1).data() for row in range(model.rowCount())}

@@ -26,8 +26,9 @@ from PySide6.QtWidgets import (
 
 from app.i18n import ar
 from app.services import calc
-from app.services.products import CatalogEntry
+from app.services.products import CatalogEntry, name_key
 from app.i18n.plan_text import every_text, plan_description
+from app.ui.widgets.phone_details import PhoneDetailsSection
 
 
 class FirstPurchaseSection(QGroupBox):
@@ -58,8 +59,12 @@ class FirstPurchaseSection(QGroupBox):
 
         form = QFormLayout()
         self.product = QComboBox(self)
+        # The owner may type a product that is not in the catalog yet; it is
+        # added when the client is saved. Sellers pick from the catalog.
+        self.product.setEditable(is_owner)
+        self.product.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         for entry in self._catalog:
-            self.product.addItem(f"{entry.name} — {entry.cash_price:,} {ar.CURRENCY_SUFFIX}", entry.name)
+            self.product.addItem(entry.name, entry.name)
         self.sale_type = QComboBox(self)
         for label, value in (
             (ar.SALE_CASH, "cash"),
@@ -95,6 +100,13 @@ class FirstPurchaseSection(QGroupBox):
         self._form = form
         layout.addLayout(form)
 
+        details_title = QLabel(ar.SALE_DETAILS_SECTION, self)
+        details_title.setObjectName("sectionHint")
+        layout.addWidget(details_title)
+        self.details = PhoneDetailsSection(can_create_products=is_owner, parent=self)
+        self.details.unit_selected.connect(self._unit_selected)
+        layout.addWidget(self.details)
+
         self.plan_hint = QLabel(self)
         self.plan_hint.setObjectName("sectionHint")
         self.plan_hint.setWordWrap(True)
@@ -106,7 +118,7 @@ class FirstPurchaseSection(QGroupBox):
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.summary)
 
-        self.product.currentIndexChanged.connect(self._product_changed)
+        self.product.currentTextChanged.connect(self._product_changed)
         self.sale_type.currentIndexChanged.connect(self._type_changed)
         self.months.valueChanged.connect(self._months_changed)
         self.months.valueChanged.connect(self.interval.setMaximum)
@@ -129,11 +141,18 @@ class FirstPurchaseSection(QGroupBox):
 
     # ------------------------------------------------------------- reactions
     def _entry(self) -> CatalogEntry | None:
-        index = self.product.currentIndex()
-        return self._catalog[index] if 0 <= index < len(self._catalog) else None
+        key = name_key(self.product.currentText())
+        return next((entry for entry in self._catalog if name_key(entry.name) == key), None) if key else None
+
+    def _unit_selected(self, unit: dict | None) -> None:
+        """A phone picked from stock is sold at its own price."""
+        if unit is not None:
+            self.cash_price.setValue(unit["cash_price"])
+        self._update_summary()
 
     def _product_changed(self, *_args: object) -> None:
         entry = self._entry()
+        self.details.set_product(self.product.currentText())
         if entry is not None:
             self.cash_price.setValue(entry.cash_price)
             self.apply_plan(entry.months, entry.interval)
@@ -188,6 +207,9 @@ class FirstPurchaseSection(QGroupBox):
             return None
 
     def _wholesale(self) -> int:
+        unit = self.details.selected_unit()
+        if unit is not None:
+            return unit["wholesale_price"]
         entry = self._entry()
         return entry.wholesale_price if entry is not None else 0
 
@@ -214,12 +236,12 @@ class FirstPurchaseSection(QGroupBox):
 
     def sale_values(self) -> dict[str, object] | None:
         """Return create_sale keyword arguments, or ``None`` when unchecked."""
-        if not self.isChecked() or self.product.currentIndex() < 0:
+        if not self.isChecked() or not self.product.currentText().strip():
             return None
         kind = self.sale_type.currentData()
         purchase: date = self.purchase_date.date().toPython()
         return {
-            "product": self.product.currentData(),
+            "product": self.product.currentText().strip(),
             "sale_type": kind,
             "wholesale_price": self._wholesale(),
             "cash_price": self.cash_price.value(),
@@ -228,6 +250,7 @@ class FirstPurchaseSection(QGroupBox):
             "months": self.months.value() if kind == "installment" else None,
             "payment_interval": self._interval() if kind == "installment" else 1,
             "purchase_date": purchase,
+            **self.details.values(),
         }
 
 

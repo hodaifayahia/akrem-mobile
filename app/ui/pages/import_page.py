@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -54,6 +55,13 @@ def _field_labels() -> dict[str, str]:
         "profit": ar.IMP_FIELD_PROFIT,
         "purchase_date": ar.IMP_FIELD_PURCHASE_DATE,
         "end_date": ar.IMP_FIELD_END_DATE,
+        "phone": ar.IMP_FIELD_PHONE,
+        "client_type": ar.IMP_FIELD_CLIENT_TYPE,
+        "payment_interval": ar.IMP_FIELD_INTERVAL,
+        "color": ar.PROD_TPL_COLOR,
+        "battery": ar.PROD_TPL_BATTERY,
+        "imei": ar.PROD_TPL_IMEI,
+        "reference": ar.PROD_TPL_REF,
     }
 
 
@@ -558,6 +566,7 @@ class ImportPage(QWidget):
                     uncategorized_id=self._uncategorized_id,
                     mark_past_due_paid=self.mark_past_due.isChecked(),
                     use_sheet_values=set(self._sheet_value_rows),
+                    owner_user_id=int(self.current_user.id),
                 )
         except Exception:
             self.progress.setVisible(False)
@@ -604,7 +613,9 @@ class ImportPage(QWidget):
         if path.suffix.casefold() != ".xlsx":
             path = path.with_suffix(".xlsx")
         try:
-            _write_template(path)
+            with session_scope() as session:
+                client_types = [category.name for category in categories.list_client_types(session)]
+            _write_template(path, client_types)
         except Exception:
             self._show_error(ar.IMP_TEMPLATE_ERROR)
             return
@@ -694,39 +705,54 @@ def _sale_type_label(sale_type: str) -> str:
     }.get(sale_type, sale_type)
 
 
-def _write_template(path: Path) -> None:
-    """Create the spreadsheet template and add editable column dropdowns."""
+def _write_template(path: Path, client_types: list[str] | None = None) -> None:
+    """Create the sales sheet template (cash, installment and credit) with dropdowns.
+
+    The required columns are blue; the optional ones (phone, client type,
+    payment interval and the phone's colour, battery, IMEI and REF) are grey.
+    """
+    from app.i18n import is_rtl
+
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = importer.SHEET_NAME[:31]
+    worksheet.sheet_view.rightToLeft = is_rtl()
     fields = tuple(importer.HEADERS)
     headers = [importer.HEADERS[field] for field in fields]
     worksheet.append(headers)
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}500"
-    for column, header in enumerate(headers, start=1):
+    for column, (field, header) in enumerate(zip(fields, headers), start=1):
         cell = worksheet.cell(row=1, column=column)
         cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="0758CD")
+        optional = field in importer.OPTIONAL_HEADERS
+        cell.fill = PatternFill(fill_type="solid", fgColor="5B6577" if optional else "0758CD")
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        if optional:
+            cell.comment = Comment(ar.IMP_TEMPLATE_OPTIONAL_NOTE, "AkremMobile")
         worksheet.column_dimensions[get_column_letter(column)].width = max(
             17, min(34, len(header) + 4)
         )
+    imei_letter = get_column_letter(fields.index("imei") + 1)
+    worksheet.column_dimensions[imei_letter].number_format = "@"
 
-    validations = (
+    list_rules = [
         ("sale_type", ar.IMP_TEMPLATE_TYPES),
-        ("months", ",".join(str(month) for month in range(2, 13))),
         ("rate", "0,5,10,15,20,25,30,35,40,45,50"),
-    )
-    for field, choices in validations:
-        column = fields.index(field) + 1
-        letter = get_column_letter(column)
-        validation = DataValidation(
-            type="list",
-            formula1=f'"{choices}"',
-            allow_blank=True,
-        )
+    ]
+    if client_types:
+        choices = ",".join(name.replace(",", " ") for name in client_types)
+        if len(choices) < 250:  # Excel's limit for an inline list
+            list_rules.append(("client_type", choices))
+    for field, choices in list_rules:
+        letter = get_column_letter(fields.index(field) + 1)
+        validation = DataValidation(type="list", formula1=f'"{choices}"', allow_blank=True)
+        worksheet.add_data_validation(validation)
+        validation.add(f"{letter}2:{letter}500")
+    for field in ("months", "payment_interval"):
+        letter = get_column_letter(fields.index(field) + 1)
+        validation = DataValidation(type="whole", operator="between", formula1="1", formula2="60", allow_blank=True)
         worksheet.add_data_validation(validation)
         validation.add(f"{letter}2:{letter}500")
     workbook.save(path)

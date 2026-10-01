@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -36,13 +37,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.db.models import Product, User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, calc, products
+from app.services import auth, calc, product_sheet, products, stock
 from app.services.customers import normalize_search_text
 from app.services.settings import get_rate_presets
 from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
+from app.ui.pages.stock_panel import StockPanel
 from app.i18n.plan_text import every_text, plan_description, plan_summary
+from app.i18n.stock_text import battery_text, ltr_text
 from app.ui.theme import qcolor, repolish
 
 _LOG = logging.getLogger(__name__)
@@ -147,8 +150,8 @@ class ProductDialog(QDialog):
 class ProductsPage(QWidget):
     """Browse and (for the owner) manage the product catalog."""
 
-    COLUMNS_OWNER = ("name", "wholesale", "cash", "margin", "plan", "quote", "sold", "last_sold", "state")
-    COLUMNS_SELLER = ("name", "cash", "plan", "quote", "sold", "state")
+    COLUMNS_OWNER = ("name", "wholesale", "cash", "margin", "plan", "quote", "stock", "sold", "last_sold", "state")
+    COLUMNS_SELLER = ("name", "cash", "plan", "quote", "stock", "sold", "state")
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -156,15 +159,18 @@ class ProductsPage(QWidget):
         self._is_owner = current_user.role == "owner"
         self._columns = self.COLUMNS_OWNER if self._is_owner else self.COLUMNS_SELLER
         self._rows: list[Product] = []
+        self._stock: dict[int, tuple[int, int]] = {}
+        self._stock_totals = (0, 0)
         self._build_ui()
         events.data_changed.connect(self.refresh)
+        events.data_changed.connect(self.stock_panel.refresh)
         self.refresh()
 
     # ------------------------------------------------------------------ build
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 22, 28, 22)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         header = QHBoxLayout()
         titles = QVBoxLayout()
@@ -182,37 +188,55 @@ class ProductsPage(QWidget):
         self.upload_button = self._action(ar.PROD_UPLOAD_BUTTON, "upload", "secondary")
         self.upload_button.setToolTip(ar.PROD_UPLOAD_TOOLTIP)
         self.upload_button.clicked.connect(self._upload)
+        self.export_button = self._action(ar.STOCK_EXPORT, "import", "secondary")
+        self.export_button.clicked.connect(self._export_stock)
+        for button in (self.template_button, self.upload_button, self.export_button):
+            button.setVisible(self._is_owner)
+            header.addWidget(button)
+        layout.addLayout(header)
+
+        self.tabs = QTabWidget(self)
+        self.tabs.setDocumentMode(True)
+        self.stock_panel = StockPanel(self.current_user, self.tabs)
+        self.stock_panel.counts_changed.connect(self._stock_counts_changed)
+        self._stock_totals = self.stock_panel.last_counts
+        self.tabs.addTab(self.stock_panel, icons.icon("tag", "text-muted", 16), ar.PROD_TAB_STOCK)
+        catalog = QWidget(self.tabs)
+        self.tabs.addTab(catalog, icons.icon("cart", "text-muted", 16), ar.PROD_TAB_CATALOG)
+        layout.addWidget(self.tabs, 1)
+
+        catalog_layout = QVBoxLayout(catalog)
+        catalog_layout.setContentsMargins(0, 12, 0, 0)
+        catalog_layout.setSpacing(10)
+        filters = QHBoxLayout()
+        filters.setSpacing(10)
+        self.search = QLineEdit(catalog)
+        self.search.setPlaceholderText(ar.PROD_SEARCH)
+        self.search.setClearButtonEnabled(True)
+        self.search.addAction(icons.icon("search", "text-muted", 16), QLineEdit.ActionPosition.LeadingPosition)
+        self.search.textChanged.connect(self._render)
+        filters.addWidget(self.search, 1)
+        self.state_filter = QComboBox(catalog)
+        self.state_filter.addItem(ar.PROD_FILTER_ACTIVE, "active")
+        if self._is_owner:
+            self.state_filter.addItem(ar.PROD_FILTER_ARCHIVED, "archived")
+            self.state_filter.addItem(ar.PROD_FILTER_ALL, "all")
+        self.state_filter.addItem(ar.PROD_FILTER_IN_STOCK, "in_stock")
+        self.state_filter.addItem(ar.PROD_FILTER_OUT_OF_STOCK, "out_of_stock")
+        self.state_filter.currentIndexChanged.connect(self._render)
+        filters.addWidget(self.state_filter)
         self.edit_button = self._action(ar.SET_PRODUCT_EDIT, "edit", "secondary")
         self.edit_button.clicked.connect(self._edit_selected)
         self.archive_button = self._action(ar.SET_PRODUCT_ARCHIVE, "tray", "secondary")
         self.archive_button.clicked.connect(self._toggle_selected)
         self.add_button = self._action(ar.SET_PRODUCT_ADD, "plus", None)
         self.add_button.clicked.connect(self._create)
-        for button in (
-            self.template_button, self.upload_button, self.edit_button, self.archive_button, self.add_button,
-        ):
+        for button in (self.archive_button, self.edit_button, self.add_button):
             button.setVisible(self._is_owner)
-            header.addWidget(button)
-        layout.addLayout(header)
+            filters.addWidget(button)
+        catalog_layout.addLayout(filters)
 
-        filters = QHBoxLayout()
-        filters.setSpacing(10)
-        self.search = QLineEdit(self)
-        self.search.setPlaceholderText(ar.PROD_SEARCH)
-        self.search.setClearButtonEnabled(True)
-        self.search.addAction(icons.icon("search", "text-muted", 16), QLineEdit.ActionPosition.LeadingPosition)
-        self.search.textChanged.connect(self._render)
-        filters.addWidget(self.search, 1)
-        self.state_filter = QComboBox(self)
-        self.state_filter.addItem(ar.PROD_FILTER_ACTIVE, "active")
-        if self._is_owner:
-            self.state_filter.addItem(ar.PROD_FILTER_ARCHIVED, "archived")
-            self.state_filter.addItem(ar.PROD_FILTER_ALL, "all")
-        self.state_filter.currentIndexChanged.connect(self._render)
-        filters.addWidget(self.state_filter)
-        layout.addLayout(filters)
-
-        self.table = QTableWidget(0, len(self._columns), self)
+        self.table = QTableWidget(0, len(self._columns), catalog)
         self.table.setHorizontalHeaderLabels([self._header(key) for key in self._columns])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(42)
@@ -228,9 +252,9 @@ class ProductsPage(QWidget):
         self.table.itemSelectionChanged.connect(self._update_actions)
         if self._is_owner:
             self.table.itemDoubleClicked.connect(lambda _item: self._edit_selected())
-        layout.addWidget(self.table, 1)
+        catalog_layout.addWidget(self.table, 1)
 
-        self.empty_card = QFrame(self)
+        self.empty_card = QFrame(catalog)
         self.empty_card.setObjectName("emptyStateCard")
         empty_layout = QVBoxLayout(self.empty_card)
         empty_layout.setContentsMargins(20, 36, 20, 36)
@@ -242,7 +266,7 @@ class ProductsPage(QWidget):
         empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(empty_icon)
         empty_layout.addWidget(empty_text)
-        layout.addWidget(self.empty_card)
+        catalog_layout.addWidget(self.empty_card)
         self.empty_card.hide()
         self._update_actions()
 
@@ -263,6 +287,7 @@ class ProductsPage(QWidget):
             "margin": ar.PROD_COL_MARGIN,
             "plan": ar.PROD_COL_PLAN,
             "quote": ar.INSTALLMENT_AMOUNT,
+            "stock": ar.PROD_COL_STOCK,
             "sold": ar.PROD_COL_SOLD,
             "last_sold": ar.PROD_COL_LAST_SOLD,
             "state": ar.SET_PRODUCT_ACTIVE,
@@ -275,6 +300,7 @@ class ProductsPage(QWidget):
             with session_scope() as session:
                 catalog = products.list_products(session, include_inactive=self._is_owner)
                 self._sold = products.sales_by_product(session)
+                self._stock = stock.stock_counts(session)
                 self._presets = get_rate_presets(session)
         except SQLAlchemyError:
             _LOG.exception("Product catalog refresh failed")
@@ -290,6 +316,9 @@ class ProductsPage(QWidget):
             if state == "active" and not product.active:
                 continue
             if state == "archived" and product.active:
+                continue
+            in_stock = self._stock.get(product.id, (0, 0))[0]
+            if state in ("in_stock", "out_of_stock") and (not product.active or (in_stock > 0) != (state == "in_stock")):
                 continue
             if key and key not in normalize_search_text(product.name):
                 continue
@@ -310,14 +339,15 @@ class ProductsPage(QWidget):
                     item.setToolTip(ar.PLAN_NO_RATE.format(months=products.plan_of(product).months))
                 self.table.setItem(row, column, item)
         active = sum(1 for product in getattr(self, "_catalog", []) if product.active)
-        self.count_label.setText(ar.PROD_COUNT.format(count=active))
+        self._active_count = active
+        self._update_count_label()
         self.empty_card.setVisible(not self._rows)
         self.table.setVisible(bool(self._rows))
         self._update_actions()
 
     def _cell(self, product: Product, key: str) -> str:
         if key == "name":
-            return product.name
+            return ltr_text(product.name)
         if key == "wholesale":
             return _money(product.wholesale_price) if product.wholesale_price else "—"
         if key == "cash":
@@ -331,6 +361,8 @@ class ProductsPage(QWidget):
             return text if rate is None else f"{text} · {rate}%"
         if key == "quote":
             return self._quote(product)
+        if key == "stock":
+            return str(self._stock.get(product.id, (0, 0))[0])
         if key == "sold":
             return str(self._sold.get(product.name, (0, None))[0])
         if key == "last_sold":
@@ -414,6 +446,17 @@ class ProductsPage(QWidget):
         events.notify.emit("success", ar.NAV_PRODUCTS, ar.SET_PRODUCT_SAVED, 3000)
         return True
 
+    def _stock_counts_changed(self, available: int, sold: int) -> None:
+        self._stock_totals = (available, sold)
+        self._update_count_label()
+
+    def _update_count_label(self) -> None:
+        available, sold = self._stock_totals
+        self.count_label.setText(
+            ar.PROD_COUNT.format(count=getattr(self, "_active_count", 0))
+            + " · " + ar.STOCK_COUNT.format(available=available, sold=sold)
+        )
+
     # ------------------------------------------------------------ Excel
     def _download_template(self) -> None:
         selected, _filter = QFileDialog.getSaveFileName(
@@ -434,6 +477,37 @@ class ProductsPage(QWidget):
             QMessageBox.warning(self, ar.ERROR_TITLE, ar.PROD_TEMPLATE_ERROR)
             return None
         events.notify.emit("success", ar.NAV_PRODUCTS, ar.PROD_TEMPLATE_SAVED.format(path=path), 5000)
+        return path
+
+    def _export_stock(self) -> None:
+        selected, _filter = QFileDialog.getSaveFileName(
+            self, ar.STOCK_EXPORT, ar.STOCK_EXPORT_FILE, ar.IMP_TEMPLATE_FILTER
+        )
+        if selected:
+            self.export_stock(selected)
+
+    def export_stock(self, destination: str | Path) -> Path | None:
+        """Write the stock list as shown (current filters) in the re-importable layout."""
+        path = Path(destination)
+        if path.suffix.casefold() != ".xlsx":
+            path = path.with_suffix(".xlsx")
+        panel = self.stock_panel
+        try:
+            with session_scope() as session:
+                units = stock.list_units(
+                    session,
+                    status=panel.status_filter.currentData(),
+                    product_id=panel.product_filter.currentData(),
+                    color=panel.color_filter.currentData(),
+                    condition=panel.condition_filter.currentData(),
+                    search=panel.search.text(),
+                )
+                product_sheet.export_stock_workbook(session, path, units)
+        except (OSError, SQLAlchemyError):
+            _LOG.exception("Stock export failed")
+            QMessageBox.warning(self, ar.ERROR_TITLE, ar.PROD_TEMPLATE_ERROR)
+            return None
+        events.notify.emit("success", ar.NAV_PRODUCTS, ar.STOCK_EXPORT_DONE.format(path=path), 5000)
         return path
 
     def _upload(self) -> None:
@@ -479,12 +553,15 @@ class ProductsPage(QWidget):
             return None
         dialog.accept()
         events.data_changed.emit()
-        events.notify.emit(
-            "success",
-            ar.NAV_PRODUCTS,
-            ar.PROD_UPLOAD_DONE.format(created=result.created, updated=result.updated, restored=result.restored),
-            5000,
-        )
+        if dialog.preview.is_stock:
+            message = ar.PROD_UPLOAD_DONE_STOCK.format(
+                created=result.created, added=result.units_added, updated=result.units_updated,
+            )
+        else:
+            message = ar.PROD_UPLOAD_DONE.format(
+                created=result.created, updated=result.updated, restored=result.restored,
+            )
+        events.notify.emit("success", ar.NAV_PRODUCTS, message, 5000)
         return result
 
     def _toggle_selected(self) -> None:
@@ -501,13 +578,18 @@ class ProductsPage(QWidget):
 
 
 class ProductImportDialog(QDialog):
-    """Row-by-row preview of an uploaded product sheet before anything is saved."""
+    """Row-by-row preview of an uploaded products/stock sheet before anything is saved."""
+
+    CATALOG_COLUMNS = ("row", "name", "cash", "wholesale", "result", "notes", "plan")
+    STOCK_COLUMNS = ("row", "name", "wholesale", "cash", "battery", "color", "imei", "reference",
+                     "result", "stock", "notes")
 
     def __init__(self, preview: products.ProductImportPreview, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.preview = preview
+        self.columns = self.STOCK_COLUMNS if preview.is_stock else self.CATALOG_COLUMNS
         self.setWindowTitle(ar.PROD_UPLOAD_TITLE)
-        self.setMinimumSize(760, 480)
+        self.setMinimumSize(980 if preview.is_stock else 760, 520)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(8)
@@ -517,26 +599,34 @@ class ProductImportDialog(QDialog):
         source = QLabel(ar.PROD_UPLOAD_FILE.format(name=preview.path.name, sheet=preview.sheet_name), self)
         source.setObjectName("sectionHint")
         layout.addWidget(source)
-        self.summary = QLabel(ar.PROD_UPLOAD_SUMMARY.format(
-            create=preview.count(products.ACTION_CREATE),
-            update=preview.count(products.ACTION_UPDATE),
-            restore=preview.count(products.ACTION_RESTORE),
-            unchanged=preview.count(products.ACTION_UNCHANGED),
-            invalid=preview.count(products.ACTION_INVALID),
-        ), self)
+        if preview.is_stock:
+            summary = ar.PROD_UPLOAD_STOCK_SUMMARY.format(
+                create=preview.count(products.ACTION_CREATE),
+                units=preview.units_to_add,
+                updated=preview.unit_count(products.UNIT_UPDATE),
+                in_stock=preview.unit_count(products.UNIT_IN_STOCK),
+                invalid=preview.count(products.ACTION_INVALID),
+            )
+            hint_text = ar.PROD_UPLOAD_STOCK_HINT
+        else:
+            summary = ar.PROD_UPLOAD_SUMMARY.format(
+                create=preview.count(products.ACTION_CREATE),
+                update=preview.count(products.ACTION_UPDATE),
+                restore=preview.count(products.ACTION_RESTORE),
+                unchanged=preview.count(products.ACTION_UNCHANGED),
+                invalid=preview.count(products.ACTION_INVALID),
+            )
+            hint_text = ar.PROD_UPLOAD_HINT
+        self.summary = QLabel(summary, self)
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
-        hint = QLabel(ar.PROD_UPLOAD_HINT, self)
+        hint = QLabel(hint_text, self)
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        headers = [
-            ar.PROD_UPLOAD_COL_ROW, ar.SET_PRODUCT_NAME, ar.SET_PRODUCT_CASH, ar.SET_PRODUCT_WHOLESALE,
-            ar.PROD_UPLOAD_COL_RESULT, ar.PROD_UPLOAD_COL_NOTES, ar.PROD_COL_PLAN,
-        ]
-        self.table = QTableWidget(len(preview.rows), len(headers), self)
-        self.table.setHorizontalHeaderLabels(headers)
+        self.table = QTableWidget(len(preview.rows), len(self.columns), self)
+        self.table.setHorizontalHeaderLabels([_preview_header(key) for key in self.columns])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -544,39 +634,39 @@ class ProductImportDialog(QDialog):
         self.table.setShowGrid(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.columns.index("name"), QHeaderView.ResizeMode.Stretch)
+        notes_column = self.columns.index("notes")
+        header.setSectionResizeMode(notes_column, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(notes_column, 230)
         header.setStretchLastSection(False)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         for row, item in enumerate(preview.rows):
-            tone = _ACTION_TONES[item.action]
-            notes = [_problem_text(code) for code in item.errors + item.warnings]
-            cells = (
-                str(item.row_number),
-                item.name or "—",
-                _money(item.cash_price) if item.cash_price is not None else "—",
-                _money(item.wholesale_price) if item.wholesale_price is not None else "—",
-                action_label(item.action),
-                " · ".join(notes),
-                _row_plan_text(item),
-            )
-            for column, text in enumerate(cells):
-                cell = QTableWidgetItem(text)
-                if column not in (1, 5):
+            for column, key in enumerate(self.columns):
+                cell = QTableWidgetItem(_preview_cell(item, key))
+                if key not in ("name", "notes"):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column == 4 or (column == 5 and item.errors):
-                    cell.setForeground(qcolor(tone))
+                if key == "notes":
+                    cell.setToolTip(cell.text())
+                if key == "result" or (key == "notes" and item.errors):
+                    cell.setForeground(qcolor(_ACTION_TONES[item.action]))
+                if key == "stock" and item.unit_action == products.UNIT_ADD:
+                    cell.setForeground(qcolor("paid"))
                 self.table.setItem(row, column, cell)
         layout.addWidget(self.table, 1)
 
         self.error = InlineError(self)
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(self)
-        importable = sum(
-            1 for item in preview.rows
-            if item.action in (products.ACTION_CREATE, products.ACTION_UPDATE, products.ACTION_RESTORE)
-        )
-        self.import_button = buttons.addButton(
-            ar.PROD_UPLOAD_CONFIRM.format(count=importable), QDialogButtonBox.ButtonRole.AcceptRole
-        )
+        if preview.is_stock:
+            label = ar.PROD_UPLOAD_CONFIRM_STOCK.format(units=preview.units_to_add)
+        else:
+            importable = sum(
+                1 for item in preview.rows
+                if item.action in (products.ACTION_CREATE, products.ACTION_UPDATE, products.ACTION_RESTORE)
+            )
+            label = ar.PROD_UPLOAD_CONFIRM.format(count=importable)
+        self.import_button = buttons.addButton(label, QDialogButtonBox.ButtonRole.AcceptRole)
         self.import_button.setIcon(icons.icon("upload", "#FFFFFF", 16))
         self.import_button.setEnabled(preview.has_changes)
         cancel = buttons.addButton(ar.USER_CANCEL, QDialogButtonBox.ButtonRole.RejectRole)
@@ -587,12 +677,78 @@ class ProductImportDialog(QDialog):
         if not preview.has_changes:
             self.error.show_message(ar.PROD_UPLOAD_NOTHING)
 
+    def cell_text(self, row: int, key: str) -> str:
+        """Text shown for ``key`` on a preview row (used by tests)."""
+        return self.table.item(row, self.columns.index(key)).text()
+
+
+def _preview_header(key: str) -> str:
+    return {
+        "row": ar.PROD_UPLOAD_COL_ROW,
+        "name": ar.SET_PRODUCT_NAME,
+        "cash": ar.SET_PRODUCT_CASH,
+        "wholesale": ar.SET_PRODUCT_WHOLESALE,
+        "battery": ar.PROD_TPL_BATTERY,
+        "color": ar.PROD_TPL_COLOR,
+        "imei": ar.PROD_TPL_IMEI,
+        "reference": ar.PROD_TPL_REF,
+        "result": ar.PROD_UPLOAD_COL_RESULT,
+        "stock": ar.PROD_UPLOAD_COL_STOCK,
+        "notes": ar.PROD_UPLOAD_COL_NOTES,
+        "plan": ar.PROD_COL_PLAN,
+    }[key]
+
+
+def _preview_cell(item: products.ProductImportRow, key: str) -> str:
+    if key == "row":
+        return str(item.row_number)
+    if key == "name":
+        return ltr_text(item.name) if item.name else "—"
+    if key == "cash":
+        return _money(item.cash_price) if item.cash_price is not None else "—"
+    if key == "wholesale":
+        return _money(item.wholesale_price) if item.wholesale_price is not None else "—"
+    if key == "battery":
+        return battery_text(item.is_new, item.battery_health)
+    if key == "color":
+        return ltr_text(item.color) if item.color else "—"
+    if key == "imei":
+        return ltr_text(item.imei) if item.imei else "—"
+    if key == "reference":
+        if item.reference:
+            return ltr_text(item.reference)
+        return ar.STOCK_REF_AUTO if item.unit_action == products.UNIT_ADD else "—"
+    if key == "result":
+        return action_label(item.action)
+    if key == "stock":
+        return unit_action_label(item)
+    if key == "plan":
+        return _row_plan_text(item)
+    notes = [_problem_text(code) for code in item.errors + item.warnings]
+    if item.is_stock and item.note:
+        notes.append(item.note)
+    return " · ".join(notes)
+
+
+def unit_action_label(item: products.ProductImportRow) -> str:
+    """Localized stock outcome of one stock row."""
+    if not item.valid or item.unit_action is None:
+        return "—"
+    if item.unit_action == products.UNIT_ADD:
+        return ar.PROD_UNIT_ADD.format(count=item.units_to_add)
+    return {
+        products.UNIT_UPDATE: ar.PROD_UNIT_UPDATE,
+        products.UNIT_IN_STOCK: ar.PROD_UNIT_IN_STOCK,
+        products.UNIT_SOLD: ar.PROD_UNIT_SOLD,
+    }[item.unit_action]
+
 
 _ACTION_TONES = {
     products.ACTION_CREATE: "paid",
     products.ACTION_UPDATE: "primary-glow",
     products.ACTION_RESTORE: "primary-glow",
     products.ACTION_UNCHANGED: "text-muted",
+    products.ACTION_EXISTING: "text-muted",
     products.ACTION_INVALID: "failed",
 }
 
@@ -604,6 +760,7 @@ def action_label(action: str) -> str:
         products.ACTION_UPDATE: ar.PROD_ACTION_UPDATE,
         products.ACTION_RESTORE: ar.PROD_ACTION_RESTORE,
         products.ACTION_UNCHANGED: ar.PROD_ACTION_UNCHANGED,
+        products.ACTION_EXISTING: ar.PROD_ACTION_EXISTING,
         products.ACTION_INVALID: ar.PROD_ACTION_INVALID,
     }[action]
 
@@ -620,6 +777,12 @@ def _problem_text(code: str) -> str:
         products.ERROR_MONTHS_INVALID: ar.PROD_ERR_MONTHS_INVALID,
         products.ERROR_INTERVAL_INVALID: ar.PROD_ERR_INTERVAL_INVALID,
         products.ERROR_RATE_INVALID: ar.PROD_ERR_RATE_INVALID,
+        products.ERROR_NAME_INVALID: ar.PROD_ERR_NAME_INVALID,
+        products.ERROR_QUANTITY_INVALID: ar.PROD_ERR_QUANTITY_INVALID,
+        products.ERROR_IMEI_DUPLICATE: ar.PROD_ERR_IMEI_DUPLICATE,
+        products.WARNING_BATTERY_TEXT: ar.PROD_WARN_BATTERY_TEXT,
+        products.WARNING_STATUS_TEXT: ar.PROD_WARN_STATUS_TEXT,
+        products.WARNING_REF_DUPLICATE: ar.PROD_WARN_REF_DUPLICATE,
         products.WARNING_NO_WHOLESALE: ar.PROD_WARN_NO_WHOLESALE,
         products.WARNING_BELOW_WHOLESALE: ar.PROD_WARN_BELOW_WHOLESALE,
     }.get(code, code)

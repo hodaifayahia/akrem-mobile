@@ -65,6 +65,50 @@ class Product(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )
+    stock_items: Mapped[list[StockItem]] = relationship(back_populates="product", passive_deletes=True)
+
+
+class StockItem(Base):
+    """One physical unit of a catalog product (one phone), as listed in the stock sheet.
+
+    ``battery_health`` is the battery percentage of a used phone; ``is_new``
+    marks a new phone (written ``*`` in the shop's sheet). ``sale_id`` points
+    at the sale that took this unit once it is sold.
+    """
+
+    __tablename__ = "stock_items"
+    __table_args__ = (
+        CheckConstraint("status IN ('available', 'sold')", name="ck_stock_items_status"),
+        CheckConstraint("wholesale_price >= 0", name="ck_stock_items_wholesale_nonnegative"),
+        CheckConstraint("cash_price >= 0", name="ck_stock_items_cash_nonnegative"),
+        CheckConstraint(
+            "battery_health IS NULL OR (battery_health >= 0 AND battery_health <= 100)",
+            name="ck_stock_items_battery_range",
+        ),
+        Index("ix_stock_items_product_id", "product_id"),
+        Index("ix_stock_items_status", "status"),
+        Index("ix_stock_items_sale_id", "sale_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"), nullable=False)
+    wholesale_price: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cash_price: Mapped[int] = mapped_column(Integer, nullable=False)
+    color: Mapped[str | None] = mapped_column(String(60))
+    battery_health: Mapped[int | None] = mapped_column(Integer)
+    is_new: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    imei: Mapped[str | None] = mapped_column(String(40), unique=True)
+    reference: Mapped[str | None] = mapped_column(String(40), unique=True)
+    note: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="available", server_default="available")
+    sale_id: Mapped[int | None] = mapped_column(ForeignKey("sales.id", ondelete="SET NULL"))
+    sold_at: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    product: Mapped[Product] = relationship(back_populates="stock_items")
+    sale: Mapped[Sale | None] = relationship(back_populates="stock_items")
 
 
 class Customer(Base):
@@ -111,6 +155,7 @@ class Sale(Base):
         CheckConstraint("months IS NULL OR months >= 1", name="ck_sales_months_positive"),
         Index("ix_sales_customer_id", "customer_id"),
         Index("ix_sales_purchase_date", "purchase_date"),
+        Index("ix_sales_product_id", "product_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -133,11 +178,21 @@ class Sale(Base):
     purchase_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date | None] = mapped_column(Date)
     expected_pay_date: Mapped[date | None] = mapped_column(Date)
+    # The catalog product this sale was linked to, and a copy of the unit's
+    # details (kept even if the stock row is edited or removed later).
+    # Products are archived, never deleted, so the link needs no ON DELETE rule.
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
+    color: Mapped[str | None] = mapped_column(String(60))
+    battery_health: Mapped[int | None] = mapped_column(Integer)
+    is_new: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    imei: Mapped[str | None] = mapped_column(String(40))
+    reference: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )
 
     customer: Mapped[Customer] = relationship(back_populates="sales")
+    stock_items: Mapped[list[StockItem]] = relationship(back_populates="sale")
     installments: Mapped[list[Installment]] = relationship(
         back_populates="sale", cascade="all, delete-orphan", passive_deletes=True
     )

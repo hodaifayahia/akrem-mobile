@@ -115,6 +115,12 @@ def create_sale(
     end_date: date | None = None,
     expected_pay_date: date | None = None,
     payment_interval: int = 1,
+    product_id: int | None = None,
+    color: str | None = None,
+    battery_health: int | None = None,
+    is_new: bool = False,
+    imei: str | None = None,
+    reference: str | None = None,
 ) -> Sale:
     """Create a sale record using already-computed integer amounts."""
     sale = Sale(
@@ -134,6 +140,12 @@ def create_sale(
         purchase_date=purchase_date,
         end_date=end_date,
         expected_pay_date=expected_pay_date,
+        product_id=product_id,
+        color=color,
+        battery_health=battery_health,
+        is_new=is_new,
+        imei=imei,
+        reference=reference,
     )
     if not sale.product:
         raise ValueError("Product cannot be empty")
