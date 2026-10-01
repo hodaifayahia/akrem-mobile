@@ -48,7 +48,6 @@ class _UserCredentialsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(410)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.username = QLineEdit(self)
         self.username.setText(username or "")
         self.username.setVisible(username is None)
@@ -95,7 +94,6 @@ class _ProductDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(420)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.name = QLineEdit(self)
         self.wholesale_price = self._money_input(self)
         self.cash_price = self._money_input(self)
@@ -136,7 +134,6 @@ class SettingsPage(QWidget):
         self.current_user = current_user
         self._is_owner = current_user.role == "owner"
         self._products_by_id: dict[int, Product] = {}
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
         if self._is_owner:
             try:
@@ -407,7 +404,7 @@ class SettingsPage(QWidget):
         with session_scope() as session:
             auth.require_owner(session, self.current_user.id)
             from app.i18n import get_language
-            lang = settings.get_value(session, "language", get_language())
+            lang = get_language()
             due_mode = settings.get_value(session, "due_mode", "first_of_month")
             grace_days = settings.get_value(session, "grace_days", 5)
             inactivity_minutes = settings.get_value(session, "inactivity_minutes", 15)
@@ -448,16 +445,16 @@ class SettingsPage(QWidget):
             self._show_error(ar.SET_SAVE_ERROR)
             return
 
-        from app.i18n import set_language
-        from PySide6.QtCore import QSettings
-        from app.config import APP_NAME
-        QSettings(APP_NAME, APP_NAME).setValue("language", new_lang)
-        set_language(new_lang)
-
         events.data_changed.emit()
         events.settings_changed.emit()
         events.notify.emit("success", ar.SET_TITLE, ar.SET_SAVED, 4000)
-        QMessageBox.information(self, ar.SET_TITLE, ar.SET_SAVED)
+        from app.i18n import get_language
+        if new_lang and new_lang != get_language():
+            # Switching language rebuilds every page, including this one, so
+            # it must be the last thing this slot does.
+            from app.ui.locale import change_language
+
+            change_language(new_lang)
 
     def _read_rate_presets(self) -> dict[int, int]:
         """Read and validate editable months-to-rate rows."""

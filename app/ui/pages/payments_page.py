@@ -6,7 +6,6 @@ import json
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from urllib.parse import quote
 
 from PySide6.QtCore import QDate, QUrl, Qt
 from PySide6.QtGui import QDesktopServices
@@ -41,14 +40,18 @@ from app.db.models import Installment, Payment, Sale, Setting, User
 from app.db.session import session_scope
 from app.i18n import ar
 from app.services import payments as payment_service
+from app.services.reminders import whatsapp_link
 from app.services.status import Status, for_month
 from app.ui.events import events
 
-_PAYMENT_METHODS = (
-    (ar.PAY_METHOD_CASH, "cash"),
-    (ar.PAY_METHOD_CCP, "CCP"),
-    (ar.PAY_METHOD_BARIDIMOB, "BaridiMob"),
-)
+
+def _payment_methods() -> tuple[tuple[str, str], ...]:
+    """Labels in the active language (evaluated at call time)."""
+    return (
+        (ar.PAY_METHOD_CASH, "cash"),
+        (ar.PAY_METHOD_CCP, "CCP"),
+        (ar.PAY_METHOD_BARIDIMOB, "BaridiMob"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +71,6 @@ class PaymentsPage(QWidget):
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.current_user = current_user
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
         events.data_changed.connect(self.refresh)
         events.payment_changed.connect(self.refresh)
@@ -113,7 +115,6 @@ class PaymentsPage(QWidget):
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
         self.content = QWidget(self.scroll_area)
-        self.content.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.sections_layout = QVBoxLayout(self.content)
         self.sections_layout.setContentsMargins(0, 0, 0, 0)
         self.sections_layout.setSpacing(16)
@@ -168,7 +169,6 @@ class PaymentsPage(QWidget):
     ) -> tuple[QGroupBox, QTableWidget, QLabel]:
         """Create a status group with its installment table and empty hint."""
         box = QGroupBox(title, self.content)
-        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         box_layout = QVBoxLayout(box)
         box_layout.setSpacing(10)
         empty = QLabel(f"ℹ️  {ar.PAY_EMPTY}", box)
@@ -197,7 +197,6 @@ class PaymentsPage(QWidget):
     def _make_reminders_section(self) -> tuple[QGroupBox, QTableWidget, QLabel]:
         """Create a list of overdue and near-due customer reminders."""
         box = QGroupBox(f"🔔  {ar.PAY_REMINDERS_TITLE}", self.content)
-        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         box_layout = QVBoxLayout(box)
         box_layout.setSpacing(10)
         empty = QLabel(f"🎉  {ar.PAY_REMINDERS_EMPTY}", box)
@@ -225,7 +224,6 @@ class PaymentsPage(QWidget):
     def _make_credit_section(self) -> tuple[QGroupBox, QTableWidget, QLabel]:
         """Create the credit balance and payment-history group."""
         box = QGroupBox(f"💳  {ar.PAY_CREDIT_GROUP}", self.content)
-        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         box_layout = QVBoxLayout(box)
         box_layout.setSpacing(10)
         empty = QLabel(f"ℹ️  {ar.PAY_EMPTY_CREDIT}", box)
@@ -413,15 +411,14 @@ class PaymentsPage(QWidget):
     @staticmethod
     def _open_whatsapp_reminder(phone: str, customer_name: str, amount: int, due_date: date) -> None:
         """Open WhatsApp with a drafted reminder for the operator to review and send."""
-        digits = "".join(character for character in phone if character.isdecimal())
-        if len(digits) == 10 and digits.startswith("0"):
-            digits = "213" + digits[1:]
         message = ar.PAY_REMINDERS_MESSAGE.format(
             customer=customer_name,
             amount=_format_money(amount),
             due=_format_date(due_date),
         )
-        QDesktopServices.openUrl(QUrl(f"https://wa.me/{digits}?text={quote(message)}"))
+        link = whatsapp_link(phone, message)
+        if link is not None:
+            QDesktopServices.openUrl(QUrl(link))
 
     def _render_installments(
         self,
@@ -614,7 +611,6 @@ class PaymentsPage(QWidget):
         """Show payment dates, amounts, methods, and notes for one credit sale."""
         dialog = QDialog(self)
         dialog.setWindowTitle(ar.PAY_HISTORY_TITLE)
-        dialog.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         layout = QVBoxLayout(dialog)
         history = QListWidget(dialog)
         if not payments:
@@ -653,7 +649,6 @@ class PaymentDialog(QDialog):
 
     def __init__(self, remaining: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.amount_input = QSpinBox(self)
         self.amount_input.setRange(1, max(1, remaining))
         self.amount_input.setValue(max(1, remaining))
@@ -665,7 +660,7 @@ class PaymentDialog(QDialog):
         self.date_input.setDate(QDate.currentDate())
 
         self.method_input = QComboBox(self)
-        for label, value in _PAYMENT_METHODS:
+        for label, value in _payment_methods():
             self.method_input.addItem(label, value)
         self.note_input = QLineEdit(self)
 
@@ -739,7 +734,7 @@ def _format_date(value: date | datetime | None) -> str:
 
 def _method_label(method: str) -> str:
     """Map stored method codes to the localized label."""
-    for label, value in _PAYMENT_METHODS:
+    for label, value in _payment_methods():
         if method.casefold() == value.casefold():
             return label
     return method

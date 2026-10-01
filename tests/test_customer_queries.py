@@ -223,3 +223,24 @@ def test_customer_details_eagerly_loads_relationships_and_reports_missing_id(
 
         with pytest.raises(ValueError, match="Customer not found"):
             customers.get_customer_details(session, customer.id + 100)
+
+
+def test_delete_customer_service_protects_customers_with_sales(memory_engine: Engine) -> None:
+    """The customers service deletes unused customers and refuses ones with sales."""
+    with Session(memory_engine) as session:
+        category = _category(session, "حذف")
+        unused = customers.create_customer(session, full_name="بدون مبيعات", category_id=category.id)
+        used = customers.create_customer(session, full_name="مع مبيعات", category_id=category.id)
+        sales.create_sale(
+            session,
+            customer_id=used.id,
+            product="A15",
+            sale_type="cash",
+            wholesale_price=10000,
+            cash_price=12000,
+            purchase_date=date(2026, 1, 5),
+        )
+        customers.delete_customer(session, unused.id)
+        assert session.get(Customer, unused.id) is None
+        with pytest.raises(ValueError):
+            customers.delete_customer(session, used.id)

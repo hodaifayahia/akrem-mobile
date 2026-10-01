@@ -1,196 +1,184 @@
-"""Pure PySide6 antialiased vector financial trend chart."""
+"""Six-month trend of expected versus collected money.
+
+The header and legend are ordinary widgets, so Qt mirrors them. The plot is
+custom-painted and lays time out from the reading-start edge: oldest month
+on the right in Arabic, on the left in English/French. Y-axis labels sit on
+the start side as well.
+"""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QFont,
-    QLinearGradient,
-    QPaintEvent,
-    QPainter,
-    QPainterPath,
-    QPen,
-)
-from PySide6.QtWidgets import QFrame, QSizePolicy, QWidget
+from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPaintEvent, QPen
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
+
+from app.i18n import ar
+from app.ui.theme import qcolor
 
 
-class FinancialTrendChart(QFrame):
-    """High-performance antialiased vector area chart comparing expected vs collected cash."""
+def compact_amount(value: int) -> str:
+    """Shorten large amounts for axis labels (1.2M, 450K)."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value // 1_000}K"
+    return str(value)
+
+
+def nice_ceiling(value: int) -> int:
+    """Round an axis maximum up to a readable number."""
+    if value <= 10:
+        return 10
+    magnitude = 10 ** (len(str(value)) - 1)
+    return ((value // magnitude) + 1) * magnitude
+
+
+class _Plot(QWidget):
+    """Painted plot area; data is a list of (label, expected, collected)."""
+
+    MARGIN_AXIS = 52
+    MARGIN_END = 18
+    MARGIN_TOP = 12
+    MARGIN_BOTTOM = 30
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("trendChart")
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setMinimumHeight(270)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setMouseTracking(True)
-        self.setStyleSheet(
-            "QFrame#trendChart {"
-            "  background: rgba(15, 23, 42, 0.72);"
-            "  border: 1px solid rgba(51, 65, 85, 0.55);"
-            "  border-radius: 16px;"
-            "}"
-        )
-        # List of (month_label, expected_amount, collected_amount)
-        self._data: list[tuple[str, int, int]] = []
+        self.data: list[tuple[str, int, int]] = []
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-    def set_data(self, data: list[tuple[str, int, int]] | tuple[tuple[str, int, int], ...]) -> None:
-        """Update chart data points and trigger repaint."""
-        self._data = list(data)
-        self.update()
+    def _x(self, fraction: float, width: float) -> float:
+        """Map 0..1 along the time axis to a pixel x from the start edge."""
+        plot_w = max(10.0, width - self.MARGIN_AXIS - self.MARGIN_END)
+        offset = self.MARGIN_AXIS + fraction * plot_w
+        return width - offset if self.isRightToLeft() else offset
 
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt event name
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt callback name
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        width, height = float(self.width()), float(self.height())
+        top = self.MARGIN_TOP
+        base = height - self.MARGIN_BOTTOM
+        plot_h = max(10.0, base - top)
+        rtl = self.isRightToLeft()
+        scale = nice_ceiling(max([1, *(max(e, c) for _l, e, c in self.data)]))
 
-        rect = self.contentsRect()
-        w = rect.width()
-        h = rect.height()
+        # Grid and Y-axis labels (on the reading-start side).
+        painter.setFont(QFont("Rajdhani", 9, QFont.Weight.DemiBold))
+        for step in range(5):
+            y = base - plot_h * step / 4
+            painter.setPen(QPen(qcolor("border"), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(self._x(0, width), y), QPointF(self._x(1, width), y))
+            painter.setPen(qcolor("text-muted"))
+            label_rect = (
+                QRectF(width - self.MARGIN_AXIS + 6, y - 9, self.MARGIN_AXIS - 10, 18)
+                if rtl else QRectF(0, y - 9, self.MARGIN_AXIS - 10, 18)
+            )
+            align = Qt.AlignmentFlag.AlignAbsolute | (
+                Qt.AlignmentFlag.AlignLeft if rtl else Qt.AlignmentFlag.AlignRight
+            )
+            painter.drawText(label_rect, align | Qt.AlignmentFlag.AlignVCenter,
+                             compact_amount(scale * step // 4))
 
-        # 1. Header & Legend
-        header_y = 24
-        painter.setFont(QFont("Cairo", 12, QFont.Weight.Bold))
-        painter.setPen(QColor("#FFFFFF"))
-        painter.drawText(QRectF(w - 320, header_y - 8, 300, 22), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "📈  مقارنة التدفق المالي (آخر 6 أشهر)")
-
-        painter.setFont(QFont("Cairo", 9, QFont.Weight.Medium))
-        painter.setPen(QColor("#64748B"))
-        painter.drawText(QRectF(w - 320, header_y + 14, 300, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "مقارنة بين التحصيل الفعلي والمبالغ المجدولة")
-
-        # Legend (Pills on Left)
-        leg_x = 24
-        painter.setBrush(QBrush(QColor("#06B6D4")))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QPointF(leg_x + 6, header_y + 4), 5, 5)
-        painter.setFont(QFont("Cairo", 9, QFont.Weight.Bold))
-        painter.setPen(QColor("#E2E8F0"))
-        painter.drawText(leg_x + 18, header_y + 9, "المحصل الفعلي")
-
-        leg2_x = leg_x + 115
-        painter.setBrush(QBrush(QColor("#10B981")))
-        painter.drawEllipse(QPointF(leg2_x + 6, header_y + 4), 5, 5)
-        painter.setPen(QColor("#E2E8F0"))
-        painter.drawText(leg2_x + 18, header_y + 9, "المتوقع تحصيله")
-
-        # 2. Chart Grid Bounds
-        margin_left = 65
-        margin_right = 35
-        margin_top = 65
-        margin_bottom = 35
-
-        chart_w = max(50, w - margin_left - margin_right)
-        chart_h = max(50, h - margin_top - margin_bottom)
-
-        if not self._data:
-            # Fallback 6 default month markers
-            self._data = [
-                ("ماي", 0, 0), ("جوان", 0, 0), ("جويلية", 0, 0),
-                ("أوت", 0, 0), ("سبتمبر", 0, 0), ("أكتوبر", 0, 0)
-            ]
-
-        # Calculate max scale ceiling
-        max_val = 1
-        for _lbl, exp, col in self._data:
-            if exp > max_val:
-                max_val = exp
-            if col > max_val:
-                max_val = col
-
-        if max_val <= 10:
-            scale_max = 10
-        else:
-            magnitude = 10 ** (len(str(max_val)) - 1)
-            scale_max = ((max_val // magnitude) + 1) * magnitude
-
-        # 3. Horizontal Gridlines & Y-Axis Labels
-        painter.setFont(QFont("Rajdhani", 9, QFont.Weight.Medium))
-        steps = 4
-        for step in range(steps + 1):
-            y = margin_top + (chart_h * (steps - step)) / steps
-            grid_val = int((scale_max * step) / steps)
-
-            # Dashed gridline
-            grid_pen = QPen(QColor("rgba(51, 65, 85, 0.45)"), 1, Qt.PenStyle.DashLine)
-            painter.setPen(grid_pen)
-            painter.drawLine(margin_left, int(y), int(margin_left + chart_w), int(y))
-
-            # Y label on left
-            painter.setPen(QColor("#64748B"))
-            if grid_val >= 1_000_000:
-                lbl = f"{grid_val / 1_000_000:.1f}M"
-            elif grid_val >= 1_000:
-                lbl = f"{grid_val // 1_000}K"
-            else:
-                lbl = str(grid_val)
-            painter.drawText(QRectF(10, y - 9, margin_left - 18, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, lbl)
-
-        # 4. Compute Coordinates for Area and Curves
-        count = len(self._data)
+        count = len(self.data)
         if count < 2:
+            painter.end()
             return
+        expected = [QPointF(self._x(i / (count - 1), width), base - min(e, scale) / scale * plot_h)
+                    for i, (_l, e, _c) in enumerate(self.data)]
+        collected = [QPointF(self._x(i / (count - 1), width), base - min(c, scale) / scale * plot_h)
+                     for i, (_l, _e, c) in enumerate(self.data)]
 
-        expected_points: list[QPointF] = []
-        collected_points: list[QPointF] = []
-        x_step = chart_w / (count - 1)
-
-        for i, (_lbl, exp, col) in enumerate(self._data):
-            px = margin_left + i * x_step
-            py_exp = margin_top + chart_h - (min(exp, scale_max) / scale_max) * chart_h
-            py_col = margin_top + chart_h - (min(col, scale_max) / scale_max) * chart_h
-            expected_points.append(QPointF(px, py_exp))
-            collected_points.append(QPointF(px, py_col))
-
-        # 5. Draw Shaded Gradient Area for Collected Cash
-        area_path = QPainterPath()
-        base_y = margin_top + chart_h
-        area_path.moveTo(collected_points[0].x(), base_y)
-        area_path.lineTo(collected_points[0])
-
-        for pt in collected_points[1:]:
-            area_path.lineTo(pt)
-        area_path.lineTo(collected_points[-1].x(), base_y)
-        area_path.closeSubpath()
-
-        area_grad = QLinearGradient(0, margin_top, 0, base_y)
-        area_grad.setColorAt(0.0, QColor(6, 182, 212, 90))
-        area_grad.setColorAt(1.0, QColor(6, 182, 212, 0))
-        painter.setBrush(QBrush(area_grad))
+        glow = qcolor("primary-glow")
+        area = QPainterPath(QPointF(collected[0].x(), base))
+        for point in collected:
+            area.lineTo(point)
+        area.lineTo(collected[-1].x(), base)
+        area.closeSubpath()
+        gradient = QLinearGradient(0, top, 0, base)
+        gradient.setColorAt(0.0, QColor(glow.red(), glow.green(), glow.blue(), 80))
+        gradient.setColorAt(1.0, QColor(glow.red(), glow.green(), glow.blue(), 0))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPath(area_path)
+        painter.setBrush(QBrush(gradient))
+        painter.drawPath(area)
 
-        # 6. Draw Expected Line (Dashed Emerald)
-        exp_path = QPainterPath()
-        exp_path.moveTo(expected_points[0])
-        for pt in expected_points[1:]:
-            exp_path.lineTo(pt)
-        exp_pen = QPen(QColor("#10B981"), 2.5, Qt.PenStyle.DashLine)
-        painter.setPen(exp_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(exp_path)
+        painter.setPen(QPen(qcolor("silver"), 2, Qt.PenStyle.DashLine))
+        painter.drawPolyline(expected)
+        painter.setPen(QPen(glow, 2.5))
+        painter.drawPolyline(collected)
+        painter.setPen(QPen(qcolor("surface"), 2))
+        painter.setBrush(glow)
+        for point in collected:
+            painter.drawEllipse(point, 4, 4)
 
-        # 7. Draw Collected Line (Vibrant Solid Cyan)
-        col_path = QPainterPath()
-        col_path.moveTo(collected_points[0])
-        for pt in collected_points[1:]:
-            col_path.lineTo(pt)
-        col_pen = QPen(QColor("#06B6D4"), 3, Qt.PenStyle.SolidLine)
-        painter.setPen(col_pen)
-        painter.drawPath(col_path)
+        painter.setFont(QFont("Cairo", 9))
+        for index, (label, _e, _c) in enumerate(self.data):
+            x = collected[index].x()
+            latest = index == count - 1
+            painter.setPen(qcolor("highlight") if latest else qcolor("text-muted"))
+            left = min(max(0.0, x - 40), width - 80)
+            painter.drawText(QRectF(left, base + 6, 80, 20), Qt.AlignmentFlag.AlignCenter, label)
+        painter.end()
 
-        # 8. Draw Data Dots
-        for pt in collected_points:
-            painter.setBrush(QBrush(QColor("#06B6D4")))
-            painter.setPen(QPen(QColor("#FFFFFF"), 2))
-            painter.drawEllipse(pt, 5, 5)
 
-        # 9. X-Axis Month Labels
-        painter.setFont(QFont("Cairo", 9, QFont.Weight.Medium))
-        for i, (lbl, _exp, _col) in enumerate(self._data):
-            px = margin_left + i * x_step
-            # Highlight current / last month in cyan
-            is_latest = (i == count - 1)
-            painter.setPen(QColor("#38BDF8") if is_latest else QColor("#94A3B8"))
-            painter.drawText(QRectF(px - 35, base_y + 8, 70, 20), Qt.AlignmentFlag.AlignCenter, lbl)
+class _LegendDot(QLabel):
+    def __init__(self, color: QColor, dashed: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(18, 10)
+        self._color = color
+        self._dashed = dashed
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt callback name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        style = Qt.PenStyle.DashLine if self._dashed else Qt.PenStyle.SolidLine
+        painter.setPen(QPen(self._color, 2.5, style))
+        painter.drawLine(1, 5, 17, 5)
+        painter.end()
+
+
+class FinancialTrendChart(QFrame):
+    """Card with a title, legend and the expected/collected trend plot."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.setMinimumHeight(290)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 12)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        self.title = QLabel(ar.DASH_TREND_TITLE, self)
+        self.title.setObjectName("sectionTitle")
+        self.subtitle = QLabel(ar.DASH_TREND_SUBTITLE, self)
+        self.subtitle.setObjectName("sectionHint")
+        titles.addWidget(self.title)
+        titles.addWidget(self.subtitle)
+        header.addLayout(titles, 1)
+        for color, dashed, text in (
+            (qcolor("primary-glow"), False, ar.DASH_LEGEND_COLLECTED),
+            (qcolor("silver"), True, ar.DASH_LEGEND_EXPECTED),
+        ):
+            header.addWidget(_LegendDot(color, dashed, self))
+            legend = QLabel(text, self)
+            legend.setObjectName("sectionHint")
+            header.addWidget(legend)
+            header.addSpacing(8)
+        layout.addLayout(header)
+
+        self.plot = _Plot(self)
+        layout.addWidget(self.plot, 1)
+
+    @property
+    def _data(self) -> list[tuple[str, int, int]]:
+        return self.plot.data
+
+    def set_data(self, data: list[tuple[str, int, int]] | tuple[tuple[str, int, int], ...]) -> None:
+        """Replace the (label, expected, collected) points, oldest first."""
+        self.plot.data = list(data)
+        self.plot.update()

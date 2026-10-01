@@ -1,97 +1,108 @@
-"""Clickable summary card for dashboard counts and totals."""
+"""Clickable KPI card used on the dashboard."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
+
+from app.i18n import ar
+from app.ui import icons
+from app.ui.theme import TOKENS
 
 
 class StatCard(QFrame):
-    """A themed card with an accent stripe, an Arabic title, a large formatted value, and subtitle."""
+    """A KPI tile: icon chip, title, large value and a one-line caption.
+
+    ``color`` is a theme token name (``"paid"``, ``"failed"``…) or a hex
+    colour. It tints the icon chip and a slim accent bar painted on the
+    card's reading-start edge.
+    """
 
     clicked = Signal()
 
-    def __init__(self, label: str, *, color: str = "#38BDF8", subtitle: str = "", parent=None) -> None:
+    def __init__(
+        self,
+        label: str,
+        *,
+        color: str = "primary-glow",
+        subtitle: str = "",
+        icon: str = "dashboard",
+        clickable: bool = True,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
-        self.setObjectName("statCard")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setProperty("accentColor", color)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setMinimumHeight(115)
-        self.setMinimumWidth(160)
-        self.setStyleSheet(
-            f"QFrame#statCard {{"
-            f"  background: rgba(15, 23, 42, 0.72);"
-            f"  border: 1px solid rgba(51, 65, 85, 0.55);"
-            f"  border-top: 3px solid {color};"
-            f"  border-radius: 14px;"
-            f"}}"
-            f"QFrame#statCard:hover {{"
-            f"  background: rgba(21, 31, 56, 0.85);"
-            f"  border-color: {color};"
-            f"}}"
-        )
+        self.setObjectName("kpiCard")
+        self._accent = QColor(TOKENS.get(color, color))
+        self._clickable = clickable
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(118)
+        self.setMinimumWidth(180)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(4)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(6)
 
-        # Top row: Title right-aligned + colored dot on left
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(0, 0, 0, 0)
-
-        self.title_label = QLabel(label, self)
-        self.title_label.setObjectName("statCardTitle")
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.title_label.setStyleSheet("color: #E2E8F0; font-size: 12px; font-weight: 700;")
-        title_row.addWidget(self.title_label, 1)
-
-        self.status_dot = QLabel("●", self)
-        self.status_dot.setObjectName("statCardDot")
-        self.status_dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.status_dot.setStyleSheet(f"color: {color}; font-size: 10px;")
-        title_row.addWidget(self.status_dot)
-        layout.addLayout(title_row)
-
-        # Main large value (Right-aligned)
-        self.value_label = QLabel("0", self)
-        self.value_label.setObjectName("statCardValue")
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.value_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.value_label.setStyleSheet(
-            f"color: {color}; font-size: 24px; font-weight: 900; "
-            "font-family: 'Cairo', 'Rajdhani', sans-serif; letter-spacing: -0.5px; margin: 2px 0;"
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.icon_label = QLabel(self)
+        self.icon_label.setFixedSize(32, 32)
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon_label.setPixmap(icons.pixmap(icon, self._accent.name(), 18))
+        red, green, blue = self._accent.red(), self._accent.green(), self._accent.blue()
+        self.icon_label.setStyleSheet(
+            f"background-color: rgba({red}, {green}, {blue}, 0.14); border-radius: 9px;"
         )
+        self.title_label = QLabel(label, self)
+        self.title_label.setObjectName("kpiTitle")
+        self.title_label.setWordWrap(True)
+        top.addWidget(self.icon_label)
+        top.addWidget(self.title_label, 1)
+        layout.addLayout(top)
+
+        self.value_label = QLabel("0", self)
+        self.value_label.setObjectName("kpiValue")
         layout.addWidget(self.value_label)
 
-        # Subtitle (Right-aligned)
         self.subtitle_label = QLabel(subtitle, self)
-        self.subtitle_label.setObjectName("statCardSubtitle")
-        self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.subtitle_label.setStyleSheet("color: #64748B; font-size: 10px; font-weight: 500;")
+        self.subtitle_label.setObjectName("kpiCaption")
+        self.subtitle_label.setWordWrap(True)
         layout.addWidget(self.subtitle_label)
+        layout.addStretch(1)
 
+        for child in (self.icon_label, self.title_label, self.value_label, self.subtitle_label):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAccessibleName(label)
 
     def set_subtitle(self, subtitle: str) -> None:
-        """Update subtitle description text."""
+        """Update the caption under the value."""
         self.subtitle_label.setText(subtitle)
 
     def set_value(self, value: int | str, *, currency: bool = False, unit: str = "") -> None:
-        """Set the displayed value, using Western digits and grouped numbers."""
+        """Show a value with Western digits and thousands separators."""
         if currency and isinstance(value, int):
-            text = f"{value:,} دج"
+            text = f"{value:,} {ar.CURRENCY_SUFFIX}"
         elif isinstance(value, int):
             text = f"{value:,} {unit}".strip()
         else:
             text = f"{value} {unit}".strip()
         self.value_label.setText(text)
+        self.setAccessibleDescription(text)
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt callback name
+        """Draw the card, then a short accent bar on the reading-start edge."""
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._accent)
+        x = self.width() - 3 if self.isRightToLeft() else 0
+        painter.drawRoundedRect(QRectF(x, 18, 3, 28), 1.5, 1.5)
+        painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt callback name
-        """Emit a click signal when the card is pressed."""
-        if event.button() == Qt.MouseButton.LeftButton:
+        """Emit ``clicked`` on a left-button press."""
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)

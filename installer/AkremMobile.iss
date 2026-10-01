@@ -28,13 +28,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "startupicon"; Description: "Start AkremMobile when I sign in to Windows"; GroupDescription: "Background:"; Flags: unchecked
 
 [Files]
 Source: "..\dist\AkremMobile\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\AkremMobile"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\AkremMobile"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+; AppUserModelID must match WINDOWS_APP_ID in app/ui/tray.py so Windows
+; attributes the app's toast notifications to this shortcut.
+Name: "{group}\AkremMobile"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "AkremMobile.InstallmentManager"
+Name: "{autodesktop}\AkremMobile"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; AppUserModelID: "AkremMobile.InstallmentManager"
+Name: "{userstartup}\AkremMobile"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon; AppUserModelID: "AkremMobile.InstallmentManager"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch AkremMobile"; Flags: nowait postinstall skipifsilent

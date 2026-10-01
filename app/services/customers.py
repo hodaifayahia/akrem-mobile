@@ -431,3 +431,8 @@ def _validate_cheques_count(value: int | None) -> None:
     """Check that an optional cheque count is a nonnegative integer."""
     if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
         raise ValueError("Cheque count must be a nonnegative whole number")
+
+
+def delete_customer(session: Session, customer_id: int) -> None:
+    """Delete a customer who has no sales; financial history is never removed."""
+    repositories.delete_customer(session, customer_id)

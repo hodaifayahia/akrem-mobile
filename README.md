@@ -14,6 +14,12 @@ Arabic, right-to-left Windows desktop application for managing customers, phone 
 - Excel template creation, monthly collection and overdue exports, and owner-only profit reports.
 - Arabic commitment-form and payment-receipt PDFs.
 - Owner settings for users, product prices, installment rules, local backups, and restore.
+- Arabic (right-to-left), English and French (left-to-right) interface with live switching; the layout, icons and charts mirror with the language. The language is saved per PC.
+- Client types: four defaults plus a protected "غير مصنف" type; the owner can add, rename, recolour, reorder and delete types (moving their customers), filter the customer list by type and assign a type to several customers at once.
+- Runs in the Windows system tray: closing the window keeps the app (and its collection monitor and backups) running; a second launch brings the existing window forward.
+- Notifications: an in-app notification center (overdue, upcoming, activity) and native Windows toasts for the daily collection digest and newly overdue installments while the window is in the background.
+
+See [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) for the design system, RTL/LTR rules, and the tray/notification architecture.
 
 ## Requirements
 

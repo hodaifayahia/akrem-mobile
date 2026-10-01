@@ -30,56 +30,64 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import select
 
 from app import config
-from app.db.models import Category
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import importer
-from app.services.seed import DEFAULT_CATEGORIES
+from app.services import categories, importer
 from app.ui.events import events
 
-_FIELD_LABELS = {
-    "full_name": ar.IMP_FIELD_FULL_NAME,
-    "product": ar.IMP_FIELD_PRODUCT,
-    "sale_type": ar.IMP_FIELD_SALE_TYPE,
-    "wholesale_price": ar.IMP_FIELD_WHOLESALE,
-    "cash_price": ar.IMP_FIELD_CASH_PRICE,
-    "rate": ar.IMP_FIELD_RATE,
-    "financed": ar.IMP_FIELD_FINANCED,
-    "down_payment": ar.IMP_FIELD_DOWN_PAYMENT,
-    "months": ar.IMP_FIELD_MONTHS,
-    "monthly_amount": ar.IMP_FIELD_MONTHLY,
-    "profit": ar.IMP_FIELD_PROFIT,
-    "purchase_date": ar.IMP_FIELD_PURCHASE_DATE,
-    "end_date": ar.IMP_FIELD_END_DATE,
-}
-_PREVIEW_COLUMNS = (
-    ar.IMP_COLUMN_ROW,
-    ar.IMP_COLUMN_CUSTOMER,
-    ar.IMP_COLUMN_PRODUCT,
-    ar.IMP_COLUMN_TYPE,
-    ar.IMP_COLUMN_WHOLESALE,
-    ar.IMP_COLUMN_CASH,
-    ar.IMP_COLUMN_RATE,
-    ar.IMP_COLUMN_DOWN,
-    ar.IMP_COLUMN_MONTHS,
-    ar.IMP_COLUMN_DATE,
-    ar.IMP_COLUMN_SHEET_FINANCED,
-    ar.IMP_COLUMN_CALC_FINANCED,
-    ar.IMP_COLUMN_SHEET_MONTHLY,
-    ar.IMP_COLUMN_CALC_MONTHLY,
-    ar.IMP_COLUMN_SHEET_PROFIT,
-    ar.IMP_COLUMN_CALC_PROFIT,
-    ar.IMP_COLUMN_STATUS,
-    ar.IMP_COLUMN_SOURCE,
-)
-_SALE_TYPE_CHOICES = (
-    (ar.IMP_TYPE_CASH, "cash"),
-    (ar.IMP_TYPE_INSTALLMENT, "installment"),
-    (ar.IMP_TYPE_CREDIT, "credit"),
-)
+
+def _field_labels() -> dict[str, str]:
+    """Labels in the active language (evaluated at call time)."""
+    return {
+        "full_name": ar.IMP_FIELD_FULL_NAME,
+        "product": ar.IMP_FIELD_PRODUCT,
+        "sale_type": ar.IMP_FIELD_SALE_TYPE,
+        "wholesale_price": ar.IMP_FIELD_WHOLESALE,
+        "cash_price": ar.IMP_FIELD_CASH_PRICE,
+        "rate": ar.IMP_FIELD_RATE,
+        "financed": ar.IMP_FIELD_FINANCED,
+        "down_payment": ar.IMP_FIELD_DOWN_PAYMENT,
+        "months": ar.IMP_FIELD_MONTHS,
+        "monthly_amount": ar.IMP_FIELD_MONTHLY,
+        "profit": ar.IMP_FIELD_PROFIT,
+        "purchase_date": ar.IMP_FIELD_PURCHASE_DATE,
+        "end_date": ar.IMP_FIELD_END_DATE,
+    }
+
+
+def _preview_columns() -> tuple[str, ...]:
+    """Labels in the active language (evaluated at call time)."""
+    return (
+        ar.IMP_COLUMN_ROW,
+        ar.IMP_COLUMN_CUSTOMER,
+        ar.IMP_COLUMN_PRODUCT,
+        ar.IMP_COLUMN_TYPE,
+        ar.IMP_COLUMN_WHOLESALE,
+        ar.IMP_COLUMN_CASH,
+        ar.IMP_COLUMN_RATE,
+        ar.IMP_COLUMN_DOWN,
+        ar.IMP_COLUMN_MONTHS,
+        ar.IMP_COLUMN_DATE,
+        ar.IMP_COLUMN_SHEET_FINANCED,
+        ar.IMP_COLUMN_CALC_FINANCED,
+        ar.IMP_COLUMN_SHEET_MONTHLY,
+        ar.IMP_COLUMN_CALC_MONTHLY,
+        ar.IMP_COLUMN_SHEET_PROFIT,
+        ar.IMP_COLUMN_CALC_PROFIT,
+        ar.IMP_COLUMN_STATUS,
+        ar.IMP_COLUMN_SOURCE,
+    )
+
+
+def _sale_type_choices() -> tuple[tuple[str, str], ...]:
+    """Labels in the active language (evaluated at call time)."""
+    return (
+        (ar.IMP_TYPE_CASH, "cash"),
+        (ar.IMP_TYPE_INSTALLMENT, "installment"),
+        (ar.IMP_TYPE_CREDIT, "credit"),
+    )
 
 
 class ImportPage(QWidget):
@@ -96,7 +104,6 @@ class ImportPage(QWidget):
         self._uncategorized_id: int | None = None
         self._loading_preview = False
 
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         if getattr(current_user, "role", None) != "owner":
             layout = QVBoxLayout(self)
             layout.setContentsMargins(34, 30, 34, 30)
@@ -147,7 +154,6 @@ class ImportPage(QWidget):
         layout.addLayout(sheet_row)
 
         self.mapping_section = QGroupBox(f"⚙️  {ar.IMP_MAPPING_TITLE}", self)
-        self.mapping_section.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         mapping_layout = QVBoxLayout(self.mapping_section)
         mapping_layout.addWidget(QLabel(ar.IMP_MAPPING_HELP, self.mapping_section))
         self.mapping_form = QFormLayout()
@@ -198,8 +204,8 @@ class ImportPage(QWidget):
         self.preview_summary.setStyleSheet("color: #9DBEFF; font-weight: 600; font-size: 13px;")
         layout.addWidget(self.preview_summary)
 
-        self.preview_table = QTableWidget(0, len(_PREVIEW_COLUMNS), self)
-        self.preview_table.setHorizontalHeaderLabels(_PREVIEW_COLUMNS)
+        self.preview_table = QTableWidget(0, len(_preview_columns()), self)
+        self.preview_table.setHorizontalHeaderLabels(_preview_columns())
         self.preview_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.preview_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.preview_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -334,7 +340,7 @@ class ImportPage(QWidget):
                 selected_index = combo.findData(existing_column)
                 if selected_index >= 0:
                     combo.setCurrentIndex(selected_index)
-            label = _FIELD_LABELS[field]
+            label = _field_labels()[field]
             if field in importer.REQUIRED_HEADERS:
                 label += ar.IMP_REQUIRED_MARK
             self.mapping_form.addRow(label, combo)
@@ -447,7 +453,7 @@ class ImportPage(QWidget):
         """Create a per-row selector for missing or unrecognized sale types."""
         combo = QComboBox(self.preview_table)
         combo.addItem(ar.IMP_CHOOSE_TYPE, None)
-        for label, value in _SALE_TYPE_CHOICES:
+        for label, value in _sale_type_choices():
             combo.addItem(label, value)
         selected_type = self._sale_type_overrides.get(source_row)
         if selected_type is not None:
@@ -499,10 +505,9 @@ class ImportPage(QWidget):
 
     def _load_uncategorized_category(self) -> None:
         """Require the existing default uncategorized category before importing."""
-        expected_name = DEFAULT_CATEGORIES[-1]
         try:
             with session_scope() as session:
-                category = session.scalar(select(Category).where(Category.name == expected_name))
+                category = categories.get_fallback_type(session)
                 if category is not None:
                     self._uncategorized_id = category.id
                     self.category_selector.clear()

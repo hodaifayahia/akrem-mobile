@@ -24,8 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import database_path, database_url, ensure_data_dirs
 from app.db.migrate import upgrade_database
-from app.db.models import Category, Customer, Installment, Payment, Sale
+from app.db.models import Customer, Installment, Payment, Sale
 from app.db.session import session_scope
+from app.services.categories import get_fallback_type
 from app.services.importer import import_preview, preview_workbook
 from app.services.seed import seed_defaults
 
@@ -94,14 +95,8 @@ def main() -> int:
     print("  [*] Importing records into database...")
     mark_past_due = not args.no_mark_past_paid
     with session_scope() as session:
-        # Find or create default category
-        uncategorized = session.scalar(
-            select(Category).where(Category.name == "غير مصنف")
-        )
-        if uncategorized is None:
-            uncategorized = Category(name="غير مصنف", is_default=True)
-            session.add(uncategorized)
-            session.flush()
+        # New customers go to the protected system client type (created if missing).
+        uncategorized = get_fallback_type(session)
 
         result = import_preview(
             session=session,

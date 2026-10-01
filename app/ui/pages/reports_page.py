@@ -33,7 +33,6 @@ class ReportsPage(QWidget):
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.current_user = current_user
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -68,7 +67,6 @@ class ReportsPage(QWidget):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         cards_widget = QWidget(scroll)
-        cards_widget.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         cards_layout = QVBoxLayout(cards_widget)
         cards_layout.setContentsMargins(0, 0, 0, 0)
         cards_layout.setSpacing(16)

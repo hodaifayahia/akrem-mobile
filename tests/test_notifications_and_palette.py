@@ -11,10 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from app.db.models import User
+from app.i18n import ar
 from app.ui.events import events
 from app.ui.widgets.toast import ToastCard, ToastManager
 from app.ui.widgets.topbar import AppTopBar
-from app.ui.widgets.notification_center import NotificationCenterPopup, AlertItem
+from app.ui.widgets.notification_center import NotificationCenterPopup
 from app.ui.dialogs.command_palette import CommandPaletteDialog
 from app.ui.dialogs.shortcuts_dialog import ShortcutsDialog
 
@@ -56,7 +57,8 @@ def test_topbar_breadcrumbs(qapp):
     assert "لوحة التحكم" in topbar.page_title_label.text()
 
     topbar.set_active_page(1)
-    assert "إدارة الزبائن" in topbar.page_title_label.text()
+    assert "الزبائن" in topbar.page_title_label.text()
+    assert topbar.page_sub_label.text() == ar.PAGE_SUBTITLES[1]
 
     topbar.set_active_page(2)
     assert "بيع جديد" in topbar.page_title_label.text()

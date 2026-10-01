@@ -49,3 +49,24 @@ def get_rate_presets(session: Session) -> dict[int, int]:
         if 2 <= month_count <= 12 and 0 <= rate_percent <= 50:
             result[month_count] = rate_percent
     return result or DEFAULT_RATE_PRESETS.copy()
+
+
+DEFAULT_GRACE_DAYS = 5
+
+
+def get_grace_days(session: Session) -> int:
+    """Return the owner's grace-days setting, or 5 when missing or invalid.
+
+    Booleans, negative numbers, non-integers, and undecodable JSON all fall
+    back to the documented default.
+    """
+    setting = session.get(Setting, "grace_days")
+    if setting is None:
+        return DEFAULT_GRACE_DAYS
+    try:
+        value = json.loads(setting.value)
+    except (TypeError, json.JSONDecodeError):
+        return DEFAULT_GRACE_DAYS
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_GRACE_DAYS
+    return value

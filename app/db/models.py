@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -25,13 +26,18 @@ class Base(DeclarativeBase):
 
 
 class Category(Base):
-    """Editable customer category."""
+    """Editable customer category, shown to the owner as a client type."""
 
     __tablename__ = "categories"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    color: Mapped[str] = mapped_column(String(16), nullable=False, default="slate", server_default="slate")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )

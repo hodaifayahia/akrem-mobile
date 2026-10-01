@@ -50,19 +50,27 @@ def show_uncaught_exception(
 def main() -> int:
     """Start the desktop application."""
     configure_logging()
+    from app.ui.tray import set_windows_app_id
+
+    # Must happen before the first window so Windows attributes toasts and
+    # the taskbar button to AkremMobile rather than to python.exe.
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("AkremMobile")
     app.setOrganizationName("AkremMobile")
 
-    from app.i18n import get_layout_direction, set_language
-    from PySide6.QtCore import QSettings
-    saved_lang = QSettings("AkremMobile", "AkremMobile").value("language", "ar")
-    set_language(saved_lang)
-    app.setLayoutDirection(get_layout_direction())
+    from app.ui.single_instance import SingleInstance
+
+    instance = SingleInstance()
+    if instance.notify_existing():
+        # Already running (possibly hidden in the tray): it shows itself.
+        return 0
+    instance.listen()
+
+    from app.ui.locale import apply_language, saved_language
 
     load_arabic_font()
-    theme_path = RESOURCE_DIR / "theme.qss"
-    app.setStyleSheet(theme_path.read_text(encoding="utf-8"))
+    apply_language(saved_language() or "ar")
     sys.excepthook = show_uncaught_exception
 
     try:
@@ -80,10 +88,10 @@ def main() -> int:
         seed_defaults()
         with session_scope() as session:
             has_owner = owner_exists(session)
-            db_lang = get_value(session, "language", None)
-            if db_lang:
-                set_language(db_lang)
-                app.setLayoutDirection(get_layout_direction())
+            shop_language = get_value(session, "language", None)
+        if saved_language() is None and shop_language:
+            # First run on this PC: start in the shop's default language.
+            apply_language(shop_language)
         if not has_owner:
             setup_dialog = SetupOwnerDialog()
             if setup_dialog.exec() != QDialog.DialogCode.Accepted:
@@ -104,9 +112,15 @@ def main() -> int:
         QMessageBox.critical(None, ar.ERROR_TITLE, ar.ERROR_BODY)
         return 1
 
+    # Closing the window hides it in the tray; MainWindow quits explicitly.
+    app.setQuitOnLastWindowClosed(False)
     window = MainWindow(current_user=login_dialog.user)
+    instance.activation_requested.connect(window.restore_from_tray)
     window.show()
-    return app.exec()
+    window.start_background_services()
+    exit_code = app.exec()
+    instance.close()
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -40,7 +40,6 @@ class PaletteItemWidget(QWidget):
 
     def __init__(self, item: PaletteItem, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(10)
@@ -93,7 +92,6 @@ class CommandPaletteDialog(QDialog):
         self.current_user = current_user
         self.setObjectName("commandPaletteDialog")
         self.setFixedSize(620, 440)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self._static_items: list[PaletteItem] = []

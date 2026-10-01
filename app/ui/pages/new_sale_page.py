@@ -69,7 +69,6 @@ class NewSalePage(QWidget):
         self._cash_status = "paid"  # 'paid' or 'credit'
         self._last_saved_cash_sale_id: int | None = None
 
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self._build_ui()
         self._refresh_categories()
         self._refresh_customers()

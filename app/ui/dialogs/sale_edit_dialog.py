@@ -27,7 +27,6 @@ class SaleEditDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(ar.CUST_EDIT_SALE)
         self.setMinimumWidth(440)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.sale = sale
 
         self.product = QLineEdit(sale.product, self)
