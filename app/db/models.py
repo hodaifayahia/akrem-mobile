@@ -320,3 +320,89 @@ class AuditLog(Base):
     )
 
     user: Mapped[User | None] = relationship(back_populates="audit_entries")
+
+
+class DebtParty(Base):
+    """A person (or supplier) in the shop's debt book, outside the sales customers."""
+
+    __tablename__ = "debt_parties"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    first_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(120))
+    national_id: Mapped[str | None] = mapped_column(String(30), unique=True)
+    phone: Mapped[str | None] = mapped_column(String(20))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    debts: Mapped[list[Debt]] = relationship(back_populates="party", passive_deletes=True)
+
+    @property
+    def full_name(self) -> str:
+        """First and last name."""
+        return f"{self.first_name} {self.last_name}".strip()
+
+
+class Debt(Base):
+    """Money owed to the shop (``receivable``) or owed by the shop (``payable``).
+
+    ``plan`` is ``single`` (one payment, optional ``due_date``) or
+    ``installments`` (``months`` long, a payment every ``payment_interval``
+    months, like a facility sale).
+    """
+
+    __tablename__ = "debts"
+    __table_args__ = (
+        CheckConstraint("direction IN ('receivable', 'payable')", name="ck_debts_direction"),
+        CheckConstraint("plan IN ('single', 'installments')", name="ck_debts_plan"),
+        CheckConstraint("amount > 0", name="ck_debts_amount_positive"),
+        CheckConstraint("months IS NULL OR months >= 1", name="ck_debts_months_positive"),
+        CheckConstraint("payment_interval >= 1", name="ck_debts_interval_positive"),
+        Index("ix_debts_party_id", "party_id"),
+        Index("ix_debts_direction", "direction"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    party_id: Mapped[int] = mapped_column(ForeignKey("debt_parties.id", ondelete="RESTRICT"), nullable=False)
+    direction: Mapped[str] = mapped_column(String(12), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(200))
+    debt_date: Mapped[date] = mapped_column(Date, nullable=False)
+    plan: Mapped[str] = mapped_column(String(16), nullable=False, default="single", server_default="single")
+    due_date: Mapped[date | None] = mapped_column(Date)
+    months: Mapped[int | None] = mapped_column(Integer)
+    payment_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    party: Mapped[DebtParty] = relationship(back_populates="debts")
+    payments: Mapped[list[DebtPayment]] = relationship(
+        back_populates="debt", cascade="all, delete-orphan", passive_deletes=True,
+        order_by="DebtPayment.payment_date, DebtPayment.id",
+    )
+
+
+class DebtPayment(Base):
+    """One amount received (receivable) or paid out (payable) against a debt."""
+
+    __tablename__ = "debt_payments"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_debt_payments_amount_positive"),
+        Index("ix_debt_payments_debt_id", "debt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    debt_id: Mapped[int] = mapped_column(ForeignKey("debts.id", ondelete="CASCADE"), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    method: Mapped[str] = mapped_column(String(20), nullable=False, default="cash", server_default="cash")
+    note: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    debt: Mapped[Debt] = relationship(back_populates="payments")

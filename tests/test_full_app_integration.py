@@ -118,10 +118,10 @@ def test_main_window_initialization_and_page_navigation(qapp, memory_engine: Eng
         # Assert topbar and toast manager are initialized
         assert window.topbar is not None
         assert window.toast_manager is not None
-        assert window.pages.count() == 9
+        assert window.pages.count() == 11
 
-        # Test switching across all 9 pages (7 original + products + client types)
-        for page_idx in range(9):
+        # Test switching across all 11 pages (7 original + products, client types and the two debt pages)
+        for page_idx in range(11):
             window._select_page(page_idx)
             assert window.pages.currentIndex() == page_idx
             assert window.buttons[page_idx].property("active") is True

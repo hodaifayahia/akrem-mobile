@@ -37,6 +37,7 @@ from app.ui.events import events
 from app.ui.notifications import hub
 from app.ui.pages.client_types_page import ClientTypesPage
 from app.ui.pages.customers_page import CustomersPage
+from app.ui.pages.debts_page import PayablesPage, ReceivablesPage
 from app.ui.pages.dashboard_page import DashboardPage
 from app.ui.pages.import_page import ImportPage
 from app.ui.pages.new_sale_page import NewSalePage
@@ -54,8 +55,9 @@ _LOG = logging.getLogger(__name__)
 PAGE_DASHBOARD, PAGE_CUSTOMERS, PAGE_NEW_SALE, PAGE_PAYMENTS = 0, 1, 2, 3
 PAGE_IMPORT, PAGE_REPORTS, PAGE_SETTINGS = 4, 5, 6
 PAGE_PRODUCTS, PAGE_CLIENT_TYPES = 7, 8
-PAGE_COUNT = 9
-OWNER_ONLY_PAGES = frozenset({PAGE_IMPORT, PAGE_CLIENT_TYPES})
+PAGE_DEBTS_IN, PAGE_DEBTS_OUT = 9, 10
+PAGE_COUNT = 11
+OWNER_ONLY_PAGES = frozenset({PAGE_IMPORT, PAGE_CLIENT_TYPES, PAGE_DEBTS_IN, PAGE_DEBTS_OUT})
 SIDEBAR_SETTING = "window/sidebar_collapsed"
 
 
@@ -143,11 +145,12 @@ class MainWindow(QMainWindow):
 
     _PAGE_CLASSES = (
         DashboardPage, CustomersPage, NewSalePage, PaymentsPage, ImportPage, ReportsPage, SettingsPage,
-        ProductsPage, ClientTypesPage,
+        ProductsPage, ClientTypesPage, ReceivablesPage, PayablesPage,
     )
     _PAGE_ATTRIBUTES = (
         "dashboard_page", "customers_page", "new_sale_page", "payments_page",
         "import_page", "reports_page", "settings_page", "products_page", "client_types_page",
+        "debts_in_page", "debts_out_page",
     )
 
     def _create_pages(self) -> None:
@@ -167,6 +170,10 @@ class MainWindow(QMainWindow):
             page.payment_filter_requested.connect(self._show_customer_payment_kind)
             page.open_customer_requested.connect(self._open_customer_details)
             page.view_overdue_requested.connect(lambda: self._select_page(PAGE_PAYMENTS))
+            page.debts_requested.connect(
+                lambda direction: self._select_page(PAGE_DEBTS_IN if direction == "receivable" else PAGE_DEBTS_OUT)
+            )
+            page.stock_requested.connect(lambda: self._select_page(PAGE_PRODUCTS))
         elif index == PAGE_CUSTOMERS:
             page.customer_selected.connect(self._open_customer_details)
             page.manage_types_requested.connect(lambda: self._select_page(PAGE_CLIENT_TYPES))
@@ -270,7 +277,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+N"), self, lambda: self._select_page(PAGE_NEW_SALE))
         QShortcut(QKeySequence("Ctrl+L"), self, self._lock_after_idle)
         QShortcut(QKeySequence("F1"), self, self._open_shortcuts_dialog)
-        for index in range(PAGE_COUNT):
+        for index in range(min(PAGE_COUNT, 9)):
             QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, lambda i=index: self._select_page(i))
 
     # ------------------------------------------------------- language change

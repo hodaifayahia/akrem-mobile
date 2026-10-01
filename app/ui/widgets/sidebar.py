@@ -26,28 +26,34 @@ from app.i18n import ar
 from app.ui import icons
 from app.ui.theme import qcolor, repolish
 
-#: Icon per page index. Indexes 0-6 are the original pages; 7 and 8 were added
-#: later, so their position in the sidebar differs from their index.
-NAV_ICONS = ("dashboard", "users", "cart", "wallet", "import", "reports", "settings", "tag", "users")
+#: Icon per page index. Indexes 0-6 are the original pages; later pages were
+#: appended, so their position in the sidebar differs from their index.
+NAV_ICONS = (
+    "dashboard", "users", "cart", "wallet", "import", "reports", "settings", "tag", "users",
+    "debt-in", "debt-out",
+)
 PAGE_COUNT = len(NAV_ICONS)
 MAIN_PAGES = (0, 1, 2, 3)
+DEBT_PAGES = (9, 10)
 CATALOG_PAGES = (7, 8)
 MANAGE_PAGES = (4, 5, 6)
-OWNER_ONLY_PAGES = frozenset({4, 6, 8})
+OWNER_ONLY_PAGES = frozenset({4, 6, 8, 9, 10})
 
 
 def page_title(index: int) -> str:
     """Return a page's title in the active language."""
     if index < len(ar.SIDEBAR_ITEMS):
         return ar.SIDEBAR_ITEMS[index]
-    return (ar.NAV_PRODUCTS, ar.NAV_CLIENT_TYPES)[index - len(ar.SIDEBAR_ITEMS)]
+    return (ar.NAV_PRODUCTS, ar.NAV_CLIENT_TYPES, ar.NAV_DEBTS_IN, ar.NAV_DEBTS_OUT)[index - len(ar.SIDEBAR_ITEMS)]
 
 
 def page_subtitle(index: int) -> str:
     """Return a page's one-line description in the active language."""
     if index < len(ar.PAGE_SUBTITLES):
         return ar.PAGE_SUBTITLES[index]
-    return (ar.PAGE_SUBTITLE_PRODUCTS, ar.PAGE_SUBTITLE_CLIENT_TYPES)[index - len(ar.PAGE_SUBTITLES)]
+    return (
+        ar.PAGE_SUBTITLE_PRODUCTS, ar.PAGE_SUBTITLE_CLIENT_TYPES, ar.PAGE_SUBTITLE_DEBTS_IN, ar.PAGE_SUBTITLE_DEBTS_OUT,
+    )[index - len(ar.PAGE_SUBTITLES)]
 
 EXPANDED_WIDTH = 248
 COLLAPSED_WIDTH = 72
@@ -181,6 +187,7 @@ class Sidebar(QFrame):
 
         for section, pages in (
             ("NAV_SECTION_MAIN", MAIN_PAGES),
+            ("NAV_SECTION_DEBTS", DEBT_PAGES),
             ("NAV_SECTION_CATALOG", CATALOG_PAGES),
             ("NAV_SECTION_MANAGE", MANAGE_PAGES),
         ):
@@ -315,8 +322,8 @@ class Sidebar(QFrame):
         self.setFixedWidth(COLLAPSED_WIDTH if collapsed else EXPANDED_WIDTH)
         self.brand_text.setVisible(not collapsed)
         for label, key in self._section_labels:
-            pages = {"NAV_SECTION_MAIN": MAIN_PAGES, "NAV_SECTION_CATALOG": CATALOG_PAGES,
-                     "NAV_SECTION_MANAGE": MANAGE_PAGES}[key]
+            pages = {"NAV_SECTION_MAIN": MAIN_PAGES, "NAV_SECTION_DEBTS": DEBT_PAGES,
+                     "NAV_SECTION_CATALOG": CATALOG_PAGES, "NAV_SECTION_MANAGE": MANAGE_PAGES}[key]
             label.setVisible(not collapsed and not all(self._is_restricted(i) for i in pages))
         for button in self._all_buttons():
             button.set_collapsed(collapsed)

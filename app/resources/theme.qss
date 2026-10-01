@@ -70,6 +70,12 @@ QLabel#wordmark {
     letter-spacing: 0.5px;
 }
 
+QLabel#netValue {
+    font-family: "Rajdhani", "Cairo", sans-serif;
+    font-size: 34px;
+    font-weight: 700;
+}
+
 QLabel#wordmarkSub {
     color: @text-muted;
     font-size: 11px;

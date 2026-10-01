@@ -656,3 +656,83 @@ def _visible_names(page) -> set[str]:
     """Customer names currently listed on the clients page."""
     model = page.table.model()
     return {model.index(row, 1).data() for row in range(model.rowCount())}
+
+
+# ------------------------------------------------------------- debt book pages
+def test_debt_pages_add_pay_by_facility_and_show_the_schedule(shop, monkeypatch) -> None:
+    from app.services import debts
+    from app.ui.main_window import PAGE_DEBTS_IN, PAGE_DEBTS_OUT, MainWindow
+    from app.ui.pages.debts_page import DebtDetailsDialog, PaymentDialog, ReceivablesPage
+
+    window = MainWindow(current_user=_user(shop["owner"]))
+    window._select_page(PAGE_DEBTS_IN)
+    page = window.pages.currentWidget()
+    assert isinstance(page, ReceivablesPage) and page.empty_card.isVisibleTo(page)
+
+    dialog = page.new_dialog()
+    assert not page.save_dialog(dialog)
+    assert dialog.error.text.text() == ar.DEBT_ERR_NAME
+    dialog.first_name.setText("علي")
+    dialog.last_name.setText("بن صالح")
+    dialog.email.setText("not-an-email")
+    dialog.amount.setValue(60000)
+    assert not page.save_dialog(dialog)
+    assert dialog.error.text.text() == ar.DEBT_ERR_EMAIL
+    dialog.email.setText("ali@example.com")
+    dialog.national_id.setText("109876543210987654")
+    dialog.plan.setCurrentIndex(dialog.plan.findData(debts.PLAN_INSTALLMENTS))
+    dialog.months.setValue(6)
+    dialog.interval.setValue(2)
+    assert ar.PLAN_EVERY_2 in dialog.preview.text() and "20,000" in dialog.preview.text()
+    assert page.save_dialog(dialog)
+
+    assert page.table.rowCount() == 1
+    assert page.table.item(0, 0).text() == "علي بن صالح"
+    assert page.cards["remaining"].text() == "60,000 دج"
+    page.table.setCurrentCell(0, 0)
+    summary = page.selected()
+    assert summary.plan == debts.PLAN_INSTALLMENTS and page.pay_button.isEnabled()
+
+    def pay(dialog: PaymentDialog) -> int:
+        dialog.amount.setValue(20000)
+        dialog.save_button.click()
+        return 1
+
+    monkeypatch.setattr(PaymentDialog, "exec", pay)
+    assert page.record_payment_for(summary)
+    assert page.cards["paid"].text() == "20,000 دج"
+
+    details = page.open_details()
+    assert isinstance(details, DebtDetailsDialog)
+    assert details.schedule_table.rowCount() == 3 and details.payments_table.rowCount() == 1
+    assert details.schedule_table.item(0, 4).text() == ar.DEBT_STATUS_PAID
+    details.close()
+
+    window._select_page(PAGE_DEBTS_OUT)
+    payables = window.pages.currentWidget()
+    assert payables.direction == debts.PAYABLE and payables.table.rowCount() == 0
+    seller = MainWindow(current_user=_user(shop["seller"]))
+    seller._select_page(PAGE_DEBTS_IN)
+    assert seller.pages.currentIndex() != PAGE_DEBTS_IN  # owner only
+
+
+def test_dashboard_shows_the_net_financial_position(shop) -> None:
+    from app.services import debts
+    from app.services.debts import DebtTerms, PersonDetails
+    from app.ui.pages.dashboard_page import DashboardPage
+
+    with session_scope() as session:
+        debts.create_debt(session, shop["owner"], direction=debts.RECEIVABLE,
+                          person=PersonDetails("سمير", "ب"), terms=DebtTerms(30000, date.today()))
+        debts.create_debt(session, shop["owner"], direction=debts.PAYABLE,
+                          person=PersonDetails("مورد", "الهواتف"), terms=DebtTerms(50000, date.today()))
+    page = DashboardPage(_user(shop["owner"]))
+    assert page.position_box.isVisibleTo(page)
+    assert page.debtors_owe_card.value_label.text() == "30,000 دج"
+    assert page.shop_owes_card.value_label.text() == "50,000 دج"
+    assert page.net_value.text() == f"{30000 - 50000:,} دج"
+    opened: list[str] = []
+    page.debts_requested.connect(opened.append)
+    page.shop_owes_card.clicked.emit()
+    assert opened == ["payable"]
+    assert not DashboardPage(_user(shop["seller"])).position_box.isVisibleTo(page)

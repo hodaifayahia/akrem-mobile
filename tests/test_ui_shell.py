@@ -149,7 +149,7 @@ def test_sidebar_navigation_badges_and_collapse(qapp, memory_engine, shop) -> No
     from app.ui.widgets.sidebar import COLLAPSED_WIDTH, EXPANDED_WIDTH, Sidebar
 
     sidebar = Sidebar(_user(memory_engine, shop["owner_id"]))
-    assert len(sidebar.buttons) == 9
+    assert len(sidebar.buttons) == 11
     sidebar.set_active(3)
     assert sidebar.buttons[3].property("active") is True
     assert sidebar.buttons[0].property("active") is False
@@ -514,7 +514,7 @@ def test_every_sidebar_and_topbar_button_receives_real_mouse_clicks(qapp, memory
         window.monitor.stop()
         window.hide()
         assert report.ok, report.failures
-        assert sum("opens its page" in check for check in report.checks) == 9
+        assert sum("opens its page" in check for check in report.checks) == 11
     apply_language("ar")
 
 

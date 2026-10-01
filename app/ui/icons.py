@@ -76,6 +76,8 @@ _PATHS: dict[str, str] = {
     '<path d="M4 15.5v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
     "sheet": '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
     '<path d="M8.5 12.5h7M8.5 16h7M12 11v7"/>',
+    "debt-in": '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v8"/><path d="M8.5 12l3.5 3.5 3.5-3.5"/>',
+    "debt-out": '<circle cx="12" cy="12" r="8.5"/><path d="M12 16.5v-8"/><path d="M8.5 12l3.5-3.5 3.5 3.5"/>',
     "drag": '<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/>',
 }
 

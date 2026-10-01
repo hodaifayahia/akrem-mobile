@@ -32,8 +32,10 @@ from app.db.session import session_scope
 from app.i18n import ar
 from app.services.alerts import CollectionAlert, collection_alerts
 from app.services.dashboard import DashboardSummary, get_dashboard_summary
+from app.services.finance import FinancialPosition, financial_position
 from app.ui import icons
 from app.ui.events import events
+from app.ui.theme import qcolor
 from app.ui.widgets.collection_gauge import CollectionGaugeWidget
 from app.ui.widgets.daily_register_card import DailyRegisterCard
 from app.ui.widgets.financial_chart import FinancialTrendChart
@@ -100,6 +102,8 @@ class DashboardPage(QWidget):
     payment_filter_requested = Signal(str)
     open_customer_requested = Signal(int)
     view_overdue_requested = Signal()
+    debts_requested = Signal(str)  # "receivable" or "payable"
+    stock_requested = Signal()
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -125,6 +129,10 @@ class DashboardPage(QWidget):
         layout.setSpacing(20)
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
+
+        self.position_box = self._build_position(body)
+        self.position_box.setVisible(self._role_is_owner)
+        layout.addWidget(self.position_box)
 
         layout.addWidget(self._section_title(ar.DASH_SECTION_OPERATIONS))
         self.status_grid = ResponsiveGrid(parent=body)
@@ -200,6 +208,99 @@ class DashboardPage(QWidget):
         bottom.addLayout(side, 2)
         layout.addLayout(bottom)
         layout.addStretch(1)
+
+    def _build_position(self, parent: QWidget) -> QWidget:
+        """Net financial position: what is inside, what is outside, the net, and this month's cash flow."""
+        box = QWidget(parent)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(self._section_title(ar.DASH_SECTION_POSITION))
+
+        hero = QFrame(box)
+        hero.setObjectName("card")
+        hero_row = QHBoxLayout(hero)
+        hero_row.setContentsMargins(22, 16, 22, 16)
+        hero_row.setSpacing(24)
+        net_box = QVBoxLayout()
+        net_box.setSpacing(2)
+        net_caption = QLabel(ar.DASH_NET_TITLE, hero)
+        net_caption.setObjectName("kpiTitle")
+        self.net_value = QLabel("—", hero)
+        self.net_value.setObjectName("netValue")
+        net_hint = QLabel(ar.DASH_NET_FORMULA, hero)
+        net_hint.setObjectName("kpiCaption")
+        net_hint.setWordWrap(True)
+        net_box.addWidget(net_caption)
+        net_box.addWidget(self.net_value)
+        net_box.addWidget(net_hint)
+        hero_row.addLayout(net_box, 2)
+        self.inside_value = self._side_total(hero, hero_row, ar.DASH_INSIDE, "paid")
+        self.outside_value = self._side_total(hero, hero_row, ar.DASH_OUTSIDE, "failed")
+        layout.addWidget(hero)
+
+        self.position_grid = ResponsiveGrid(parent=box)
+        self.clients_owe_card = StatCard(ar.DASH_CLIENTS_OWE, color="primary-glow", icon="users",
+                                         subtitle=ar.DASH_CLIENTS_OWE_CAPTION)
+        self.debtors_owe_card = StatCard(ar.DASH_DEBTORS_OWE, color="paid", icon="debt-in")
+        self.stock_value_card = StatCard(ar.DASH_STOCK_VALUE, color="highlight", icon="tag")
+        self.shop_owes_card = StatCard(ar.DASH_SHOP_OWES, color="failed", icon="debt-out")
+        self.clients_owe_card.clicked.connect(lambda: self.payment_filter_requested.emit("facilities"))
+        self.debtors_owe_card.clicked.connect(lambda: self.debts_requested.emit("receivable"))
+        self.stock_value_card.clicked.connect(self.stock_requested.emit)
+        self.shop_owes_card.clicked.connect(lambda: self.debts_requested.emit("payable"))
+        for card in (self.clients_owe_card, self.debtors_owe_card, self.stock_value_card, self.shop_owes_card):
+            self.position_grid.add(card)
+        layout.addWidget(self.position_grid)
+
+        self.flow_grid = ResponsiveGrid(max_columns=3, parent=box)
+        self.month_in_card = StatCard(ar.DASH_MONTH_IN, color="paid", icon="trend-up", clickable=False)
+        self.month_out_card = StatCard(ar.DASH_MONTH_OUT, color="pending", icon="debt-out",
+                                       subtitle=ar.DASH_MONTH_OUT_CAPTION, clickable=False)
+        self.month_net_card = StatCard(ar.DASH_MONTH_NET, color="highlight", icon="wallet",
+                                       subtitle=ar.DASH_MONTH_NET_CAPTION, clickable=False)
+        for card in (self.month_in_card, self.month_out_card, self.month_net_card):
+            self.flow_grid.add(card)
+        layout.addWidget(self.flow_grid)
+        return box
+
+    @staticmethod
+    def _side_total(parent: QWidget, row: QHBoxLayout, caption: str, tone: str) -> QLabel:
+        column = QVBoxLayout()
+        column.setSpacing(2)
+        label = QLabel(caption, parent)
+        label.setObjectName("kpiCaption")
+        value = QLabel("—", parent)
+        value.setObjectName("kpiValue")
+        value.setStyleSheet(f"color: {qcolor(tone).name()};")
+        column.addWidget(label)
+        column.addWidget(value)
+        column.addStretch(1)
+        row.addLayout(column, 1)
+        return value
+
+    def _apply_position(self, position: FinancialPosition) -> None:
+        """Fill the net position section."""
+        net = position.net
+        self.net_value.setText(f"{net:,} {ar.CURRENCY_SUFFIX}")
+        self.net_value.setStyleSheet(f"color: {qcolor('paid' if net >= 0 else 'failed').name()};")
+        self.inside_value.setText(f"{position.money_inside + position.stock_value:,} {ar.CURRENCY_SUFFIX}")
+        self.outside_value.setText(f"{position.shop_owes:,} {ar.CURRENCY_SUFFIX}")
+        self.clients_owe_card.set_value(position.clients_owe, currency=True)
+        self.debtors_owe_card.set_value(position.debtors_owe, currency=True)
+        self.debtors_owe_card.set_subtitle(ar.DASH_OVERDUE_CAPTION.format(amount=_money(position.debtors_overdue)))
+        self.stock_value_card.set_value(position.stock_value, currency=True)
+        self.stock_value_card.set_subtitle(ar.DASH_STOCK_CAPTION.format(
+            units=position.stock_units, retail=_money(position.stock_retail_value),
+        ))
+        self.shop_owes_card.set_value(position.shop_owes, currency=True)
+        self.shop_owes_card.set_subtitle(ar.DASH_OVERDUE_CAPTION.format(amount=_money(position.shop_overdue)))
+        self.month_in_card.set_value(position.month_received, currency=True)
+        self.month_in_card.set_subtitle(ar.DASH_MONTH_IN_CAPTION.format(
+            sales=_money(position.month_sales_received), debts=_money(position.month_debts_received),
+        ))
+        self.month_out_card.set_value(position.month_paid_out, currency=True)
+        self.month_net_card.set_value(position.month_net, currency=True)
 
     def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
@@ -279,12 +380,20 @@ class DashboardPage(QWidget):
                     role=self.current_user.role,
                 )
                 alerts = [a for a in collection_alerts(session, today=today) if a.kind != "due_soon"]
+                position = (
+                    financial_position(
+                        session, self.current_user.id, year=selected.year(), month=selected.month(), today=today
+                    )
+                    if self._role_is_owner else None
+                )
         except Exception:  # noqa: BLE001 - show the last figures rather than crash
             _LOG.exception("Dashboard refresh failed")
             return
         self.greeting.setText(self._greeting_text())
         self._apply_summary(summary)
         self._apply_attention(alerts)
+        if position is not None:
+            self._apply_position(position)
 
     def _apply_summary(self, summary: DashboardSummary) -> None:
         """Set card values and charts from the service result."""
@@ -339,3 +448,7 @@ class DashboardPage(QWidget):
             return
         for alert in alerts[:ATTENTION_LIMIT]:
             self.attention_list.addWidget(_AttentionRow(alert, self.open_customer_requested.emit, self))
+
+
+def _money(amount: int) -> str:
+    return f"{amount:,} {ar.CURRENCY_SUFFIX}"
