@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import os
 import pytest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from sqlalchemy.engine import Engine
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from app.config import APP_NAME
 from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import (
@@ -31,6 +30,7 @@ from app.services.settings import get_value
 from app.ui.events import events
 from app.ui.main_window import MainWindow
 from app.ui.pages.settings_page import SettingsPage
+from app.ui.preferences import app_settings
 from app.ui.widgets.topbar import AppTopBar
 
 
@@ -231,6 +231,6 @@ class TestSettingsPageMultilingual:
             assert saved_lang == "fr"
 
             # Check QSettings persistence
-            qsettings = QSettings(APP_NAME, APP_NAME)
+            qsettings = app_settings()
             assert qsettings.value("language") == "fr"
             assert get_language() == "fr"

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -172,6 +173,14 @@ def preview_workbook(
         }
         rows.append(_parse_row(excel_row, values, overrides.get(excel_row)))
     return ImportPreview(source, chosen_sheet, headers, resolved_mapping, tuple(rows), missing)
+
+
+def without_rows(preview: ImportPreview, source_rows: Iterable[int]) -> ImportPreview:
+    """The same preview without the given Excel rows (rows the owner chose not to import)."""
+    excluded = set(source_rows)
+    if not excluded:
+        return preview
+    return replace(preview, rows=tuple(row for row in preview.rows if row.source_row not in excluded))
 
 
 def import_preview(

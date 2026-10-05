@@ -105,7 +105,7 @@ def test_installment_sale_every_two_months(session: Session, customer_id: int) -
     rows = _rows(session, sale)
     assert sale.payment_interval == 2
     assert [(row.installment_index, row.due_date, row.amount_due) for row in rows] == [
-        (1, date(2026, 3, 1), 49_500), (2, date(2026, 5, 1), 49_500), (3, date(2026, 7, 1), 49_500),
+        (1, date(2026, 3, 10), 49_500), (2, date(2026, 5, 10), 49_500), (3, date(2026, 7, 10), 49_500),
     ]
     assert sale.monthly_amount == 49_500
     assert sale.end_date == date(2026, 7, 10)
@@ -116,7 +116,7 @@ def test_one_month_plan_is_allowed(session: Session, customer_id: int) -> None:
         session, customer_id=customer_id, product="Cable", sale_type="installment",
         wholesale_price=500, cash_price=1_000, rate=10, months=1, purchase_date=date(2026, 1, 10),
     )
-    assert [(r.due_date, r.amount_due) for r in _rows(session, sale)] == [(date(2026, 2, 1), 1_100)]
+    assert [(r.due_date, r.amount_due) for r in _rows(session, sale)] == [(date(2026, 2, 10), 1_100)]
 
 
 def test_cash_and_credit_sales_are_always_interval_one(session: Session, customer_id: int) -> None:
@@ -143,7 +143,7 @@ def test_editing_the_interval_rebuilds_the_schedule(session: Session, customer_i
     assert len(_rows(session, sale)) == 6
     sales.update_sale(session, sale.id, payment_interval=3)
     rows = _rows(session, sale)
-    assert [(r.due_date, r.amount_due) for r in rows] == [(date(2026, 4, 1), 30_000), (date(2026, 7, 1), 30_000)]
+    assert [(r.due_date, r.amount_due) for r in rows] == [(date(2026, 4, 10), 30_000), (date(2026, 7, 10), 30_000)]
     assert sale.monthly_amount == 30_000
 
 
@@ -156,11 +156,11 @@ def test_status_and_alerts_only_in_payment_months(session: Session, customer_id:
     )
     rows = _rows(session, sale)
     assert for_month(rows, 2026, 2, date(2026, 2, 10)) == Status.NONE      # nothing due in February
-    assert for_month(rows, 2026, 3, date(2026, 3, 2)) == Status.PENDING    # due 1 March
+    assert for_month(rows, 2026, 3, date(2026, 3, 2)) == Status.PENDING    # due 10 March
     assert for_month(rows, 2026, 3, date(2026, 3, 20)) == Status.FAILED    # unpaid after grace
     assert alerts.collection_alerts(session, today=date(2026, 2, 3)) == []
-    due_soon = alerts.collection_alerts(session, today=date(2026, 2, 25))
-    assert [(a.due_date, a.amount) for a in due_soon] == [(date(2026, 3, 1), 20_000)]
+    due_soon = alerts.collection_alerts(session, today=date(2026, 3, 5))
+    assert [(a.due_date, a.amount) for a in due_soon] == [(date(2026, 3, 10), 20_000)]
 
 
 # ---------------------------------------------------------------- products

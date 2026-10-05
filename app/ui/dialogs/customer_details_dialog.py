@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 import re
 
-from PySide6.QtCore import QDate, Qt, Signal, QUrl
+from PySide6.QtCore import QDate, QSize, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QTabWidget,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QHeaderView,
     QTableWidget,
@@ -39,7 +40,7 @@ from app.i18n import ar
 from app.i18n.plan_text import amount_label, every_text
 from app.i18n.stock_text import battery_text, ltr_text
 from app.services import auth, customers, payments, sales as sales_service
-from app.services import schedule
+from app.services import print_templates, schedule
 from app.services.sales import PaidInstallmentEditError
 from app.services.pdf_forms import generate_commitment_pdf, generate_payment_receipt_pdf
 from app.services.schedule import ScheduledInstallment
@@ -48,18 +49,26 @@ from app.ui.widgets.customer_history import CustomerHistoryPanel, HistorySummary
 from app.services.status import Status, for_customer, for_month
 from app.ui.events import events
 from app.ui.dialogs.sale_edit_dialog import SaleEditDialog
+from app.ui.screen_fit import fit_table_to_rows, fit_to_screen
 
 
 class PaymentEntryDialog(QDialog):
     """Collect a partial or full payment amount and its receipt details."""
 
-    def __init__(self, remaining: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, remaining: int, parent: QWidget | None = None, *, suggested: int | None = None, hint: str = ""
+    ) -> None:
+        """``remaining`` is the most that can be paid; ``suggested`` fills the amount (default: all)."""
         super().__init__(parent)
         self.setWindowTitle(ar.PAYMENT_DIALOG_TITLE)
         self.setMinimumWidth(390)
         self.amount = QSpinBox(self)
         self.amount.setRange(1, max(1, remaining))
-        self.amount.setValue(max(1, remaining))
+        self.amount.setValue(max(1, min(remaining, suggested if suggested is not None else remaining)))
+        self.hint = QLabel(hint, self)
+        self.hint.setObjectName("sectionHint")
+        self.hint.setWordWrap(True)
+        self.hint.setVisible(bool(hint))
         self.amount.setMaximumWidth(220)
         self.amount.setGroupSeparatorShown(True)
         self.payment_date = QDateEdit(QDate.currentDate(), self)
@@ -77,6 +86,7 @@ class PaymentEntryDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         form.addRow(ar.PAYMENT_AMOUNT, self.amount)
+        form.addRow("", self.hint)
         form.addRow(ar.PAYMENT_DATE, self.payment_date)
         form.addRow(ar.PAYMENT_METHOD, self.method)
         form.addRow(ar.PAYMENT_NOTE, self.note)
@@ -112,23 +122,24 @@ class CustomerDetailsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         engine: Engine | None = None,
+        sale_id: int | None = None,
     ) -> None:
+        """``sale_id`` opens the dialog on that sale (a row of the client list)."""
         super().__init__(parent)
         self.customer_id = customer_id
         self.current_user = current_user
         self._engine = engine
         self._customer: Customer
         self._grace_days = 5
-        self._due_mode = "first_of_month"
-        self._sale_id: int | None = None
+        self._due_mode = schedule.DEFAULT_DUE_MODE
+        self._sale_id: int | None = sale_id
         self._payments_by_id: dict[int, Payment] = {}
         self.setWindowTitle(ar.CUST_DETAILS_TITLE)
-        self.setMinimumSize(860, 720)
-        self.resize(980, 820)
+        self.setMinimumSize(640, 480)
         self._reload_customer()
         self._build_ui()
         self._populate_sales()
-        self._center_on_parent()
+        fit_to_screen(self, QSize(980, 820))
 
     def _build_ui(self) -> None:
         """Create the identity header, sale selector, details and schedule views."""
@@ -178,13 +189,19 @@ class CustomerDetailsDialog(QDialog):
         self.history_summary = HistorySummary(self)
         root.addWidget(self.history_summary)
         self.tabs = QTabWidget(self)
-        sale_tab = QWidget(self.tabs)
+        # The sale tab scrolls as a whole: price table, details, the full
+        # schedule and the print actions stay readable on a small screen.
+        self.sale_scroll = QScrollArea(self.tabs)
+        self.sale_scroll.setWidgetResizable(True)
+        self.sale_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sale_tab = QWidget(self.sale_scroll)
         sale_root = QVBoxLayout(sale_tab)
-        sale_root.setContentsMargins(0, 10, 0, 0)
+        sale_root.setContentsMargins(0, 10, 8, 0)
         sale_root.setSpacing(12)
+        self.sale_scroll.setWidget(sale_tab)
         self.history_panel = CustomerHistoryPanel(is_owner=self.current_user.role == "owner", parent=self.tabs)
         self.history_panel.purchase_activated.connect(self._show_sale_from_history)
-        self.tabs.addTab(sale_tab, ar.HIST_TAB_SALE)
+        self.tabs.addTab(self.sale_scroll, ar.HIST_TAB_SALE)
         self.tabs.addTab(self.history_panel, ar.HIST_TAB_HISTORY)
         root.addWidget(self.tabs, 1)
 
@@ -250,7 +267,7 @@ class CustomerDetailsDialog(QDialog):
         self.details_table.setShowGrid(False)
         self.details_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.details_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.details_table.setMaximumHeight(140)
+        self.details_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.details_table.setStyleSheet(
             "QTableWidget { background-color: #0E141D; border: 1px solid #1F2A3D; border-radius: 10px; }"
         )
@@ -289,7 +306,8 @@ class CustomerDetailsDialog(QDialog):
         self.schedule_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.schedule_table.setAlternatingRowColors(True)
         self.schedule_table.setShowGrid(False)
-        sale_root.addWidget(self.schedule_table, 1)
+        self.schedule_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sale_root.addWidget(self.schedule_table)
 
         self.empty_schedule = QLabel(f"ℹ️  {ar.CUST_NO_SCHEDULE}", self)
         self.empty_schedule.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -362,7 +380,7 @@ class CustomerDetailsDialog(QDialog):
         with session_scope(self._engine) as session:
             self._customer = customers.get_customer_details(session, self.customer_id)
             configured_grace = get_value(session, "grace_days", 5)
-            configured_due_mode = get_value(session, "due_mode", "first_of_month")
+            configured_due_mode = get_value(session, "due_mode", schedule.DEFAULT_DUE_MODE)
         if (
             isinstance(configured_grace, int)
             and not isinstance(configured_grace, bool)
@@ -374,7 +392,7 @@ class CustomerDetailsDialog(QDialog):
         self._due_mode = (
             configured_due_mode
             if configured_due_mode in ("first_of_month", "purchase_day")
-            else "first_of_month"
+            else schedule.DEFAULT_DUE_MODE
         )
 
     def _show_sale_from_history(self, sale_id: int) -> None:
@@ -410,7 +428,7 @@ class CustomerDetailsDialog(QDialog):
         self.sale_selector.clear()
         for sale in sorted(self._customer.sales, key=lambda item: (item.purchase_date, item.id)):
             kind = self._sale_type_label(sale.sale_type)
-            label = f"{sale.product} · {self._format_date(sale.purchase_date)} · {kind}"
+            label = f"{ltr_text(sale.product)} · {self._format_date(sale.purchase_date)} · {kind}"
             self.sale_selector.addItem(label, sale.id)
         selected_index = self.sale_selector.findData(selected_sale_id)
         self.sale_selector.setCurrentIndex(selected_index if selected_index >= 0 else 0)
@@ -494,7 +512,7 @@ class CustomerDetailsDialog(QDialog):
     def _populate_details(self, sale: Sale) -> None:
         """Render sale fields in two compact label/value pairs per row."""
         fields: list[tuple[str, str]] = [
-            (ar.PRODUCT, sale.product),
+            (ar.PRODUCT, ltr_text(sale.product)),
             (ar.CUST_SALE_TYPE, self._sale_type_label(sale.sale_type)),
         ]
         if self.current_user.role == "owner":
@@ -532,6 +550,7 @@ class CustomerDetailsDialog(QDialog):
             column = pair * 2
             self.details_table.setItem(row, column, QTableWidgetItem(label))
             self.details_table.setItem(row, column + 1, QTableWidgetItem(value))
+        fit_table_to_rows(self.details_table)
 
     def _populate_schedule(self, sale: Sale) -> None:
         """Render monthly due rows with per-row status and payment actions."""
@@ -587,6 +606,7 @@ class CustomerDetailsDialog(QDialog):
                 self.schedule_table.setCellWidget(row, 5, action)
             else:
                 self.schedule_table.setItem(row, 5, QTableWidgetItem("—"))
+        fit_table_to_rows(self.schedule_table, resize_rows=True)
 
     def _populate_credit_balance(self, sale: Sale) -> None:
         """Offer partial payment recording for a credit sale without installments."""
@@ -642,11 +662,14 @@ class CustomerDetailsDialog(QDialog):
             path = self._choose_pdf_path(ar.PDF_COMMITMENT_ACTION, default_name)
             if not path:
                 return
+            templates = self._print_templates()
             output = generate_commitment_pdf(
                 path,
                 self._customer,
                 sale,
-                include_sensitive=self.current_user.role == "owner",
+                # The owner's figures (wholesale price, profit) only when the owner turned them on.
+                include_sensitive=self.current_user.role == "owner" and templates.commitment_owner_figures,
+                templates=templates,
             )
         except Exception:
             QMessageBox.warning(self, ar.PDF_SAVE_DIALOG_TITLE, ar.PDF_GENERATE_ERROR)
@@ -673,11 +696,17 @@ class CustomerDetailsDialog(QDialog):
                 sale,
                 payment,
                 issued_by=self.current_user.username,
+                templates=self._print_templates(),
             )
         except Exception:
             QMessageBox.warning(self, ar.PDF_SAVE_DIALOG_TITLE, ar.PDF_GENERATE_ERROR)
             return
         self._offer_open_pdf(output)
+
+    def _print_templates(self) -> print_templates.PrintTemplates:
+        """The owner's texts for printed documents."""
+        with session_scope(self._engine) as session:
+            return print_templates.load(session)
 
     def _choose_pdf_path(self, title: str, filename: str) -> str | None:
         """Open a save dialog rooted in the user's PDF exports directory."""
@@ -718,23 +747,36 @@ class CustomerDetailsDialog(QDialog):
         }.get(method.casefold(), method)
 
     def _open_installment_payment(self, installment_id: int, remaining: int) -> None:
-        """Collect a payment and save it against the selected installment."""
-        dialog = PaymentEntryDialog(remaining, self)
+        """Collect any amount on the selected sale, starting with its oldest unpaid installment.
+
+        The client may pay more or less than this installment, up to what is
+        left on the whole sale.
+        """
+        sale = self._selected_sale()
+        if sale is None or not any(row.id == installment_id for row in sale.installments):
+            return
+        sale_remaining = max(
+            remaining, sum(max(0, row.amount_due - row.amount_paid) for row in sale.installments)
+        )
+        dialog = PaymentEntryDialog(
+            sale_remaining, self, suggested=remaining,
+            hint=ar.PAY_FLEXIBLE_HINT.format(remaining=f"{sale_remaining:,} {ar.CURRENCY_SUFFIX}"),
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         amount, payment_date, method, note = dialog.values()
         try:
             with session_scope(self._engine) as session:
-                payment = payments.record_installment_payment_for_user(
+                recorded = payments.record_sale_payment_for_user(
                     session,
                     int(self.current_user.id),
-                    installment_id,
+                    sale.id,
                     amount,
                     payment_date,
                     method,
                     note,
                 )
-                payment_id = payment.id
+                payment_id = recorded[-1].id
         except (PermissionError, ValueError, RuntimeError, SQLAlchemyError):
             QMessageBox.warning(self, ar.PAYMENT_DIALOG_TITLE, ar.PAYMENT_SAVE_ERROR)
             return
@@ -910,13 +952,3 @@ class CustomerDetailsDialog(QDialog):
     def _format_date(value: date | None) -> str:
         """Format optional dates in the application's DD/MM/YYYY display style."""
         return "—" if value is None else value.strftime("%d/%m/%Y")
-
-    def _center_on_parent(self) -> None:
-        """Center the dialog over its parent or the active screen."""
-        if self.parentWidget() is not None:
-            center = self.parentWidget().geometry().center()
-            self.move(self.parentWidget().mapToGlobal(center) - self.rect().center())
-            return
-        screen = self.screen()
-        if screen is not None:
-            self.move(screen.availableGeometry().center() - self.rect().center())

@@ -10,6 +10,7 @@ links it to the sale.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -37,7 +38,7 @@ _REFERENCE_NUMBER = re.compile(r"^REF-(\d+)$")
 
 
 class StockError(ValueError):
-    """A stock operation was refused; ``code`` says why (``imei_taken``, ``reference_taken``, ``sold``)."""
+    """A stock operation was refused; ``code`` says why (``imei_taken``, ``reference_taken``, ``sold``, ``not_enough``)."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -202,6 +203,31 @@ def available_units(session: Session, product_id: int) -> list[StockItem]:
     ))
 
 
+MAX_SALE_QUANTITY = 500
+
+
+def units_to_sell(
+    session: Session, *, product_id: int | None, quantity: int, first: StockItem | None = None
+) -> list[StockItem]:
+    """The stock units a sale of ``quantity`` takes, so the stock goes down by that many.
+
+    ``first`` is the phone the user picked (or matched by IMEI/REF); the rest
+    are the oldest available units of the same product. A product with no
+    phone in stock sells without touching the stock, but asking for several
+    phones when fewer are available is refused (``not_enough``).
+    """
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= MAX_SALE_QUANTITY:
+        raise ValueError(f"Quantity must be between 1 and {MAX_SALE_QUANTITY}")
+    units = [first] if first is not None else []
+    product_id = first.product_id if first is not None else product_id
+    if product_id is not None and len(units) < quantity:
+        others = [unit for unit in available_units(session, product_id) if first is None or unit.id != first.id]
+        units.extend(others[: quantity - len(units)])
+    if quantity > 1 and len(units) < quantity:
+        raise StockError("not_enough", f"Only {len(units)} unit(s) of this product are in stock")
+    return units
+
+
 def find_available_unit(
     session: Session, *, imei: str | None = None, reference: str | None = None
 ) -> StockItem | None:
@@ -218,6 +244,72 @@ def find_available_unit(
     return session.scalar(
         select(StockItem).where(StockItem.status == STATUS_AVAILABLE, or_(*conditions)).limit(1)
     )
+
+
+def find_by_scan(session: Session, code: Any) -> StockItem | None:
+    """The unsold phone a barcode scan (or a typed code) points at: its IMEI or its REF.
+
+    Scanners type the code and press Enter; ``REF-12``, ``ref-00012`` and
+    ``00012`` all find ``REF-00012``.
+    """
+    if is_blank(code):
+        return None
+    text = western_digits(str(code)).strip()
+    unit = find_available_unit(session, imei=text if normalize_imei(text) else None, reference=text)
+    if unit is not None:
+        return unit
+    number = re.sub(r"^REF-?", "", text.upper())
+    if number.isdigit():
+        return find_available_unit(session, reference=f"{REFERENCE_PREFIX}{int(number):05d}")
+    return None
+
+
+def scanned_imeis(text: str) -> tuple[list[str], list[str]]:
+    """Split scanner input (one code per line) into ``(valid IMEIs, rejected lines)``.
+
+    Repeated scans of the same phone count once.
+    """
+    valid: list[str] = []
+    rejected: list[str] = []
+    for line in str(text or "").splitlines():
+        if not line.strip():
+            continue
+        imei = normalize_imei(line)
+        if imei is None:
+            rejected.append(line.strip())
+        elif imei not in valid:
+            valid.append(imei)
+    return valid, rejected
+
+
+def add_scanned_units(
+    session: Session,
+    owner_user_id: int,
+    *,
+    product_id: int,
+    imeis: Iterable[str],
+    details: UnitDetails = UnitDetails(),
+    cash_price: int | None = None,
+    wholesale_price: int | None = None,
+) -> list[StockItem]:
+    """Add one phone per scanned IMEI (same product, prices and details); all or none; owner only."""
+    codes = list(dict.fromkeys(imeis))
+    if not codes:
+        raise ValueError("Scan at least one IMEI")
+    if len(codes) > MAX_SALE_QUANTITY:
+        raise ValueError(f"At most {MAX_SALE_QUANTITY} phones at once")
+    created: list[StockItem] = []
+    with session.begin_nested():
+        for code in codes:
+            unit_details = UnitDetails(
+                color=details.color, battery_health=details.battery_health, is_new=details.is_new,
+                imei=code, reference=None, note=details.note,
+            )
+            created.extend(add_units(
+                session, owner_user_id, product_id=product_id, details=unit_details,
+                cash_price=cash_price, wholesale_price=wholesale_price,
+            ))
+    return created
 
 
 def stock_counts(session: Session) -> dict[int, tuple[int, int]]:
@@ -273,6 +365,32 @@ def add_units(
     ]
     _flush(session)
     return created
+
+
+def set_available_quantity(
+    session: Session, owner_user_id: int, *, product_id: int, quantity: int
+) -> tuple[int, int]:
+    """Make the product's unsold phones number exactly ``quantity``; returns ``(added, removed)``; owner only.
+
+    Missing phones are added at the catalog prices (each gets its own REF).
+    Extra phones are removed newest first, preferring the ones with no IMEI,
+    so a phone typed in with its details is the last to go. Sold phones are
+    history and never touched.
+    """
+    auth.require_owner(session, owner_user_id)
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not 0 <= quantity <= MAX_SALE_QUANTITY:
+        raise ValueError(f"Quantity must be between 0 and {MAX_SALE_QUANTITY}")
+    if session.get(Product, product_id) is None:
+        raise ValueError("Catalog product not found")
+    units = available_units(session, product_id)
+    if quantity > len(units):
+        added = add_units(session, owner_user_id, product_id=product_id, quantity=quantity - len(units))
+        return len(added), 0
+    extra = sorted(units, key=lambda unit: (unit.imei is not None, -unit.id))[: len(units) - quantity]
+    for unit in extra:
+        session.delete(unit)
+    session.flush()
+    return 0, len(extra)
 
 
 def _new_unit(
@@ -340,6 +458,24 @@ def delete_unit(session: Session, owner_user_id: int, unit_id: int) -> None:
         raise StockError("sold", "A sold unit cannot be deleted")
     session.delete(unit)
     session.flush()
+
+
+def delete_units(session: Session, owner_user_id: int, unit_ids: Iterable[int]) -> tuple[int, int]:
+    """Remove several unsold units; sold ones are history and stay.
+
+    Returns ``(deleted, sold_kept)``.
+    """
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(unit_id) for unit_id in unit_ids))
+    rows = session.scalars(select(StockItem).where(StockItem.id.in_(unique_ids))).all() if unique_ids else []
+    deleted = 0
+    for unit in rows:
+        if unit.status == STATUS_SOLD:
+            continue
+        session.delete(unit)
+        deleted += 1
+    session.flush()
+    return deleted, len(rows) - deleted
 
 
 def mark_sold(session: Session, unit: StockItem, sale: Sale, sold_on: date | None = None) -> None:

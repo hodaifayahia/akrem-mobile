@@ -71,3 +71,25 @@ def get_grace_days(session: Session) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return DEFAULT_GRACE_DAYS
     return value
+
+
+SELLER_DISCOUNT_KEY = "seller_max_discount"
+DEFAULT_SELLER_MAX_DISCOUNT = 5
+
+
+def get_seller_max_discount(session: Session) -> int:
+    """Largest discount (percent of the catalog total) a seller may give without the owner; default 5."""
+    value = get_value(session, SELLER_DISCOUNT_KEY, DEFAULT_SELLER_MAX_DISCOUNT)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        return DEFAULT_SELLER_MAX_DISCOUNT
+    return value
+
+
+def set_seller_max_discount(session: Session, owner_user_id: int, percent: int) -> None:
+    """Change the sellers' discount limit (owner only)."""
+    from app.services import auth
+
+    auth.require_owner(session, owner_user_id)
+    if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+        raise ValueError("The discount limit must be a whole percentage from 0 to 100")
+    set_value(session, SELLER_DISCOUNT_KEY, percent)

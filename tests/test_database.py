@@ -41,7 +41,7 @@ def test_seed_create_two_sales_and_preserve_financial_history(memory_engine: Eng
         seed_defaults(session)
         assert set(session.scalars(select(Category.name))) == set(DEFAULT_CATEGORIES)
         settings = dict(session.execute(select(Setting.key, Setting.value)).all())
-        assert '"first_of_month"' in settings["due_mode"]
+        assert '"purchase_day"' in settings["due_mode"]
         assert settings["grace_days"] == "5"
 
         category = session.scalar(select(Category).where(Category.name == "أساتذة"))

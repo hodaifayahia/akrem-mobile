@@ -17,14 +17,15 @@ from __future__ import annotations
 import logging
 import sys
 
-from PySide6.QtCore import QObject, QSettings, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from app.config import APP_NAME, RESOURCE_DIR
+from app.config import RESOURCE_DIR
 from app.i18n import ar
-from app.ui import icons
+from app.ui import autostart, icons
 from app.ui.notifications import NotificationHub, native_enabled, set_native_enabled
+from app.ui.preferences import app_settings
 
 WINDOWS_APP_ID = "AkremMobile.InstallmentManager"
 MINIMIZE_SETTING = "tray/minimize_on_close"
@@ -59,13 +60,13 @@ def set_windows_app_id(app_id: str = WINDOWS_APP_ID) -> bool:
 
 def minimize_to_tray_enabled() -> bool:
     """Return the per-PC "minimize to tray on close" preference (default on)."""
-    value = QSettings(APP_NAME, APP_NAME).value(MINIMIZE_SETTING, True)
+    value = app_settings().value(MINIMIZE_SETTING, True)
     return value not in (False, "false", "0", 0)
 
 
 def set_minimize_to_tray(enabled: bool) -> None:
     """Persist the per-PC "minimize to tray on close" preference."""
-    QSettings(APP_NAME, APP_NAME).setValue(MINIMIZE_SETTING, bool(enabled))
+    app_settings().setValue(MINIMIZE_SETTING, bool(enabled))
 
 
 def app_icon() -> QIcon:
@@ -121,6 +122,11 @@ class TrayController(QObject):
         self.native_action.setCheckable(True)
         self.native_action.setChecked(native_enabled())
         self.native_action.toggled.connect(set_native_enabled)
+        self.autostart_action = QAction(self.menu)
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(autostart.is_enabled())
+        self.autostart_action.setVisible(autostart.is_supported())
+        self.autostart_action.toggled.connect(self._set_autostart)
 
         self.quit_action = QAction(self.menu)
         self.quit_action.triggered.connect(self.quit_requested.emit)
@@ -132,6 +138,7 @@ class TrayController(QObject):
         self.menu.addSeparator()
         self.menu.addAction(self.minimize_action)
         self.menu.addAction(self.native_action)
+        self.menu.addAction(self.autostart_action)
         self.menu.addSeparator()
         self.menu.addAction(self.quit_action)
         self.retranslate()
@@ -146,12 +153,20 @@ class TrayController(QObject):
             (self.lock_action, ar.TRAY_LOCK, "lock"),
             (self.minimize_action, ar.TRAY_MINIMIZE_ON_CLOSE, None),
             (self.native_action, ar.TRAY_NATIVE_NOTIFICATIONS, None),
+            (self.autostart_action, ar.TRAY_AUTOSTART, None),
             (self.quit_action, ar.TRAY_QUIT, "power"),
         )
         for action, text, icon_name in entries:
             action.setText(text)
             if icon_name:
                 action.setIcon(icons.icon(icon_name, "text", 16))
+
+    def _set_autostart(self, enabled: bool) -> None:
+        """Turn the Windows sign-in start on or off; undo the tick if that failed."""
+        if not autostart.set_enabled(enabled):
+            self.autostart_action.blockSignals(True)
+            self.autostart_action.setChecked(autostart.is_enabled())
+            self.autostart_action.blockSignals(False)
 
     # ------------------------------------------------------------- behaviour
     def should_hide_on_close(self) -> bool:
@@ -171,7 +186,7 @@ class TrayController(QObject):
 
     def show_background_hint_once(self) -> None:
         """Explain, the first time only, that the app keeps running in the tray."""
-        settings = QSettings(APP_NAME, APP_NAME)
+        settings = app_settings()
         if settings.value(HINT_SETTING, False) in (True, "true", "1", 1):
             return
         settings.setValue(HINT_SETTING, True)

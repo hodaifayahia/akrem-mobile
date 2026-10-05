@@ -7,7 +7,7 @@ installments on a worker thread and posts:
 * an alert whenever an installment *becomes* overdue while the app runs.
 
 Both go through the notification hub, so they appear in the notification
-center and, when the window is not in front, as native Windows toasts.
+center and, always, as native Windows toasts (unless turned off in the tray).
 Database work never runs on the UI thread, except for in-memory SQLite test
 databases, which cannot be shared across threads.
 """
@@ -19,13 +19,14 @@ from collections.abc import Callable
 from datetime import date
 from typing import Any
 
-from PySide6.QtCore import QObject, QRunnable, QSettings, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
 
-from app.config import APP_NAME, database_url
+from app.config import database_url
 from app.db import session as db_session
 from app.i18n import ar
 from app.services.alerts import AlertSummary, CollectionAlert, collection_alerts, summarize
 from app.ui.notifications import NotificationHub
+from app.ui.preferences import app_settings
 
 SCAN_INTERVAL_MS = 10 * 60 * 1000
 FIRST_SCAN_DELAY_MS = 4000
@@ -171,7 +172,7 @@ class CollectionMonitor(QObject):
 
     def _post_daily_digest(self, summary: AlertSummary) -> None:
         today = self._today().isoformat()
-        settings = QSettings(APP_NAME, APP_NAME)
+        settings = app_settings()
         if settings.value(DIGEST_SETTING, "") == today:
             return
         if summary.attention_count == 0 and summary.due_soon_count == 0:
@@ -187,7 +188,7 @@ class CollectionMonitor(QObject):
             lines.append(ar.NOTIF_DIGEST_DUE.format(count=summary.due_soon_count))
         level = "warning" if summary.attention_count else "info"
         self.hub.post(level, ar.NOTIF_DIGEST_TITLE, "\n".join(lines),
-                      duration_ms=7000, native=None, key=f"digest:{today}")
+                      duration_ms=7000, native=True, key=f"digest:{today}")
 
     def _post_new_overdue(self, fresh: list[CollectionAlert]) -> None:
         amount = sum(alert.amount for alert in fresh)
@@ -197,7 +198,7 @@ class CollectionMonitor(QObject):
             ar.NOTIF_NEW_OVERDUE_TITLE,
             ar.NOTIF_NEW_OVERDUE_BODY.format(count=len(fresh), amount=_money(amount)),
             duration_ms=7000,
-            native=None,
+            native=True,
             customer_id=customer_id,
             key="overdue:" + ",".join(sorted(alert.key for alert in fresh)),
         )

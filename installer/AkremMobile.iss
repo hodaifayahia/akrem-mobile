@@ -34,17 +34,28 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "startupicon"; Description: "Start AkremMobile when I sign in to Windows"; GroupDescription: "Background:"; Flags: unchecked
+Name: "autostart"; Description: "Start AkremMobile in the background when I sign in to Windows (payment reminders and notifications)"; GroupDescription: "Background:"
 
 [Files]
 Source: "..\dist\AkremMobile\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Turns the main shop PC into the PostgreSQL server the other PCs share (run once, as administrator).
+Source: "..\scripts\setup_shop_server.ps1"; DestDir: "{app}\server"; Flags: ignoreversion
 
 [Icons]
 ; AppUserModelID must match WINDOWS_APP_ID in app/ui/tray.py so Windows
 ; attributes the app's toast notifications to this shortcut.
 Name: "{group}\AkremMobile"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "AkremMobile.InstallmentManager"
 Name: "{autodesktop}\AkremMobile"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; AppUserModelID: "AkremMobile.InstallmentManager"
-Name: "{userstartup}\AkremMobile"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon; AppUserModelID: "AkremMobile.InstallmentManager"
+Name: "{group}\Make this PC the shop server"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\server\setup_shop_server.ps1"""; WorkingDir: "{app}\server"
+
+[InstallDelete]
+; Older versions offered a Startup-folder shortcut; the registry entry below
+; replaces it, so the app is not started twice at sign-in.
+Type: files; Name: "{userstartup}\AkremMobile.lnk"
+
+[Registry]
+; Same per-user value the app's tray menu turns on and off (app/ui/autostart.py).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "AkremMobile"; ValueData: """{app}\{#AppExeName}"" --background"; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch AkremMobile"; Flags: nowait postinstall skipifsilent

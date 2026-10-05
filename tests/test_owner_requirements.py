@@ -42,9 +42,6 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qapp) -> dict:
     """
     monkeypatch.setenv("AKREMMOBILE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.delenv("AKREMMOBILE_DATABASE_URL", raising=False)
-    from PySide6.QtCore import QSettings
-
-    QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(tmp_path / "settings"))
     for name in ("information", "warning", "critical"):
         monkeypatch.setattr(QMessageBox, name, lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
@@ -175,12 +172,14 @@ def test_clicking_a_name_opens_the_installment_and_price_table(shop) -> None:
     from app.ui.pages.customers_page import CustomersPage
 
     page = CustomersPage(_user(shop["owner"]))
-    opened: list[int] = []
-    page.customer_selected.connect(opened.append)
+    opened: list[tuple[int, int]] = []
+    page.sale_selected.connect(lambda customer_id, sale_id: opened.append((customer_id, sale_id)))
     model = page.table.model()
     row = next(r for r in range(model.rowCount()) if model.index(r, 1).data() == "ليلى خليفي")
     page._cell_clicked(model.index(row, 1))
-    assert opened == [shop["pending"]]
+    # Every row is one sale: the click opens the client on that sale.
+    assert [customer_id for customer_id, _sale_id in opened] == [shop["pending"]]
+    assert opened[0][1] is not None
 
     dialog = CustomerDetailsDialog(shop["pending"], _user(shop["owner"]))
     table = dialog.financial_table
@@ -291,11 +290,26 @@ def test_excel_template_round_trips_through_the_importer(shop, tmp_path) -> None
     assert preview.missing_columns == ()
 
 
-# 8. Excel export ---------------------------------------------------------------------
-def test_every_excel_export_opens_with_the_expected_data(shop, tmp_path, monkeypatch) -> None:
-    from app.ui.pages.customers_page import CustomersPage
+# 8. Reports: on screen, no Excel export buttons (owner request 2026-10-03) -------------------
+def test_reports_page_shows_profits_debts_and_net_money_without_exports(shop) -> None:
     from app.ui.pages.reports_page import ReportsPage
 
+    owner_page = ReportsPage(_user(shop["owner"]))
+    assert owner_page.owner_box.isVisibleTo(owner_page)
+    assert owner_page.net_money_value.text().endswith("دج")
+    assert owner_page.profit_table.rowCount() >= 2  # at least one month and the year total
+    assert ar.REPORT_YEAR_TOTAL.format(year=date.today().year) in [
+        owner_page.profit_table.item(row, 0).text() for row in range(owner_page.profit_table.rowCount())
+    ]
+    assert owner_page.overdue_table.rowCount() >= 1  # the shop has a late client
+    assert not any(hasattr(owner_page, name) for name in (
+        "collection_button", "overdue_button", "profit_button", "full_export_card", "export_everything_to",
+    ))
+    seller_page = ReportsPage(_user(shop["seller"]))
+    assert not seller_page.owner_box.isVisibleTo(seller_page)
+
+
+def test_report_services_still_write_their_sheets(shop, tmp_path) -> None:
     today = date.today()
     with session_scope() as session:
         collection = reports.monthly_collection_rows(session, year=today.year, month=today.month, today=today)
@@ -308,14 +322,15 @@ def test_every_excel_export_opens_with_the_expected_data(shop, tmp_path, monkeyp
     reports.export_profit_xlsx(profit, tmp_path / "profit.xlsx")
     assert load_workbook(tmp_path / "overdue.xlsx").active.max_row >= 2
 
-    page = CustomersPage(_user(shop["owner"]))
-    page.set_payment_filter("facilities")
-    assert page.export_to(str(tmp_path / "customers"))
+    # The Clients page no longer has an export button; the customer sheet is still written by the service.
+    with session_scope() as session:
+        listed = customers.list_customers(session, year=today.year, month=today.month, today=today)
+    reports.export_customers_xlsx(listed, tmp_path / "customers.xlsx")
     sheet = load_workbook(tmp_path / "customers.xlsx").active
-    assert sheet.max_row == 1 + 4 and sheet.sheet_view.rightToLeft
+    assert sheet.max_row == 1 + len(listed) and sheet.sheet_view.rightToLeft
 
-    reports_page = ReportsPage(_user(shop["owner"]))
-    assert reports_page.export_everything_to(str(tmp_path / "all.xlsx"))
+    with session_scope() as session:
+        reports.export_full_workbook(session, tmp_path / "all.xlsx", owner_user_id=shop["owner"])
     workbook = load_workbook(tmp_path / "all.xlsx")
     assert workbook.sheetnames == ["الزبائن", "المبيعات", "الأقساط", "الدفعات", "أنواع الزبائن", "المخزون"]
     assert workbook["الزبائن"].max_row == 1 + 5
@@ -326,7 +341,6 @@ def test_every_excel_export_opens_with_the_expected_data(shop, tmp_path, monkeyp
 
     with session_scope() as session, pytest.raises(auth.AuthorizationError):
         reports.export_full_workbook(session, tmp_path / "nope.xlsx", owner_user_id=shop["seller"])
-    assert ReportsPage(_user(shop["seller"])).full_export_card.isHidden()
 
 
 # 9. Backups -----------------------------------------------------------------------------------

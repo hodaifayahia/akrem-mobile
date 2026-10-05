@@ -15,6 +15,7 @@ Only the owner manages the debt book.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 import re
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.db.models import Debt, DebtParty, DebtPayment
 from app.services import auth, calc
 from app.services.customers import normalize_phone, normalize_search_text
+from app.services.schedule import DEFAULT_DUE_MODE
 from app.services.settings import get_grace_days, get_value
 from app.services.spreadsheet import western_digits
 
@@ -188,6 +190,17 @@ def delete_debt(session: Session, owner_user_id: int, debt_id: int) -> None:
     session.flush()
 
 
+def delete_debts(session: Session, owner_user_id: int, debt_ids: Iterable[int]) -> int:
+    """Remove several debts with their payments; returns how many were removed."""
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(debt_id) for debt_id in debt_ids))
+    rows = session.scalars(select(Debt).where(Debt.id.in_(unique_ids))).all() if unique_ids else []
+    for debt in rows:
+        session.delete(debt)
+    session.flush()
+    return len(rows)
+
+
 def record_payment(
     session: Session,
     owner_user_id: int,
@@ -230,7 +243,7 @@ def delete_payment(session: Session, owner_user_id: int, payment_id: int) -> Non
 
 
 # ------------------------------------------------------------------ queries
-def schedule(debt: Debt, *, due_mode: str = "first_of_month") -> list[ScheduleRow]:
+def schedule(debt: Debt, *, due_mode: str = DEFAULT_DUE_MODE) -> list[ScheduleRow]:
     """Expected repayments, each with how much the payments cover (oldest first)."""
     if debt.plan == PLAN_INSTALLMENTS and debt.months:
         offsets = calc.payment_offsets(debt.months, debt.payment_interval or 1)
@@ -258,7 +271,7 @@ def paid_amount(debt: Debt) -> int:
     return sum(payment.amount for payment in debt.payments)
 
 
-def summarize(debt: Debt, today: date, *, grace_days: int = 5, due_mode: str = "first_of_month") -> DebtSummary:
+def summarize(debt: Debt, today: date, *, grace_days: int = 5, due_mode: str = DEFAULT_DUE_MODE) -> DebtSummary:
     """A debt's totals, next repayment and status as of ``today``.
 
     Overdue: something that fell due (plus the grace days) is still unpaid.
@@ -385,8 +398,8 @@ def _get(session: Session, debt_id: int) -> Debt:
 
 
 def _settings(session: Session) -> tuple[int, str]:
-    due_mode = get_value(session, "due_mode", "first_of_month")
-    return get_grace_days(session), due_mode if due_mode in ("first_of_month", "purchase_day") else "first_of_month"
+    due_mode = get_value(session, "due_mode", DEFAULT_DUE_MODE)
+    return get_grace_days(session), due_mode if due_mode in ("first_of_month", "purchase_day") else DEFAULT_DUE_MODE
 
 
 def clean_person(person: PersonDetails) -> dict[str, Any]:

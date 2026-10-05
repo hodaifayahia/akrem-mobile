@@ -574,6 +574,21 @@ QTableView::item:hover, QListView::item:hover {
     background-color: @surface-2;
 }
 
+/* Customer history: a purchase row with its transactions under it. */
+QTreeView::item {
+    padding: 5px 8px;
+    border: none;
+}
+
+QTreeView::item:selected {
+    background-color: @primary-soft;
+    color: @text;
+}
+
+QTreeView::item:hover {
+    background-color: @surface-2;
+}
+
 QHeaderView {
     background-color: transparent;
 }
@@ -648,6 +663,12 @@ QCheckBox::indicator:checked, QRadioButton::indicator:checked {
     background-color: @primary;
 }
 
+/* "Select all" when only some rows are ticked. */
+QCheckBox::indicator:indeterminate {
+    border-color: @primary-glow;
+    background-color: @primary-soft;
+}
+
 /* ------------------------------------------------------------ 10. Scrollbars */
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
@@ -718,6 +739,37 @@ QCalendarWidget QAbstractItemView:enabled {
     color: @text;
     selection-background-color: @primary;
     selection-color: #FFFFFF;
+}
+
+/* The day grid is a QTableView: undo the padded, rounded table style of
+   section 7, which made the cells too big for the popup and garbled it. */
+QCalendarWidget QTableView {
+    border: none;
+    border-radius: 0;
+    outline: 0;
+    padding: 0;
+}
+
+QCalendarWidget QTableView::item {
+    padding: 0;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+}
+
+QCalendarWidget QTableView::item:hover { background-color: @surface-2; }
+
+QCalendarWidget QTableView::item:selected {
+    background-color: @primary;
+    color: #FFFFFF;
+}
+
+QCalendarWidget QTableView::item:disabled { color: @text-disabled; }
+
+QCalendarWidget QSpinBox {
+    min-height: 0;
+    padding: 0 4px;
+    border-radius: 4px;
 }
 
 QCalendarWidget QWidget#qt_calendar_navigationbar {

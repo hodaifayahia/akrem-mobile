@@ -131,6 +131,56 @@ def test_payments_are_newest_first_with_sale_details(memory_engine: Engine) -> N
         assert first.sale_id == history.purchases[1].sale_id
 
 
+def test_each_purchase_lists_every_transaction_with_a_running_balance(memory_engine: Engine) -> None:
+    """A purchase's transactions are oldest first and add up to what it has been paid."""
+    with session_scope(memory_engine) as session:
+        customer = _mixed_customer(session)
+        history = customers.customer_history(session, customer.id, today=TODAY)
+        credit, installment, cash = history.purchases
+
+        assert [(tx.kind, tx.amount, tx.remaining_after) for tx in cash.transactions] == [
+            ("full_payment", 3_000, 0),
+        ]
+        assert [
+            (tx.kind, tx.transaction_date, tx.amount, tx.installment_index, tx.remaining_after)
+            for tx in installment.transactions
+        ] == [
+            ("down_payment", date(2026, 6, 5), 5_000, None, 35_500),
+            ("payment", date(2026, 7, 2), 8_875, 1, 26_625),
+            ("payment", date(2026, 8, 3), 4_000, 2, 22_625),
+        ]
+        assert installment.transactions[2].method == "BaridiMob"
+        assert installment.transactions[2].note == "دفعة جزئية"
+        assert [(tx.kind, tx.amount) for tx in credit.transactions] == [
+            ("down_payment", 2_000), ("payment", 5_000), ("payment", 3_000),
+        ]
+        for purchase in history.purchases:
+            assert sum(tx.amount for tx in purchase.transactions) == purchase.paid
+            assert purchase.transactions[-1].remaining_after == purchase.remaining
+
+
+def test_an_amount_marked_paid_without_payment_rows_is_an_earlier_transaction(memory_engine: Engine) -> None:
+    """Imported installments marked paid still show what was received."""
+    with session_scope(memory_engine) as session:
+        category = _category(session)
+        customer = customers.create_customer(session, full_name="مستورد", category_id=category.id)
+        sale = sales.create_sale(
+            session, customer_id=customer.id, product="هاتف", sale_type="installment",
+            wholesale_price=10_000, cash_price=12_000, rate=0, months=2, purchase_date=date(2026, 5, 1),
+        )
+        first = min(sale.installments, key=lambda row: row.installment_index)
+        first.amount_paid = first.amount_due
+        first.paid_date = date(2026, 6, 1)
+        session.flush()
+
+        (purchase,) = customers.customer_history(session, customer.id, today=TODAY).purchases
+
+        assert [(tx.kind, tx.transaction_date, tx.amount, tx.installment_index) for tx in purchase.transactions] == [
+            ("earlier", date(2026, 6, 1), 6_000, 1),
+        ]
+        assert purchase.transactions[0].remaining_after == 6_000
+
+
 def test_grace_days_setting_changes_overdue_count(memory_engine: Engine) -> None:
     """The configured grace period decides which unpaid months are overdue."""
     with session_scope(memory_engine) as session:
@@ -270,7 +320,8 @@ def test_owner_creates_customer_with_installment_sale(memory_engine: Engine) -> 
 
 
 def test_seller_gets_catalog_prices(memory_engine: Engine) -> None:
-    """Sellers cannot set their own prices; non-catalog products are refused."""
+    """Sellers sell catalog products at the catalog price (a blank price) and their wholesale
+    price always comes from the catalog; a big discount needs the owner; unknown products are refused."""
     with session_scope(memory_engine) as session:
         owner, seller = _owner_and_seller(session)
         category = _category(session)
@@ -285,11 +336,18 @@ def test_seller_gets_catalog_prices(memory_engine: Engine) -> None:
                 "product": "Galaxy A15",
                 "sale_type": "cash",
                 "wholesale_price": 1,
-                "cash_price": 2,
+                "cash_price": 0,
                 "purchase_date": date(2026, 10, 1),
             },
         )
         assert (sale.wholesale_price, sale.cash_price, sale.total) == (20_000, 25_000, 25_000)
+        with pytest.raises(sales.DiscountApprovalRequired):
+            sales.create_customer_with_sale(
+                session, seller.id,
+                customer={"full_name": "تخفيض كبير", "category_id": category.id},
+                sale={"product": "Galaxy A15", "sale_type": "cash", "wholesale_price": 1, "cash_price": 2,
+                      "purchase_date": date(2026, 10, 1)},
+            )
 
         before = _customer_count(session)
         with pytest.raises(auth.AuthorizationError, match="catalog"):

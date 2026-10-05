@@ -152,6 +152,18 @@ def authenticate(
     return LoginResult("invalid_credentials")
 
 
+def approve_as_owner(session: Session, *, username: str, password: str) -> User | None:
+    """The owner account approving something at the counter (e.g. a seller's bigger discount), or None.
+
+    Wrong passwords count toward the same lockout as signing in, so the
+    approval box cannot be used to guess the owner's password.
+    """
+    result = authenticate(session, username=username, password=password)
+    if result.status != "success" or result.user is None or result.user.role != "owner":
+        return None
+    return result.user
+
+
 def _record_failed_attempt(user: User, current_time: datetime) -> bool:
     """Count one failed password or code attempt; return True when it starts a lockout."""
     user.failed_attempts += 1

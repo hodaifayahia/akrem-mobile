@@ -86,6 +86,10 @@ def check_window(app: QApplication, window, report: SelfTestReport) -> None:
     for index, button in enumerate(window.sidebar.buttons):
         if button is None or not button.isVisible():
             continue
+        # On a short window the page list scrolls: bring the button into view
+        # first, as a user would.
+        window.sidebar.nav_scroll.ensureWidgetVisible(button)
+        settle(app, 3)
         if not reaches(window, button):
             target = click_target(window, button)
             report.failed(
@@ -115,14 +119,13 @@ def run_self_test(report_path: str | None = None) -> int:
     import os
     import tempfile
 
-    from PySide6.QtCore import QSettings
+    from app.ui.preferences import use_settings_folder
 
     report = SelfTestReport()
     with tempfile.TemporaryDirectory(prefix="akremmobile-selftest-") as folder:
         os.environ["AKREMMOBILE_DATA_DIR"] = str(Path(folder) / "data")
         os.environ.pop("AKREMMOBILE_DATABASE_URL", None)
-        QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(Path(folder) / "settings"))
-        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(Path(folder) / "settings"))
+        use_settings_folder(str(Path(folder) / "settings"))
         app = QApplication.instance() or QApplication([])
         window = None
         try:

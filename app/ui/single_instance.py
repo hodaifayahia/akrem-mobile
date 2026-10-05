@@ -103,6 +103,14 @@ class SingleInstance(QObject):
             return False
         return True
 
+    def is_running(self) -> bool:
+        """Whether a copy is already listening, without asking it to do anything."""
+        socket = QLocalSocket()
+        socket.connectToServer(self.name)
+        running = socket.waitForConnected(_TIMEOUT_MS)
+        socket.abort()
+        return running
+
     def request_quit(self) -> bool:
         """Ask a running copy to quit; ``True`` if one was running."""
         return self._send(_QUIT, expect_reply=False) is not None

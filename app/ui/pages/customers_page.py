@@ -1,4 +1,10 @@
-"""Customer directory: client-type chips, status and search filters, owner actions."""
+"""Customer directory: client-type chips, status and search filters, owner actions.
+
+Every sale is its own row, except products bought together in one basket,
+which share a row (a client who bought three phones on three visits shows
+three rows); a client without sales shows one row. Ticking a row selects the
+client, so delete and "assign type" act on clients.
+"""
 
 from __future__ import annotations
 
@@ -6,22 +12,18 @@ import logging
 from datetime import date
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QDate, QRectF, QSortFilterProxyModel, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIntValidator, QPainter
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
-    QFileDialog,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QTableView,
     QVBoxLayout,
@@ -34,21 +36,22 @@ from PySide6.QtWidgets import (
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.db.models import Category, User
+from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.config import data_dir
-from app.services import auth, categories, customers, products, reports, sales
-from app.services.settings import get_rate_presets
+from app.i18n.stock_text import ltr_text
+from app.services import auth, backup, categories, customers
 from app.services.categories import ClientType, ClientTypeError
 from app.services.customers import CustomerSummary, DuplicateCustomerPhoneError
 from app.services.status import Status
 from app.ui import icons
 from app.ui.theme import qcolor
 from app.ui.dialogs.client_types_dialog import AssignTypeDialog, error_text
+from app.ui.dialogs.customer_form_dialog import CustomerFormDialog
 from app.ui.events import events
+from app.ui.widgets import row_selection
 from app.ui.widgets.client_types import TypeFilterBar, TypeTagDelegate
-from app.ui.widgets.purchase_form import FirstPurchaseSection
+from app.ui.widgets.row_selection import SelectionBar
 
 _STATUS_COLORS = {
     Status.PAID: "#22C55E",
@@ -90,7 +93,7 @@ def _headers() -> tuple[str, ...]:
 
 
 class _CustomerTableModel(QAbstractTableModel):
-    """Read-only model containing exactly one service summary per customer."""
+    """Read-only model: one service summary per sale (or per client without sales)."""
 
     SUMMARY_ROLE = Qt.ItemDataRole.UserRole + 1
     TYPE_COLOR_ROLE = Qt.ItemDataRole.UserRole + 2
@@ -134,6 +137,8 @@ class _CustomerTableModel(QAbstractTableModel):
                 return _status_tooltips()[summary.status]
             if column == 1:
                 return ar.CUST_NAME_TOOLTIP.format(name=summary.full_name)
+            if column == 3:
+                return "\n".join(ltr_text(product) for product in summary.products)
             return self.data(index, Qt.ItemDataRole.DisplayRole)
         if role == Qt.ItemDataRole.UserRole:
             return self._sort_value(summary, column)
@@ -148,7 +153,8 @@ class _CustomerTableModel(QAbstractTableModel):
         if column == 2:
             return summary.phone or ""
         if column == 3:
-            return ", ".join(summary.products)
+            # Products bought together share the row (the tooltip lists one per line).
+            return " + ".join(ltr_text(product) for product in summary.products)
         if column == 4:
             return self._date_text(summary.purchase_date)
         if column == 5:
@@ -283,152 +289,11 @@ class _StatusDotDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class _CustomerFormDialog(QDialog):
-    """Add/edit customer profile details without performing database work."""
-
-    def __init__(
-        self,
-        category_rows: list[tuple[Category, int]],
-        customer: CustomerSummary | None,
-        parent: QWidget,
-        *,
-        purchase: FirstPurchaseSection | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(ar.CUST_ADD if customer is None else ar.CUST_EDIT)
-        self.setMinimumWidth(520 if purchase is None else 980)
-        self.purchase = purchase
-        self.customer = customer.customer if customer is not None else None
-
-        self.full_name = QLineEdit(self)
-        self.phone = QLineEdit(self)
-        self.phone.setMaxLength(20)
-        self.phone.setPlaceholderText("05xxxxxxxx")
-        self.category = QComboBox(self)
-        for category, count in category_rows:
-            self.category.addItem(f"{category.name} ({count})", category.id)
-
-        self.id_number = QLineEdit(self)
-        self.issue_date_enabled = QCheckBox(ar.CUST_ID_ISSUE_DATE, self)
-        self.issue_date = QDateEdit(self)
-        self.issue_date.setCalendarPopup(True)
-        self.issue_date.setDisplayFormat("dd/MM/yyyy")
-        self.issue_date.setDate(QDate.currentDate())
-        self.issue_date.setEnabled(False)
-        self.issue_date_enabled.toggled.connect(self.issue_date.setEnabled)
-        self.issue_place = QLineEdit(self)
-        self.address = QLineEdit(self)
-        self.profession = QLineEdit(self)
-        self.ccp_number = QLineEdit(self)
-        self.cheques_enabled = QCheckBox(ar.CUST_CHEQUES_COUNT, self)
-        self.cheques_count = QLineEdit(self)
-        self.cheques_count.setValidator(QIntValidator(0, 2_000_000_000, self))
-        self.cheques_count.setEnabled(False)
-        self.cheques_enabled.toggled.connect(self.cheques_count.setEnabled)
-        self.notes = QPlainTextEdit(self)
-        self.notes.setMaximumHeight(100)
-
-        form = QFormLayout()
-        form.addRow(ar.CUST_COL_NAME, self.full_name)
-        form.addRow(ar.CUST_COL_PHONE, self.phone)
-        form.addRow(ar.CUST_COL_CATEGORY, self.category)
-        form.addRow(ar.CUST_ID_NUMBER, self.id_number)
-        issue_date_row = QWidget(self)
-        issue_date_layout = QHBoxLayout(issue_date_row)
-        issue_date_layout.setContentsMargins(0, 0, 0, 0)
-        issue_date_layout.addWidget(self.issue_date_enabled)
-        issue_date_layout.addWidget(self.issue_date, 1)
-        form.addRow("", issue_date_row)
-        form.addRow(ar.CUST_ID_ISSUE_PLACE, self.issue_place)
-        form.addRow(ar.CUST_ADDRESS, self.address)
-        form.addRow(ar.CUST_PROFESSION, self.profession)
-        form.addRow(ar.CUST_CCP_NUMBER, self.ccp_number)
-        cheque_row = QWidget(self)
-        cheque_layout = QHBoxLayout(cheque_row)
-        cheque_layout.setContentsMargins(0, 0, 0, 0)
-        cheque_layout.addWidget(self.cheques_enabled)
-        cheque_layout.addWidget(self.cheques_count, 1)
-        form.addRow("", cheque_row)
-        form.addRow(ar.CUST_NOTES, self.notes)
-
-        buttons = QHBoxLayout()
-        self.cancel_button = QPushButton(ar.CUST_CANCEL, self)
-        self.cancel_button.setProperty("variant", "secondary")
-        self.save_button = QPushButton(ar.CUST_SAVE, self)
-        self.cancel_button.clicked.connect(self.reject)
-        self.save_button.clicked.connect(self.accept)
-        buttons.addStretch(1)
-        buttons.addWidget(self.cancel_button)
-        buttons.addWidget(self.save_button)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 18)
-        if purchase is None:
-            layout.addLayout(form)
-        else:
-            columns = QHBoxLayout()
-            columns.setSpacing(20)
-            columns.addLayout(form, 1)
-            purchase.setParent(self)
-            columns.addWidget(purchase, 1)
-            layout.addLayout(columns)
-        layout.addLayout(buttons)
-        self._load_customer()
-
-    def values(self) -> dict[str, object]:
-        """Return validated-shape form values; service validation remains authoritative."""
-        cheque_text = self.cheques_count.text().strip()
-        return {
-            "full_name": self.full_name.text(),
-            "phone": self.phone.text(),
-            "category_id": self.category.currentData(),
-            "id_number": self._optional_text(self.id_number.text()),
-            "id_issue_date": (
-                self.issue_date.date().toPython() if self.issue_date_enabled.isChecked() else None
-            ),
-            "id_issue_place": self._optional_text(self.issue_place.text()),
-            "address": self._optional_text(self.address.text()),
-            "profession": self._optional_text(self.profession.text()),
-            "ccp_number": self._optional_text(self.ccp_number.text()),
-            "cheques_count": int(cheque_text) if self.cheques_enabled.isChecked() and cheque_text else None,
-            "notes": self._optional_text(self.notes.toPlainText()),
-        }
-
-    def _load_customer(self) -> None:
-        """Populate the form when editing an existing row."""
-        if self.customer is None:
-            return
-        customer = self.customer
-        self.full_name.setText(customer.full_name)
-        self.phone.setText(customer.phone or "")
-        category_index = self.category.findData(customer.category_id)
-        if category_index >= 0:
-            self.category.setCurrentIndex(category_index)
-        self.id_number.setText(customer.id_number or "")
-        if customer.id_issue_date is not None:
-            self.issue_date_enabled.setChecked(True)
-            self.issue_date.setDate(QDate(customer.id_issue_date.year, customer.id_issue_date.month,
-                                          customer.id_issue_date.day))
-        self.issue_place.setText(customer.id_issue_place or "")
-        self.address.setText(customer.address or "")
-        self.profession.setText(customer.profession or "")
-        self.ccp_number.setText(customer.ccp_number or "")
-        if customer.cheques_count is not None:
-            self.cheques_enabled.setChecked(True)
-            self.cheques_count.setText(str(customer.cheques_count))
-        self.notes.setPlainText(customer.notes or "")
-
-    @staticmethod
-    def _optional_text(value: str) -> str | None:
-        return value.strip() or None
-
-
-
-
 class CustomersPage(QWidget):
     """Search and manage customers, with service-owned queries and mutations."""
 
     customer_selected = Signal(int)
+    sale_selected = Signal(int, int)  # customer id, sale id: open the client on that sale
     manage_types_requested = Signal()
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
@@ -464,16 +329,10 @@ class CustomersPage(QWidget):
         heading.setObjectName("pageTitle")
         self.count_label = QLabel(self)
         self.count_label.setObjectName("pageSubtitle")
+        self.count_label.setWordWrap(True)
         titles.addWidget(heading)
         titles.addWidget(self.count_label)
         title_row.addLayout(titles, 1)
-
-        self.export_button = QPushButton(ar.CUST_EXPORT, self)
-        self.export_button.setProperty("variant", "secondary")
-        self.export_button.setIcon(icons.icon("import", "text", 16))
-        self.export_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.export_button.clicked.connect(self._export_list)
-        title_row.addWidget(self.export_button)
 
         self.assign_type_button = QPushButton(ar.CT_ASSIGN, self)
         self.assign_type_button.setProperty("variant", "secondary")
@@ -588,6 +447,28 @@ class CustomersPage(QWidget):
             self.deduction_filter.addItem(label, value)
         self.deduction_filter.currentIndexChanged.connect(self.refresh)
         date_row.addWidget(self.deduction_filter)
+        date_row.addSpacing(16)
+        # One-click sale-type filter (كاش / بالتقسيط / كريدي), kept in step
+        # with the "payment" drop-down above.
+        kind_label = QLabel(ar.CUST_KIND_FILTER, self)
+        kind_label.setObjectName("sectionHint")
+        date_row.addWidget(kind_label)
+        self.kind_chips: dict[str | None, QPushButton] = {}
+        for label, value in (
+            (ar.CUST_PAY_ALL, None),
+            (ar.SALE_CASH, "cash"),
+            (ar.SALE_INSTALLMENT, "installment"),
+            (ar.SALE_CREDIT, "credit"),
+        ):
+            chip = QPushButton(label, self)
+            chip.setProperty("chip", True)
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(lambda _checked=False, kind=value: self.set_payment_filter(kind))
+            self.kind_chips[value] = chip
+            date_row.addWidget(chip)
+        self.payment_filter.currentIndexChanged.connect(self._sync_kind_chips)
+        self._sync_kind_chips()
         date_row.addStretch(1)
         layout.addLayout(date_row)
 
@@ -634,7 +515,9 @@ class CustomersPage(QWidget):
         header.setMinimumSectionSize(48)
         header.setSectionResizeMode(0, header.ResizeMode.Fixed)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
-        for column, width in {0: 52, 2: 108, 3: 120, 4: 92, 5: 100, 6: 122, 7: 100, 8: 108, 9: 112}.items():
+        # A basket row lists several products, so this column shares the spare width with the name.
+        header.setSectionResizeMode(3, header.ResizeMode.Stretch)
+        for column, width in {0: 52, 2: 108, 4: 92, 5: 100, 6: 122, 7: 140, 8: 108, 9: 112}.items():
             self.table.setColumnWidth(column, width)
         self.table.setItemDelegateForColumn(0, _StatusDotDelegate(self.table))
         self.table.setItemDelegateForColumn(
@@ -647,6 +530,18 @@ class CustomersPage(QWidget):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._customer_context_menu)
         layout.addWidget(self.table, 1)
+
+        # Owner: a checkbox per row, "select all" and "delete selected" at the
+        # start of the status legend strip; the click hint becomes its tooltip.
+        self.selection: SelectionBar | None = None
+        if self._is_owner:
+            self.selection = SelectionBar(self.table, self._key_at, legend_bar)
+            self.selection.delete_requested.connect(self._delete_selected)
+            self.selection.changed.connect(self._selection_changed)
+            legend.insertWidget(0, self.selection, 0, Qt.AlignmentFlag.AlignVCenter)
+            legend.insertSpacing(1, 16)
+            hint.hide()
+            legend_bar.setToolTip(ar.CUST_CLICK_HINT)
 
         self.empty_card = QFrame(self)
         self.empty_card.setObjectName("emptyStateCard")
@@ -700,6 +595,7 @@ class CustomersPage(QWidget):
                     balance=self.balance_filter.currentData(),
                     purchased=self.purchased_filter.currentData(),
                     deduction=self.deduction_filter.currentData(),
+                    per_sale=True,
                 )
         except (ValueError, RuntimeError, SQLAlchemyError):
             # Refreshes run in response to events; a modal box here could
@@ -713,14 +609,17 @@ class CustomersPage(QWidget):
         self._model.replace_rows(summaries)
         header = self.table.horizontalHeader()
         self.table.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
-        self.count_label.setText(ar.CUST_SUMMARY.format(
-            count=len(summaries),
+        self.count_label.setText(ar.CUST_SUMMARY_SALES.format(
+            sales=sum(len(item.sales) for item in summaries if item.sale_id is not None),
+            count=len({item.id for item in summaries}),
             monthly=_CustomerTableModel._money_text(sum(item.monthly_amount for item in summaries)),
             remaining=_CustomerTableModel._money_text(sum(item.remaining_balance for item in summaries)),
         ))
         is_empty = len(summaries) == 0
         self.empty_card.setVisible(is_empty)
         self.table.setVisible(not is_empty)
+        if self.selection is not None:
+            self.selection.refresh()
         self._selection_changed()
 
     def set_status_filter(self, status: Status | str | None) -> None:
@@ -738,6 +637,13 @@ class CustomersPage(QWidget):
         index = self.payment_filter.findData(kind) if kind else 0
         if index >= 0:
             self.payment_filter.setCurrentIndex(index)
+        self._sync_kind_chips()
+
+    def _sync_kind_chips(self, *_args: object) -> None:
+        """Check the sale-type chip that matches the payment drop-down."""
+        current = self.payment_filter.currentData()
+        for kind, chip in self.kind_chips.items():
+            chip.setChecked(kind == current)
 
     def visible_summaries(self) -> list[CustomerSummary]:
         """Return the rows in their on-screen (sorted) order."""
@@ -746,28 +652,12 @@ class CustomersPage(QWidget):
             if (summary := self._summary_from_proxy_row(row)) is not None
         ]
 
-    def _export_list(self) -> None:
-        """Save the customers currently listed (with all filters) as an Excel file."""
-        default = str(data_dir() / "exports" / ar.CUST_EXPORT_FILENAME)
-        selected, _filter = QFileDialog.getSaveFileName(
-            self, ar.CUST_EXPORT_TITLE, default, ar.IMP_TEMPLATE_FILTER
-        )
-        if not selected:
-            return
-        self.export_to(selected)
-
-    def export_to(self, destination: str) -> bool:
-        """Write the visible list to ``destination``; returns success."""
-        rows = self.visible_summaries()
-        path = destination if destination.casefold().endswith(".xlsx") else destination + ".xlsx"
-        try:
-            reports.export_customers_xlsx(rows, path)
-        except OSError:
-            _LOG.exception("Customer export failed")
-            self._show_error(ar.CUST_EXPORT_ERROR)
-            return False
-        events.notify.emit("success", ar.CUST_EXPORT_TITLE, ar.CUST_EXPORT_DONE.format(count=len(rows)), 4000)
-        return True
+    def checked_summaries(self) -> list[CustomerSummary]:
+        """The rows ticked with their checkbox, in on-screen order."""
+        if self.selection is None:
+            return []
+        wanted = set(self.selection.checked_keys())
+        return _one_per_client(summary for summary in self.visible_summaries() if summary.id in wanted)
 
     def edit_customer_by_id(self, customer_id: int) -> None:
         """Open the owner edit form for a customer from another screen."""
@@ -798,9 +688,18 @@ class CustomersPage(QWidget):
         self._search_timer.start()
 
     # --------------------------------------------------------------- selection
+    def _key_at(self, proxy_row: int) -> int | None:
+        """The customer id shown on a table row (the row's checkbox key)."""
+        summary = self._summary_from_proxy_row(proxy_row)
+        return summary.id if summary is not None else None
+
     def _selected_summaries(self) -> list[CustomerSummary]:
+        """The ticked customers, or else the highlighted rows."""
+        if self.selection is not None:
+            wanted = set(self.selection.target_keys())
+            return _one_per_client(summary for summary in self.visible_summaries() if summary.id in wanted)
         rows = {index.row() for index in self.table.selectionModel().selectedRows()}
-        return [summary for row in sorted(rows) if (summary := self._summary_from_proxy_row(row))]
+        return _one_per_client(summary for row in sorted(rows) if (summary := self._summary_from_proxy_row(row)))
 
     def _selection_changed(self, *_args: object) -> None:
         count = len(self._selected_summaries())
@@ -819,7 +718,11 @@ class CustomersPage(QWidget):
 
     def _open_row(self, proxy_index: QModelIndex) -> None:
         summary = self._summary_from_proxy_row(proxy_index.row()) if proxy_index.isValid() else None
-        if summary is not None:
+        if summary is None:
+            return
+        if summary.sale_id is not None:
+            self.sale_selected.emit(summary.id, summary.sale_id)
+        else:
             self.customer_selected.emit(summary.id)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt event override
@@ -847,18 +750,23 @@ class CustomersPage(QWidget):
         summary = self._summary_from_proxy_row(proxy_index.row())
         if summary is None:
             return
+        # The ticked/highlighted rows when the clicked row is one of them, else just this row.
+        targets = self._selected_summaries()
+        if summary.id not in {item.id for item in targets}:
+            targets = [summary]
         menu = QMenu(self)
         edit_action = menu.addAction(icons.icon("edit", "text", 16), ar.CUST_EDIT)
         assign_action = menu.addAction(icons.icon("tag", "text", 16), ar.CT_ASSIGN)
         menu.addSeparator()
-        delete_action = menu.addAction(icons.icon("trash", "failed", 16), ar.CUST_DELETE)
+        delete_text = ar.CUST_DELETE if len(targets) == 1 else f"{ar.SEL_DELETE} ({len(targets)})"
+        delete_action = menu.addAction(icons.icon("trash", "failed", 16), delete_text)
         chosen = menu.exec(self.table.viewport().mapToGlobal(position))
         if chosen == edit_action:
             self._edit_customer(summary)
         elif chosen == assign_action:
-            self._assign_type_to_selection()
+            self._assign_type(targets)
         elif chosen == delete_action:
-            self._delete_customer(summary)
+            self._delete_summaries(targets)
 
     # ----------------------------------------------------------- client types
     def _manage_types(self) -> None:
@@ -872,7 +780,9 @@ class CustomersPage(QWidget):
         self.refresh()
 
     def _assign_type_to_selection(self) -> None:
-        selection = self._selected_summaries()
+        self._assign_type(self._selected_summaries())
+
+    def _assign_type(self, selection: list[CustomerSummary]) -> None:
         if not self._is_owner:
             return
         if not selection:
@@ -901,38 +811,28 @@ class CustomersPage(QWidget):
 
     # -------------------------------------------------------------- customers
     def _add_customer(self) -> None:
-        """Open the new-client form (with an optional first purchase) and save it."""
+        """Open the new-client form and save the client (purchases are made on the New sale page)."""
         if not self._category_rows:
             self._show_error(ar.CUST_SAVE_ERROR)
             return
-        dialog = _CustomerFormDialog(
-            self._category_rows, None, self, purchase=self._purchase_section()
-        )
+        dialog = CustomerFormDialog(self._category_rows, None, self)
         preferred = self.type_filter.selected_type_id()
         if preferred is not None:
             dialog.category.setCurrentIndex(max(0, dialog.category.findData(preferred)))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.save_new_customer(dialog.values(), dialog.purchase.sale_values() if dialog.purchase else None)
+        self.save_new_customer(dialog.values())
 
-    def _purchase_section(self) -> FirstPurchaseSection:
-        with session_scope() as session:
-            presets = get_rate_presets(session)
-            catalog = products.catalog_entries(session, presets)
-        return FirstPurchaseSection(catalog, presets, is_owner=self._is_owner)
-
-    def save_new_customer(
-        self, values: dict[str, object], sale_values: dict[str, object] | None
-    ) -> int | None:
-        """Save a new client, plus the chosen purchase in the same transaction."""
+    def save_new_customer(self, values: dict[str, object]) -> int | None:
+        """Save a new client, asking first when the phone number is already used."""
         try:
-            customer_id = self._save_customer(values, sale_values, allow_duplicate_phone=False)
+            customer_id = self._save_customer(values, allow_duplicate_phone=False)
         except DuplicateCustomerPhoneError as error:
             names = ", ".join(customer.full_name for customer in error.matches)
             if not self._confirm(ar.CUST_DUP_PHONE_CONFIRM + "\n" + names, ar.CUST_ADD, ar.CUST_SAVE):
                 return None
             try:
-                customer_id = self._save_customer(values, sale_values, allow_duplicate_phone=True)
+                customer_id = self._save_customer(values, allow_duplicate_phone=True)
             except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
                 self._show_error(ar.CUST_SAVE_ERROR)
                 return None
@@ -944,7 +844,7 @@ class CustomersPage(QWidget):
 
     def _edit_customer(self, summary: CustomerSummary) -> None:
         """Edit customer profile fields through the customer service."""
-        dialog = _CustomerFormDialog(self._category_rows, summary, self)
+        dialog = CustomerFormDialog(self._category_rows, summary, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
@@ -964,14 +864,8 @@ class CustomersPage(QWidget):
             return
         self._emit_customer_change(summary.id)
 
-    def _save_customer(
-        self,
-        values: dict[str, object],
-        sale_values: dict[str, object] | None = None,
-        *,
-        allow_duplicate_phone: bool,
-    ) -> int:
-        """Create a customer (and optionally their first sale) in one transaction."""
+    def _save_customer(self, values: dict[str, object], *, allow_duplicate_phone: bool) -> int:
+        """Create a customer through the customer service."""
         customer_values = {
             "full_name": str(values["full_name"]),
             "category_id": int(values["category_id"]),
@@ -979,18 +873,9 @@ class CustomersPage(QWidget):
         }
         with session_scope() as session:
             self._require_owner(session)
-            if sale_values is not None:
-                customer, _sale = sales.create_customer_with_sale(
-                    session,
-                    self.current_user.id,
-                    customer=customer_values,
-                    sale=sale_values,
-                    allow_duplicate_phone=allow_duplicate_phone,
-                )
-            else:
-                customer = customers.create_customer(
-                    session, allow_duplicate_phone=allow_duplicate_phone, **customer_values
-                )
+            customer = customers.create_customer(
+                session, allow_duplicate_phone=allow_duplicate_phone, **customer_values
+            )
             return customer.id
 
     def _update_customer(
@@ -1007,20 +892,54 @@ class CustomersPage(QWidget):
                 session, customer_id, allow_duplicate_phone=allow_duplicate_phone, **values
             )
 
-    def _delete_customer(self, summary: CustomerSummary) -> None:
-        """Confirm and delete a customer only when the service allows it."""
-        if not self._confirm(
-            ar.CUST_CONFIRM_DELETE + "\n" + summary.full_name, ar.CUST_DELETE, ar.CUST_DELETE
-        ):
+    def _delete_selected(self) -> None:
+        """Delete the ticked customers (or the highlighted ones) after confirmation."""
+        self._delete_summaries(self._selected_summaries())
+
+    def _delete_summaries(self, chosen: list[CustomerSummary]) -> None:
+        """Confirm, then delete; customers with sales need an explicit "with sales" choice."""
+        if not chosen or not self._is_owner:
             return
+        message = ar.CUST_DELETE_MANY_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+            [summary.full_name for summary in chosen]
+        )
+        with_sales = [summary for summary in chosen if summary.sales]
+        if with_sales:
+            choices = [("with_sales", ar.CUST_DELETE_WITH_SALES)]
+            if len(with_sales) < len(chosen):
+                choices.append(("without_sales", ar.CUST_DELETE_WITHOUT_SALES.format(
+                    count=len(chosen) - len(with_sales)
+                )))
+            details = ar.CUST_DELETE_HAS_SALES.format(count=len(with_sales)) + "\n" + ar.SEL_BACKUP_NOTE
+            answer = row_selection.ask_delete(self, ar.CUST_DELETE, message, choices, details=details)
+        else:
+            answer = row_selection.ask_delete(self, ar.CUST_DELETE, message)
+        if answer is None:
+            return
+        self.delete_customers([summary.id for summary in chosen], with_sales=answer == "with_sales")
+
+    def delete_customers(self, customer_ids: list[int], *, with_sales: bool = False) -> bool:
+        """Delete customers; with ``with_sales`` their sales go too (after a safety backup)."""
+        if with_sales:
+            backup.create_safety_backup()
         try:
             with session_scope() as session:
                 self._require_owner(session)
-                customers.delete_customer(session, summary.id)
+                result = customers.delete_customers(
+                    session, self.current_user.id, customer_ids, with_sales=with_sales
+                )
         except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
-            self._show_error(ar.CUST_DELETE_ERROR)
-            return
-        self._emit_customer_change(summary.id)
+            _LOG.exception("Customer delete failed")
+            self._show_error(ar.CUST_DELETE_FAILED)
+            return False
+        if self.selection is not None:
+            self.selection.clear()
+        events.data_changed.emit()
+        message = ar.CUST_DELETED_TOAST.format(count=result.deleted)
+        if result.kept:
+            message += " " + ar.CUST_DELETE_KEPT.format(count=len(result.kept))
+        events.notify.emit("success", ar.CUST_PAGE_TITLE, message, 4000)
+        return True
 
     def _require_owner(self, session: Session) -> None:
         """Enforce current owner status before any write action."""
@@ -1045,3 +964,14 @@ class CustomersPage(QWidget):
     def _show_error(self, message: str) -> None:
         """Display a localized page-level error."""
         QMessageBox.warning(self, ar.ERROR_TITLE, message)
+
+
+def _one_per_client(rows) -> list[CustomerSummary]:
+    """The first row of each client: actions such as delete act on clients, not on sale rows."""
+    seen: set[int] = set()
+    result = []
+    for summary in rows:
+        if summary.id not in seen:
+            seen.add(summary.id)
+            result.append(summary)
+    return result

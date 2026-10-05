@@ -85,16 +85,16 @@ def test_debt_paid_back_by_facility_every_two_months(session: Session, owner_id:
     debt = debts.get_debt(session, debt_id)
     rows = debts.schedule(debt)
     assert [(row.due_date, row.amount) for row in rows] == [
-        (date(2026, 9, 1), 20_000), (date(2026, 11, 1), 20_000), (date(2027, 1, 1), 20_000),
+        (date(2026, 9, 10), 20_000), (date(2026, 11, 10), 20_000), (date(2027, 1, 10), 20_000),
     ]
     summary = debts.summarize(debt, TODAY)
-    assert (summary.status, summary.overdue_amount, summary.next_due_date) == (debts.STATUS_OVERDUE, 20_000, date(2026, 9, 1))
+    assert (summary.status, summary.overdue_amount, summary.next_due_date) == (debts.STATUS_OVERDUE, 20_000, date(2026, 9, 10))
 
     debts.record_payment(session, owner_id, debt_id, amount=25_000, payment_date=date(2026, 10, 1))
     summary = debts.summarize(debts.get_debt(session, debt_id), TODAY)
     assert (summary.paid, summary.remaining, summary.overdue_amount) == (25_000, 35_000, 0)
-    assert (summary.next_due_date, summary.next_due_amount, summary.status) == (date(2026, 11, 1), 15_000, debts.STATUS_ON_TRACK)
-    assert debts.summarize(debts.get_debt(session, debt_id), date(2026, 10, 28)).status == debts.STATUS_DUE_SOON
+    assert (summary.next_due_date, summary.next_due_amount, summary.status) == (date(2026, 11, 10), 15_000, debts.STATUS_ON_TRACK)
+    assert debts.summarize(debts.get_debt(session, debt_id), date(2026, 11, 5)).status == debts.STATUS_DUE_SOON
 
     with pytest.raises(DebtError) as overpaid:
         debts.record_payment(session, owner_id, debt_id, amount=40_000, payment_date=TODAY)

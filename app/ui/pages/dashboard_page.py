@@ -224,16 +224,20 @@ class DashboardPage(QWidget):
         hero_row.setSpacing(24)
         net_box = QVBoxLayout()
         net_box.setSpacing(2)
-        net_caption = QLabel(ar.DASH_NET_TITLE, hero)
-        net_caption.setObjectName("kpiTitle")
+        net_caption = QLabel(ar.NET_MONEY_TITLE, hero)
+        net_caption.setObjectName("sectionTitle")
         self.net_value = QLabel("—", hero)
         self.net_value.setObjectName("netValue")
-        net_hint = QLabel(ar.DASH_NET_FORMULA, hero)
+        net_hint = QLabel(ar.NET_MONEY_FORMULA, hero)
         net_hint.setObjectName("kpiCaption")
         net_hint.setWordWrap(True)
+        self.with_stock_label = QLabel(hero)
+        self.with_stock_label.setObjectName("kpiCaption")
+        self.with_stock_label.setWordWrap(True)
         net_box.addWidget(net_caption)
         net_box.addWidget(self.net_value)
         net_box.addWidget(net_hint)
+        net_box.addWidget(self.with_stock_label)
         hero_row.addLayout(net_box, 2)
         self.inside_value = self._side_total(hero, hero_row, ar.DASH_INSIDE, "paid")
         self.outside_value = self._side_total(hero, hero_row, ar.DASH_OUTSIDE, "failed")
@@ -280,13 +284,19 @@ class DashboardPage(QWidget):
         return value
 
     def _apply_position(self, position: FinancialPosition) -> None:
-        """Fill the net position section."""
-        net = position.net
+        """Fill the net position section: "my net money" first, the stock beside it."""
+        net = position.net_money
         self.net_value.setText(f"{net:,} {ar.CURRENCY_SUFFIX}")
         self.net_value.setStyleSheet(f"color: {qcolor('paid' if net >= 0 else 'failed').name()};")
-        self.inside_value.setText(f"{position.money_inside + position.stock_value:,} {ar.CURRENCY_SUFFIX}")
+        self.with_stock_label.setText(ar.NET_MONEY_WITH_STOCK.format(
+            stock=_money(position.stock_value), units=position.stock_units, total=_money(position.net),
+        ))
+        self.inside_value.setText(f"{position.money_inside:,} {ar.CURRENCY_SUFFIX}")
         self.outside_value.setText(f"{position.shop_owes:,} {ar.CURRENCY_SUFFIX}")
         self.clients_owe_card.set_value(position.clients_owe, currency=True)
+        self.clients_owe_card.set_subtitle(ar.NET_MONEY_CLIENTS_SPLIT.format(
+            installments=_money(position.installments_owe), credit=_money(position.credit_owe),
+        ))
         self.debtors_owe_card.set_value(position.debtors_owe, currency=True)
         self.debtors_owe_card.set_subtitle(ar.DASH_OVERDUE_CAPTION.format(amount=_money(position.debtors_overdue)))
         self.stock_value_card.set_value(position.stock_value, currency=True)

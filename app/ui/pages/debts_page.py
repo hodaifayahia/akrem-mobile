@@ -43,12 +43,15 @@ from app.db.session import session_scope
 from app.i18n import ar
 from app.i18n.plan_text import plan_summary
 from app.services import auth, calc, debts
+from app.services.schedule import DEFAULT_DUE_MODE
 from app.services.debts import DebtError, DebtSummary, DebtTerms, PersonDetails
 from app.services.settings import get_grace_days, get_value
 from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
 from app.ui.theme import qcolor, repolish
+from app.ui.widgets import row_selection
+from app.ui.widgets.row_selection import SelectionBar
 
 _LOG = logging.getLogger(__name__)
 _STATUS_TONES = {
@@ -339,7 +342,7 @@ class DebtDetailsDialog(QDialog):
         """Re-read the debt and fill both tables."""
         with session_scope() as session:
             debt = debts.get_debt(session, self.debt_id)
-            due_mode = get_value(session, "due_mode", "first_of_month")
+            due_mode = get_value(session, "due_mode", DEFAULT_DUE_MODE)
             summary = debts.summarize(debt, date.today(), grace_days=get_grace_days(session), due_mode=due_mode)
             rows = debts.schedule(debt, due_mode=due_mode)
             payments = [(p.id, p.payment_date, p.amount, p.method, p.note) for p in debt.payments]
@@ -420,15 +423,13 @@ class DebtsPage(QWidget):
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
-        self.delete_button = _button(self, ar.DEBT_DELETE, "trash", "secondary")
-        self.delete_button.clicked.connect(self._delete_selected)
         self.edit_button = _button(self, ar.DEBT_EDIT, "edit", "secondary")
         self.edit_button.clicked.connect(self._edit_selected)
         self.pay_button = _button(self, ar.DEBT_RECEIVE if self.receivable else ar.DEBT_PAY, "wallet", "secondary")
         self.pay_button.clicked.connect(self._pay_selected)
         self.add_button = _button(self, ar.DEBT_ADD_IN if self.receivable else ar.DEBT_ADD_OUT, "plus", None)
         self.add_button.clicked.connect(self._add)
-        for button in (self.delete_button, self.edit_button, self.pay_button, self.add_button):
+        for button in (self.edit_button, self.pay_button, self.add_button):
             header.addWidget(button)
         layout.addLayout(header)
 
@@ -485,6 +486,11 @@ class DebtsPage(QWidget):
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.itemSelectionChanged.connect(self._update_actions)
         self.table.itemDoubleClicked.connect(lambda _item: self.open_details())
+        # A checkbox per row, "select all" and "delete selected" next to the filters.
+        self.selection = SelectionBar(self.table, self._key_at, self, delete_text=ar.DEBT_DELETE)
+        self.selection.delete_requested.connect(self._delete_selected)
+        self.delete_button = self.selection.delete_button
+        filters.addWidget(self.selection)
         layout.addWidget(self.table, 1)
 
         self.empty_card = QFrame(self)
@@ -538,6 +544,7 @@ class DebtsPage(QWidget):
                 self.table.item(row, column).setToolTip(tip)
         self.table.setVisible(bool(rows))
         self.empty_card.setVisible(not rows)
+        self.selection.refresh()
         self._update_actions()
 
     @staticmethod
@@ -567,10 +574,13 @@ class DebtsPage(QWidget):
         row = selection[0].row() if selection else self.table.currentRow()
         return self._rows[row] if 0 <= row < len(self._rows) else None
 
+    def _key_at(self, row: int) -> int | None:
+        """The debt id on a table row (the row's checkbox key)."""
+        return self._rows[row].id if 0 <= row < len(self._rows) else None
+
     def _update_actions(self) -> None:
         summary = self.selected()
         self.edit_button.setEnabled(summary is not None)
-        self.delete_button.setEnabled(summary is not None)
         self.pay_button.setEnabled(summary is not None and summary.remaining > 0)
 
     def new_dialog(self, summary: DebtSummary | None = None) -> DebtDialog:
@@ -666,22 +676,38 @@ class DebtsPage(QWidget):
         return True
 
     def _delete_selected(self) -> None:
-        summary = self.selected()
-        if summary is None:
+        """Delete the ticked debts (or the highlighted one) after confirmation."""
+        wanted = set(self.selection.target_keys())
+        chosen = [summary for summary in self._rows if summary.id in wanted]
+        if not chosen:
             return
-        if QMessageBox.question(self, ar.DEBT_DELETE, ar.DEBT_DELETE_CONFIRM.format(name=summary.full_name)) \
-                != QMessageBox.StandardButton.Yes:
+        if len(chosen) == 1:
+            message = ar.DEBT_DELETE_CONFIRM.format(name=chosen[0].full_name)
+        else:
+            message = ar.DEBT_DELETE_MANY_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+                [summary.full_name for summary in chosen]
+            )
+        if row_selection.ask_delete(self, ar.DEBT_DELETE, message) is None:
             return
-        self.delete_debt(summary.id)
+        self.delete_debts([summary.id for summary in chosen])
 
     def delete_debt(self, debt_id: int) -> bool:
+        """Remove one debt with its payments."""
+        return self.delete_debts([debt_id])
+
+    def delete_debts(self, debt_ids: list[int]) -> bool:
+        """Remove several debts with their payments."""
         try:
             with session_scope() as session:
-                debts.delete_debt(session, self.current_user.id, debt_id)
+                removed = debts.delete_debts(session, self.current_user.id, debt_ids)
         except (DebtError, auth.AuthorizationError, SQLAlchemyError):
+            _LOG.exception("Debt delete failed")
             QMessageBox.warning(self, ar.ERROR_TITLE, ar.ERROR_BODY)
             return False
+        self.selection.clear()
         events.data_changed.emit()
+        events.notify.emit("success", ar.NAV_DEBTS_IN if self.receivable else ar.NAV_DEBTS_OUT,
+                           ar.DEBT_DELETED.format(count=removed), 3000)
         return True
 
     def open_details(self) -> DebtDetailsDialog | None:

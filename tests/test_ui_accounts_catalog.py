@@ -6,7 +6,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QMessageBox
 from sqlalchemy import select
 
@@ -26,7 +25,6 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qapp) -> dict:
     """Migrated file database with an owner, a seller and a small catalog."""
     monkeypatch.setenv("AKREMMOBILE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.delenv("AKREMMOBILE_DATABASE_URL", raising=False)
-    QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(tmp_path / "settings"))
     for name in ("information", "warning", "critical"):
         monkeypatch.setattr(QMessageBox, name, lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
     from app.db.migrate import upgrade_database
@@ -213,43 +211,69 @@ def test_products_page_downloads_template_and_uploads_products(shop, monkeypatch
     assert warnings == [ar.PROD_UPLOAD_NO_HEADER]
 
 
-# ----------------------------------------------------- new client + purchase
-def test_new_client_form_fills_the_catalog_price_and_saves_the_purchase(shop) -> None:
+# ---------------------------------------------------------------- new client
+def test_new_client_form_fits_the_screen_and_has_no_purchase_section(shop, qapp) -> None:
+    from PySide6.QtWidgets import QGroupBox
+
+    from app.ui.dialogs.customer_form_dialog import (
+        SCREEN_HEIGHT_SHARE,
+        SCREEN_WIDTH_SHARE,
+        CustomerFormDialog,
+    )
+    from app.ui.locale import apply_language
     from app.ui.pages.customers_page import CustomersPage
 
+    apply_language("ar")  # the app's stylesheet: real field heights
     page = CustomersPage(_user(shop["owner"]))
-    section = page._purchase_section()
-    assert section.isChecked()
-    section.product.setCurrentIndex(section.product.findData("iPhone 13"))
-    assert section.cash_price.value() == 110000
-    section.sale_type.setCurrentIndex(section.sale_type.findData("installment"))
-    section.months.setValue(6)
-    assert section.rate.value() == 35  # preset for 6 months
-    section.down_payment.setValue(28500)
-    result = section.calculation()
-    assert result is not None and result.total == 148500 and result.monthly_list[0] == 20000
-    assert "20,000" in section.summary.text()
+    dialog = CustomerFormDialog(page._category_rows, None, page)
+    dialog.show()
+    qapp.processEvents()
+    area = dialog.screen().availableGeometry()
+    assert dialog.width() <= area.width() * SCREEN_WIDTH_SHARE
+    assert dialog.height() <= area.height() * SCREEN_HEIGHT_SHARE
+    assert area.contains(dialog.frameGeometry())
+    # Save and Cancel sit below the scrolling fields, so they are always reachable.
+    assert not dialog.scroll.isAncestorOf(dialog.save_button)
+    assert dialog.save_button.isVisible() and dialog.cancel_button.isVisible()
+    # Adding a client only creates the client: purchases are made on the New sale page.
+    assert dialog.findChild(QGroupBox) is None
+    dialog.reject()
 
-    fallback_id = page._types[-1].id
-    values = {"full_name": "زبون جديد", "phone": "0550000001", "category_id": fallback_id}
-    customer_id = page.save_new_customer(values, section.sale_values())
+
+def test_new_sale_add_client_opens_the_form_and_selects_the_new_client(shop, monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from app.ui.dialogs.customer_form_dialog import CustomerFormDialog
+    from app.ui.pages import new_sale_page
+    from app.ui.pages.new_sale_page import NewSalePage
+
+    warnings: list[str] = []
+    monkeypatch.setattr(new_sale_page.QMessageBox, "warning", lambda _p, _t, text: warnings.append(text))
+    page = NewSalePage(current_user=_user(shop["seller"]))  # sellers add clients while selling
+    page.customer_search.setText("لا أحد")  # a search that hides every client
+    attempts: list[str] = []
+
+    def fill_and_save(dialog: CustomerFormDialog) -> QDialog.DialogCode:
+        attempts.append(dialog.full_name.text())
+        if len(attempts) == 1:
+            dialog.phone.setText("0661112233")  # the name is forgotten the first time
+        else:
+            assert dialog.phone.text() == "0661112233"  # the form keeps what was typed
+            dialog.full_name.setText("زبون من البيع")
+            dialog.address.setText("أم الطيور")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(CustomerFormDialog, "exec", fill_and_save)
+    customer_id = page.add_new_customer()
+    assert warnings == [ar.FORM_NAME_REQUIRED] and len(attempts) == 2
     assert customer_id is not None
+    assert page.customer_search.text() == ""
+    assert page.customer_combo.currentData() == customer_id
     with session_scope() as session:
-        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
-        assert (sale.product, sale.sale_type, sale.total, sale.months) == ("iPhone 13", "installment", 148500, 6)
-
-    cash = page._purchase_section()
-    cash.product.setCurrentIndex(cash.product.findData("Redmi 13"))
-    cash.sale_type.setCurrentIndex(cash.sale_type.findData("cash"))
-    cash_id = page.save_new_customer(
-        {"full_name": "زبون كاش", "phone": "", "category_id": fallback_id}, cash.sale_values()
-    )
-    with session_scope() as session:
-        assert session.scalar(select(Sale.sale_type).where(Sale.customer_id == cash_id)) == "cash"
-
-    unchecked = page._purchase_section()
-    unchecked.setChecked(False)
-    assert unchecked.sale_values() is None
+        saved = session.get(Customer, customer_id)
+        assert (saved.full_name, saved.phone, saved.address) == ("زبون من البيع", "0661112233", "أم الطيور")
+    page._continue_to_sale()
+    assert page.steps.currentIndex() == 1 and page._customer_id == customer_id
 
 
 # ------------------------------------------------------------------- history
@@ -280,14 +304,68 @@ def test_clicking_a_client_shows_their_full_history(shop) -> None:
     assert summary.profile.text() == ar.HIST_PROFILE_FACILITIES
 
     panel = dialog.history_panel
-    assert panel.purchases_table.rowCount() == 2
-    assert _plain(panel.purchases_table.item(0, 1).text()) == "Redmi 13"  # newest first
-    assert panel.purchases_table.item(0, 2).text() == ar.SALE_CASH
-    assert panel.payments_table.rowCount() == 1
-    assert panel.payments_table.item(0, 2).text() == "CCP"
+    tree = panel.purchases_tree
+    assert tree.topLevelItemCount() == 2
+    cash, installment = tree.topLevelItem(0), tree.topLevelItem(1)
+    assert _plain(cash.text(1)) == "Redmi 13"  # newest first
+    assert cash.text(2) == ar.SALE_CASH
+    assert [cash.child(0).text(1)] == [ar.HIST_TX_FULL]
+    # Every transaction of the installment sale is listed under it, oldest first.
+    assert [installment.child(row).text(1) for row in range(installment.childCount())] == [
+        ar.HIST_TX_DOWN_PAYMENT, ar.HIST_TX_INSTALLMENT.format(n=1),
+    ]
+    assert installment.child(1).text(2) == "CCP"
+    assert installment.child(1).text(5) == f"{148500 - 28500 - 20000:,} دج"
+    assert installment.isExpanded()
 
     panel.purchase_activated.emit(dialog.sale_selector.itemData(1))
     assert dialog.tabs.currentIndex() == 0
+
+
+# ------------------------------------------------------------- printed forms
+def test_print_forms_page_edits_previews_and_saves_the_texts(shop) -> None:
+    from app.services import print_templates
+    from app.ui.main_window import PAGE_PRINT_FORMS, MainWindow
+
+    window = MainWindow(current_user=_user(shop["owner"]))
+    window._select_page(PAGE_PRINT_FORMS)
+    page = window.print_forms_page
+    assert window.pages.currentWidget() is page
+    assert window.topbar.page_title_label.text() == ar.NAV_PRINT_FORMS
+    assert not page.save_button.isEnabled()  # nothing to save yet
+
+    page.commitment_title.setText("عقد بيع بالتقسيط")
+    clauses = page.commitment_clauses
+    clauses._add()
+    clauses.list.item(clauses.list.count() - 1).setText("بند جديد")
+    assert page.is_dirty() and page.save_button.isEnabled()
+    page.refresh_preview()
+    assert not page.preview_label.pixmap().isNull()
+    page.show_preview("cash_receipt")
+    assert page.preview_kind == "cash_receipt" and page.preview_buttons["cash_receipt"].isChecked()
+
+    assert page.save()
+    assert not page.save_button.isEnabled()
+    with session_scope() as session:
+        saved = print_templates.load(session)
+    assert saved.commitment_title == "عقد بيع بالتقسيط"
+    assert saved.commitment_clauses[-1] == "بند جديد"
+
+    clauses.list.setCurrentRow(clauses.list.count() - 1)
+    clauses._move(-1)
+    assert clauses.lines()[-2] == "بند جديد"
+    clauses._remove()
+    assert "بند جديد" not in clauses.lines()
+    assert page.reset_to_defaults()
+    assert page.commitment_title.text() == ar.PDF_COMMITMENT_TITLE
+    window._quitting = True
+    window.close()
+
+    seller_window = MainWindow(current_user=_user(shop["seller"]))
+    seller_window._select_page(PAGE_PRINT_FORMS)
+    assert seller_window.pages.currentIndex() != PAGE_PRINT_FORMS
+    seller_window._quitting = True
+    seller_window.close()
 
 
 # ------------------------------------------------------------------ settings
@@ -422,42 +500,6 @@ def test_product_dialog_saves_a_default_plan_shown_on_the_products_page(shop) ->
     assert edit.plan().interval == 1
 
 
-def test_new_client_purchase_starts_from_the_product_plan_and_can_differ(shop) -> None:
-    from app.ui.pages.customers_page import CustomersPage
-
-    with session_scope() as session:
-        product = {p.name: p for p in products.list_products(session)}["Redmi 13"]
-        products.update_product(
-            session, shop["owner"], product.id, name="Redmi 13", cash_price=32000,
-            plan=products.ProductPlan(months=4, interval=2, rate=20),
-        )
-    page = CustomersPage(_user(shop["owner"]))
-    section = page._purchase_section()
-    section.product.setCurrentIndex(section.product.findData("Redmi 13"))
-    section.sale_type.setCurrentIndex(section.sale_type.findData("installment"))
-    assert (section.months.value(), section.interval.value(), section.rate.value()) == (4, 2, 20)
-    assert ar.PLAN_EVERY_2 in section.plan_hint.text()
-    assert "19,200" in section.summary.text()  # 38,400 in 2 payments
-
-    # This client pays monthly over 5 months instead (rate follows the preset).
-    section.months.setValue(5)
-    section.interval.setValue(1)
-    assert section.rate.value() == 35
-    values = section.sale_values()
-    assert (values["months"], values["payment_interval"]) == (5, 1)
-
-    section.months.setValue(6)
-    section.interval.setValue(3)
-    fallback_id = page._types[-1].id
-    customer_id = page.save_new_customer(
-        {"full_name": "زبون كل 3 أشهر", "phone": "0550000009", "category_id": fallback_id},
-        section.sale_values(),
-    )
-    with session_scope() as session:
-        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
-        assert (sale.months, sale.payment_interval, len(sale.installments)) == (6, 3, 2)
-
-
 def test_new_sale_page_applies_the_product_plan_and_saves_the_interval(shop, monkeypatch) -> None:
     from app.ui.pages.new_sale_page import NewSalePage
 
@@ -550,10 +592,7 @@ def test_stock_tab_adds_edits_filters_and_removes_phones(shop, monkeypatch) -> N
     assert panel.delete_unit(panel.selected_unit().id)
     assert panel.table.rowCount() == 2
 
-    exported = page.export_stock(Path(shop["tmp"]) / "stock-out")
-    from openpyxl import load_workbook
-
-    assert load_workbook(exported).worksheets[0].max_row == 3
+    assert not hasattr(page, "export_stock")  # no Excel export (owner request 2026-10-03)
 
     seller_page = ProductsPage(_user(shop["seller"]))
     assert seller_page.stock_panel.add_button.isHidden()
@@ -606,29 +645,6 @@ def test_new_sale_page_sells_a_phone_from_stock_with_its_details(shop, monkeypat
         cash_sale = session.scalar(select(Sale).where(Sale.product == "Tablet Modio"))
         assert (cash_sale.color, cash_sale.is_new) == ("Grey", True)
         assert cash_sale.product_id == products.find_by_name(session, "tablet modio").id
-
-
-def test_new_client_form_links_a_typed_product_and_records_phone_details(shop) -> None:
-    from app.ui.pages.customers_page import CustomersPage
-
-    page = CustomersPage(_user(shop["owner"]))
-    section = page._purchase_section()
-    assert section.product.isEditable()
-    section.product.setCurrentText("Honor X9D 12/256")
-    assert section.details.product_state.text() == ar.SALE_PRODUCT_NEW
-    section.sale_type.setCurrentIndex(section.sale_type.findData("cash"))
-    section.cash_price.setValue(82800)
-    section.details.battery.setValue(97)
-    section.details.color.setCurrentText("Black")
-    values = section.sale_values()
-    assert (values["product"], values["battery_health"], values["color"]) == ("Honor X9D 12/256", 97, "Black")
-    customer_id = page.save_new_customer(
-        {"full_name": "زبون هونر", "phone": "0550000555", "category_id": page._types[-1].id}, values
-    )
-    with session_scope() as session:
-        sale = session.scalar(select(Sale).where(Sale.customer_id == customer_id))
-        assert sale.product_id == products.find_by_name(session, "honor x9d 12/256").id
-        assert (sale.battery_health, sale.color) == (97, "Black")
 
 
 def test_clients_page_has_purchase_and_end_of_deduction_filters(shop) -> None:
@@ -736,3 +752,135 @@ def test_dashboard_shows_the_net_financial_position(shop) -> None:
     page.shop_owes_card.clicked.emit()
     assert opened == ["payable"]
     assert not DashboardPage(_user(shop["seller"])).position_box.isVisibleTo(page)
+
+
+# ------------------------------------------------------- payments: one table
+def _overdue_client(owner_id: int, name: str = "زبون الدفعات", phone: str | None = "0550000777") -> int:
+    """A client whose three installments are all well past due."""
+    from datetime import timedelta
+
+    with session_scope() as session:
+        fallback = categories.get_fallback_type(session)
+        customer = customers.create_customer(session, full_name=name, phone=phone, category_id=fallback.id)
+        sales.create_sale_for_user(
+            session, owner_id, customer_id=customer.id, product="iPhone 13", sale_type="installment",
+            wholesale_price=90000, cash_price=110000, rate=0, down_payment=20000, months=3,
+            purchase_date=date.today() - timedelta(days=200),
+        )
+        return customer.id
+
+
+def test_payments_table_filters_collects_reminds_and_exports(shop, monkeypatch, tmp_path) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from app.ui.pages import payments_page
+    from app.ui.pages.payments_page import PaymentDialog, PaymentsPage
+
+    _overdue_client(shop["owner"])
+    page = PaymentsPage(_user(shop["owner"]))
+    rows = page.visible_rows()
+    assert [(row.status, row.number) for row in rows] == [("overdue", 1), ("overdue", 2), ("overdue", 3)]
+    assert page.tiles["overdue"].value.text().startswith("3 ·")
+
+    page.search.setText("لا يوجد")
+    page._apply_filters()
+    assert page.visible_rows() == [] and page.empty_card.isVisibleTo(page)
+    page.reset_filters()
+    assert len(page.visible_rows()) == 3
+
+    opened: list[str] = []
+    monkeypatch.setattr(payments_page.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    page.send_reminder(rows[0])
+    assert opened and opened[0].startswith("https://wa.me/213550000777?text=")
+
+    monkeypatch.setattr(PaymentDialog, "exec", lambda dialog: QDialog.DialogCode.Accepted)
+    page.record_payment(rows[0])  # the dialog's default amount pays it in full
+    assert [row.number for row in page.visible_rows()] == [2, 3]
+    page._tile_clicked("paid")
+    assert [(row.status, row.number) for row in page.visible_rows()] == [("paid", 1)]
+    page._tile_clicked("paid")  # a second click clears the status filter
+    assert page.status_filter.currentData() is None
+
+
+def test_payments_page_accepts_any_amount_up_to_the_sale_balance(shop, monkeypatch) -> None:
+    """A client paying 45,000 on 30,000 installments covers the first and half the second."""
+    from PySide6.QtWidgets import QDialog
+
+    from app.ui.pages.payments_page import PaymentDialog, PaymentsPage
+
+    _overdue_client(shop["owner"])
+    page = PaymentsPage(_user(shop["owner"]))
+    first = page.visible_rows()[0]
+    seen: dict[str, int] = {}
+
+    def pay(dialog: PaymentDialog) -> int:
+        seen.update(maximum=dialog.amount_input.maximum(), suggested=dialog.amount_input.value())
+        dialog.amount_input.setValue(45000)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(PaymentDialog, "exec", pay)
+    page.record_payment(first)
+    assert seen == {"maximum": 90000, "suggested": 30000}
+    page.show_status(None)
+    assert [(row.number, row.paid, row.remaining) for row in sorted(page.visible_rows(), key=lambda r: r.number)] == [
+        (1, 30000, 0), (2, 15000, 15000), (3, 0, 30000),
+    ]
+
+
+def test_payments_and_clients_pages_have_no_excel_buttons(shop) -> None:
+    from app.ui.pages.customers_page import CustomersPage
+    from app.ui.pages.payments_page import PaymentsPage
+
+    # Owner request 2026-10-03: no Excel export, import or template on these pages.
+    for page_class in (CustomersPage, PaymentsPage):
+        owner_page = page_class(_user(shop["owner"]))
+        for name in ("upload_button", "template_button", "export_button", "export_to"):
+            assert not hasattr(owner_page, name)
+    payments = PaymentsPage(_user(shop["owner"]))
+    from app.ui.events import events
+
+    requested: list[int] = []
+    events.navigate_to.connect(requested.append)
+    try:
+        payments.new_sale_button.click()
+    finally:
+        events.navigate_to.disconnect(requested.append)
+    assert requested == [2]
+
+
+def test_clients_page_sale_type_chips_include_credit(shop) -> None:
+    from app.ui.pages.customers_page import CustomersPage
+
+    page = CustomersPage(_user(shop["owner"]))
+    assert set(page.kind_chips) == {None, "cash", "installment", "credit"}
+    assert page.kind_chips[None].isChecked()
+    page.kind_chips["credit"].click()
+    assert page.payment_filter.currentData() == "credit"
+    assert [kind for kind, chip in page.kind_chips.items() if chip.isChecked()] == ["credit"]
+    page.set_payment_filter("facilities")  # only in the drop-down: no chip is checked
+    assert not any(chip.isChecked() for chip in page.kind_chips.values())
+
+
+def test_import_dialog_opens_with_the_chosen_workbook(shop, tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from app.services import importer
+    from app.ui.pages.import_page import ImportDialog
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = importer.SHEET_NAME
+    fields = list(importer.REQUIRED_HEADERS)
+    sheet.append([importer.HEADERS[field] for field in fields])
+    values = {
+        "full_name": "زبون من الملف", "product": "Redmi 13", "sale_type": "بالتقسيط", "wholesale_price": 25000,
+        "cash_price": 32000, "rate": 35, "financed": 43200, "down_payment": 0, "months": 6,
+        "purchase_date": datetime(2026, 7, 20),
+    }
+    sheet.append([values[field] for field in fields])
+    path = tmp_path / "تقسيط.xlsx"
+    book.save(path)
+    dialog = ImportDialog(_user(shop["owner"]), path)
+    preview = dialog.page._preview
+    assert preview is not None and len(preview.rows) == 1 and preview.rows[0].ready
+    assert dialog.page.import_button.isEnabled()

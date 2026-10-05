@@ -114,9 +114,9 @@ def test_create_installment_sale_builds_full_schedule(memory_engine: Engine) -> 
         assert sale.end_date == date(2026, 12, 30)
         assert [row.amount_due for row in installments] == [23_166, 23_166, 23_168]
         assert [row.due_date for row in installments] == [
-            date(2026, 10, 1),
-            date(2026, 11, 1),
-            date(2026, 12, 1),
+            date(2026, 10, 30),
+            date(2026, 11, 30),
+            date(2026, 12, 30),
         ]
         assert sum(row.amount_due for row in installments) == sale.financed
 

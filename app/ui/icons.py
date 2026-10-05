@@ -79,6 +79,10 @@ _PATHS: dict[str, str] = {
     "debt-in": '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v8"/><path d="M8.5 12l3.5 3.5 3.5-3.5"/>',
     "debt-out": '<circle cx="12" cy="12" r="8.5"/><path d="M12 16.5v-8"/><path d="M8.5 12l3.5-3.5 3.5 3.5"/>',
     "drag": '<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/>',
+    "print": '<path d="M7 8.5V3.5h10v5"/><rect x="3.5" y="8.5" width="17" height="8" rx="2"/>'
+    '<rect x="7" y="13.5" width="10" height="7" rx="1"/><path d="M17 11.5h.01"/>',
+    "arrow-up": '<path d="M12 19V5"/><path d="M6.5 10.5L12 5l5.5 5.5"/>',
+    "arrow-down": '<path d="M12 5v14"/><path d="M6.5 13.5L12 19l5.5-5.5"/>',
 }
 
 #: Icons whose meaning depends on reading direction.

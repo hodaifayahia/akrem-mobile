@@ -156,6 +156,7 @@ class Sale(Base):
         Index("ix_sales_customer_id", "customer_id"),
         Index("ix_sales_purchase_date", "purchase_date"),
         Index("ix_sales_product_id", "product_id"),
+        Index("ix_sales_basket_id", "basket_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -178,6 +179,10 @@ class Sale(Base):
     purchase_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date | None] = mapped_column(Date)
     expected_pay_date: Mapped[date | None] = mapped_column(Date)
+    # How many units of the product this sale took (prices above are for all of them).
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    # Products bought together in one basket share this id (None for a sale on its own).
+    basket_id: Mapped[str | None] = mapped_column(String(32))
     # The catalog product this sale was linked to, and a copy of the unit's
     # details (kept even if the stock row is edited or removed later).
     # Products are archived, never deleted, so the link needs no ON DELETE rule.
@@ -252,6 +257,9 @@ class Payment(Base):
     payment_date: Mapped[date] = mapped_column(Date, nullable=False)
     method: Mapped[str] = mapped_column(String(30), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    # One amount received that was spread over several installments: every
+    # part shares this id, so undoing the payment removes all of them.
+    batch_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )

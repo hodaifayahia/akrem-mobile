@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -42,12 +43,18 @@ from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
 from app.ui.theme import qcolor, repolish
+from app.ui.widgets import row_selection
+from app.ui.widgets.row_selection import SelectionBar
 
 _LOG = logging.getLogger(__name__)
 
 
 class StockUnitDialog(QDialog):
-    """Add or edit one phone: product, prices, battery, colour, IMEI, REF, note."""
+    """Add or edit one phone: product, prices, battery, colour, IMEI, REF, note.
+
+    When adding, a barcode scanner can fill the "scanned IMEIs" box (one
+    code per line, the scanner presses Enter): one phone is added per IMEI.
+    """
 
     def __init__(
         self,
@@ -104,7 +111,15 @@ class StockUnitDialog(QDialog):
         self.note = QLineEdit(self)
         self.note.setMaxLength(500)
         self.quantity = QSpinBox(self)
-        self.quantity.setRange(1, 50)
+        self.quantity.setRange(1, stock.MAX_SALE_QUANTITY)
+        self.quantity.setMaximumWidth(160)
+        self.scanned = QPlainTextEdit(self)
+        self.scanned.setPlaceholderText(ar.SCAN_IMEIS_PLACEHOLDER)
+        self.scanned.setMaximumHeight(96)
+        self.scanned.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.scanned.textChanged.connect(self._scanned_changed)
+        self.scanned_state = QLabel(self)
+        self.scanned_state.setObjectName("sectionHint")
 
         form = QFormLayout()
         form.addRow(f"{ar.STOCK_PRODUCT} *", self.product)
@@ -118,6 +133,8 @@ class StockUnitDialog(QDialog):
         form.addRow(ar.PROD_TPL_REF, self.reference)
         form.addRow(ar.PROD_TPL_NOTE, self.note)
         form.addRow(ar.STOCK_QUANTITY, self.quantity)
+        form.addRow(ar.SCAN_IMEIS_LABEL, self.scanned)
+        form.addRow("", self.scanned_state)
         self._form = form
         layout.addLayout(form)
         self.error = InlineError(self)
@@ -142,6 +159,8 @@ class StockUnitDialog(QDialog):
             self.reference.setText(unit.reference or "")
             self.note.setText(unit.note or "")
             form.setRowVisible(self.quantity, False)
+            form.setRowVisible(self.scanned, False)
+            form.setRowVisible(self.scanned_state, False)
         self._product_changed(self.product.currentText())
 
     def _product_changed(self, text: str) -> None:
@@ -162,6 +181,25 @@ class StockUnitDialog(QDialog):
             self.product_state.setText(ar.SALE_PRODUCT_NEW if name else "")
         self.error.clear()
 
+    def scanned_imeis(self) -> tuple[list[str], list[str]]:
+        """``(valid IMEIs, rejected lines)`` from the scan box."""
+        return stock.scanned_imeis(self.scanned.toPlainText())
+
+    def _scanned_changed(self) -> None:
+        """With scanned IMEIs the quantity is their number and the single IMEI field is not used."""
+        valid, rejected = self.scanned_imeis()
+        scanning = bool(valid or rejected)
+        self.quantity.setEnabled(not scanning)
+        self.imei.setEnabled(not scanning)
+        self.reference.setEnabled(not scanning)
+        if valid:
+            self.quantity.setValue(min(len(valid), self.quantity.maximum()))
+        text = ar.SCAN_IMEIS_COUNT.format(count=len(valid)) if valid else ""
+        if rejected:
+            text = (text + " · " if text else "") + ar.SCAN_IMEIS_REJECTED.format(codes="، ".join(rejected[:5]))
+        self.scanned_state.setText(text)
+        self.error.clear()
+
     def details(self) -> stock.UnitDetails:
         """The phone's descriptive fields."""
         battery = self.battery.value()
@@ -180,7 +218,11 @@ class StockUnitDialog(QDialog):
             return ar.STOCK_PRODUCT_REQUIRED
         if self.cash_price.value() <= 0:
             return ar.PROD_PRICE_REQUIRED
-        if self.imei.text().strip() and stock.normalize_imei(self.imei.text()) is None:
+        if self.scanned.toPlainText().strip():
+            _valid, rejected = self.scanned_imeis()
+            if rejected:
+                return ar.SCAN_IMEIS_REJECTED.format(codes="، ".join(rejected[:5]))
+        if self.imei.isEnabled() and self.imei.text().strip() and stock.normalize_imei(self.imei.text()) is None:
             return ar.STOCK_IMEI_INVALID
         return None
 
@@ -221,11 +263,10 @@ class StockPanel(QWidget):
         self.add_button.clicked.connect(self._add)
         self.edit_button = _action(self, ar.STOCK_EDIT, "edit", "secondary")
         self.edit_button.clicked.connect(self._edit_selected)
-        self.delete_button = _action(self, ar.STOCK_DELETE, "trash", "secondary")
-        self.delete_button.clicked.connect(self._delete_selected)
-        for button in (self.delete_button, self.edit_button, self.add_button):
+        for button in (self.edit_button, self.add_button):
             button.setVisible(self._is_owner)
             tools.addWidget(button)
+        self._tools = tools
         layout.addLayout(tools)
 
         filters = QHBoxLayout()
@@ -270,6 +311,14 @@ class StockPanel(QWidget):
         self.table.itemSelectionChanged.connect(self._update_actions)
         if self._is_owner:
             self.table.itemDoubleClicked.connect(lambda _item: self._edit_selected())
+        # Owner: a checkbox per phone, "select all" and "delete selected" by the search box.
+        self.selection: SelectionBar | None = None
+        self.delete_button: QPushButton | None = None
+        if self._is_owner:
+            self.selection = SelectionBar(self.table, self._key_at, self, delete_text=ar.STOCK_DELETE)
+            self.selection.delete_requested.connect(self._delete_selected)
+            self.delete_button = self.selection.delete_button
+            self._tools.insertWidget(1, self.selection)  # after the search box
         layout.addWidget(self.table, 1)
 
         self.empty_card = QFrame(self)
@@ -362,6 +411,8 @@ class StockPanel(QWidget):
                 self.table.setItem(row, column, item)
         self.empty_card.setVisible(not self._units)
         self.table.setVisible(bool(self._units))
+        if self.selection is not None:
+            self.selection.refresh()
         self._update_actions()
 
     @staticmethod
@@ -394,12 +445,15 @@ class StockPanel(QWidget):
         row = selected[0].row() if selected else self.table.currentRow()
         return self._units[row] if 0 <= row < len(self._units) else None
 
+    def _key_at(self, row: int) -> int | None:
+        """The unit id on a table row (the row's checkbox key)."""
+        return self._units[row].id if 0 <= row < len(self._units) else None
+
     def _update_actions(self) -> None:
         unit = self.selected_unit()
         self.edit_button.setEnabled(unit is not None)
-        self.delete_button.setEnabled(unit is not None and unit.status == stock.STATUS_AVAILABLE)
 
-    def new_dialog(self, unit: StockItem | None = None) -> StockUnitDialog:
+    def new_dialog(self, unit: StockItem | None = None, *, title: str | None = None) -> StockUnitDialog:
         """Build the add/edit dialog with the current catalog and colours."""
         with session_scope() as session:
             catalog = [
@@ -410,11 +464,20 @@ class StockPanel(QWidget):
             if unit is not None:
                 unit = session.get(StockItem, unit.id)
                 _ = unit.product.name
-        title = ar.STOCK_EDIT if unit is not None else ar.STOCK_ADD
+        title = title or (ar.STOCK_EDIT if unit is not None else ar.STOCK_ADD)
         return StockUnitDialog(title=title, catalog=catalog, colors=colors, unit=unit, parent=self)
 
     def _add(self) -> None:
         dialog = self.new_dialog()
+        dialog.save_button.clicked.connect(lambda: self.save_dialog(dialog))
+        dialog.exec()
+
+    def receive_goods(self) -> None:
+        """New goods bought for the shop: the same form, titled for a purchase, with the quantity first in mind."""
+        if not self._is_owner:
+            return
+        dialog = self.new_dialog(title=ar.PROD_RECEIVE)
+        dialog.quantity.setFocus()
         dialog.save_button.clicked.connect(lambda: self.save_dialog(dialog))
         dialog.exec()
 
@@ -438,7 +501,18 @@ class StockPanel(QWidget):
                     session, self.current_user.id, dialog.product.currentText(),
                     cash_price=dialog.cash_price.value(), wholesale_price=dialog.wholesale_price.value(),
                 )
-                if unit_id is None:
+                scanned, _rejected = dialog.scanned_imeis()
+                if unit_id is None and scanned:
+                    details = dialog.details()
+                    stock.add_scanned_units(
+                        session, self.current_user.id, product_id=product.id, imeis=scanned,
+                        details=stock.UnitDetails(
+                            color=details.color, battery_health=details.battery_health,
+                            is_new=details.is_new, note=details.note,
+                        ),
+                        cash_price=dialog.cash_price.value(), wholesale_price=dialog.wholesale_price.value(),
+                    )
+                elif unit_id is None:
                     stock.add_units(
                         session, self.current_user.id, product_id=product.id, details=dialog.details(),
                         cash_price=dialog.cash_price.value(), wholesale_price=dialog.wholesale_price.value(),
@@ -466,13 +540,40 @@ class StockPanel(QWidget):
         return True
 
     def _delete_selected(self) -> None:
-        unit = self.selected_unit()
-        if unit is None:
+        """Delete the ticked phones (or the highlighted one); sold phones stay."""
+        if self.selection is None:
             return
-        answer = QMessageBox.question(self, ar.STOCK_DELETE, ar.STOCK_DELETE_CONFIRM)
-        if answer != QMessageBox.StandardButton.Yes:
+        wanted = set(self.selection.target_keys())
+        chosen = [unit for unit in self._units if unit.id in wanted]
+        if not chosen:
             return
-        self.delete_unit(unit.id)
+        if all(unit.status == stock.STATUS_SOLD for unit in chosen):
+            QMessageBox.warning(self, ar.STOCK_DELETE, ar.STOCK_SOLD_LOCKED)
+            return
+        message = ar.STOCK_DELETE_CONFIRM if len(chosen) == 1 else ar.STOCK_DELETE_MANY_CONFIRM.format(count=len(chosen))
+        sold = sum(1 for unit in chosen if unit.status == stock.STATUS_SOLD)
+        details = ar.STOCK_DELETE_SOLD_KEPT.format(count=sold) if sold else None
+        if row_selection.ask_delete(self, ar.STOCK_DELETE, message, details=details) is None:
+            return
+        self.delete_units([unit.id for unit in chosen])
+
+    def delete_units(self, unit_ids: list[int]) -> tuple[int, int] | None:
+        """Remove several unsold phones; returns (deleted, sold kept)."""
+        try:
+            with session_scope() as session:
+                deleted, sold_kept = stock.delete_units(session, self.current_user.id, unit_ids)
+        except (ValueError, auth.AuthorizationError, SQLAlchemyError):
+            _LOG.exception("Stock delete failed")
+            QMessageBox.warning(self, ar.ERROR_TITLE, ar.STOCK_ERROR)
+            return None
+        if self.selection is not None:
+            self.selection.clear()
+        events.data_changed.emit()
+        message = ar.STOCK_DELETED.format(count=deleted)
+        if sold_kept:
+            message += " " + ar.STOCK_DELETE_SOLD_KEPT.format(count=sold_kept)
+        events.notify.emit("success", ar.PROD_TAB_STOCK, message, 3000)
+        return deleted, sold_kept
 
     def delete_unit(self, unit_id: int) -> bool:
         """Remove an unsold unit."""

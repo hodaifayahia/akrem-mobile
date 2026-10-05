@@ -8,6 +8,9 @@ from typing import Any, Mapping
 
 from app.services.calc import add_months, payment_offsets
 
+#: Installments fall due on the purchase day of each payment month.
+DEFAULT_DUE_MODE = "purchase_day"
+
 
 @dataclass(frozen=True, slots=True)
 class ScheduledInstallment:
@@ -22,7 +25,8 @@ class ScheduledInstallment:
 def build(sale: Any, settings: Mapping[str, Any] | None = None) -> list[ScheduledInstallment]:
     """Build schedule rows for a Sale ORM object or compatible sale record.
 
-    ``due_mode`` may be ``first_of_month`` (the default) or ``purchase_day``.
+    ``due_mode`` may be ``purchase_day`` (the default: a sale on 02/02 is due
+    on 02/03, 02/04, ...) or ``first_of_month`` (due on the 1st of those months).
     The schedule is derived from ``financed``, ``months`` and
     ``payment_interval`` (months between payments, default 1) so persisted
     Sale rows do not need to store each amount.
@@ -40,7 +44,7 @@ def build(sale: Any, settings: Mapping[str, Any] | None = None) -> list[Schedule
     if purchase_date is None:
         raise ValueError("installment sale requires purchase_date")
 
-    due_mode = _setting(settings or {}, "due_mode", "first_of_month")
+    due_mode = _setting(settings or {}, "due_mode", DEFAULT_DUE_MODE)
     if due_mode not in {"first_of_month", "purchase_day"}:
         raise ValueError("due_mode must be 'first_of_month' or 'purchase_day'")
 

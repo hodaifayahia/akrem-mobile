@@ -8,9 +8,11 @@
 
 "Outside" (what the shop must pay): the debt book's ``payable`` side.
 
-``net = clients + debtors + stock - what the shop owes``. For the selected
-month it also gives the money that came in (sales collections and debt
-repayments received) and the money paid out on the shop's own debts.
+``net_money = clients + debtors - what the shop owes`` is the owner's
+headline "how much money do I really have out there" (the clients' part is
+split into installments and credit). ``net`` also counts the stock. For the
+selected month it also gives the money that came in (sales collections and
+debt repayments received) and the money paid out on the shop's own debts.
 """
 
 from __future__ import annotations
@@ -20,9 +22,9 @@ from dataclasses import dataclass
 from datetime import date
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from app.db.models import StockItem
+from app.db.models import Installment, Sale, StockItem
 from app.services import auth, dashboard, debts, stock
 
 
@@ -41,11 +43,18 @@ class FinancialPosition:
     month_paid_out: int
     debtors_overdue: int
     shop_overdue: int
+    installments_owe: int = 0
+    credit_owe: int = 0
 
     @property
     def money_inside(self) -> int:
         """Money owed to the shop (clients and debtors)."""
         return self.clients_owe + self.debtors_owe
+
+    @property
+    def net_money(self) -> int:
+        """The owner's money outside the drawer: installments + credit + debts owed to me - debts I owe."""
+        return self.money_inside - self.shop_owes
 
     @property
     def net(self) -> int:
@@ -77,6 +86,7 @@ def financial_position(
             func.coalesce(func.sum(StockItem.cash_price), 0),
         ).where(StockItem.status == stock.STATUS_AVAILABLE)
     ).one()
+    installments_owe, credit_owe = clients_owe_by_kind(session)
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     return FinancialPosition(
@@ -91,4 +101,27 @@ def financial_position(
         month_paid_out=debts.payments_between(session, debts.PAYABLE, start, end),
         debtors_overdue=owed_to_me.overdue,
         shop_overdue=i_owe.overdue,
+        installments_owe=installments_owe,
+        credit_owe=credit_owe,
     )
+
+
+def clients_owe_by_kind(session: Session) -> tuple[int, int]:
+    """``(installments, credit)``: what clients still owe on each kind of sale."""
+    sales = session.scalars(
+        select(Sale)
+        .where(Sale.sale_type.in_(("installment", "credit")))
+        .options(
+            selectinload(Sale.installments).selectinload(Installment.payments),
+            selectinload(Sale.credit_payments),
+        )
+    ).all()
+    installments = credit = 0
+    for sale in sales:
+        if sale.sale_type == "credit":
+            credit += max(0, sale.financed - sum(payment.amount for payment in sale.credit_payments))
+            continue
+        for row in sale.installments:
+            paid = max(row.amount_paid, sum(payment.amount for payment in row.payments))
+            installments += max(0, row.amount_due - paid)
+    return installments, credit

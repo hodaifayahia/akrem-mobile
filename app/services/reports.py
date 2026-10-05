@@ -1,4 +1,4 @@
-"""Read-only monthly collection and owner profit reports."""
+"""Read-only monthly collection, overdue and owner profit reports (shown on the Reports page)."""
 
 from __future__ import annotations
 
@@ -172,6 +172,40 @@ def profit_by_month(
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class CollectionTotals:
+    """What fell due in a month, what was paid of it and what is still open."""
+
+    due: int
+    paid: int
+    remaining: int
+    count: int
+
+
+def collection_totals(rows: Iterable[CollectionRow]) -> CollectionTotals:
+    """Add up the rows of ``monthly_collection_rows``."""
+    items = list(rows)
+    return CollectionTotals(
+        due=sum(row.amount_due for row in items),
+        paid=sum(row.amount_paid for row in items),
+        remaining=sum(row.remaining for row in items),
+        count=len(items),
+    )
+
+
+def profit_for(rows: Iterable[ProfitRow], *, year: int, month: int | None = None) -> ProfitRow:
+    """One year's (or one month's) totals from ``profit_by_month`` rows, zero when nothing was sold."""
+    chosen = [row for row in rows if row.year == year and (month is None or row.month == month)]
+    return ProfitRow(
+        year,
+        month or 0,
+        sum(row.sale_count for row in chosen),
+        sum(row.wholesale for row in chosen),
+        sum(row.total for row in chosen),
+        sum(row.profit for row in chosen),
+    )
+
+
 def export_collection_xlsx(rows: Iterable[CollectionRow], destination: str | Path) -> Path:
     """Write a monthly collection sheet with printable widths and Arabic headings."""
     from app.i18n import ar
@@ -336,6 +370,39 @@ def export_customers_xlsx(
         for summary in summaries
     ]
     return _write_workbook(destination, [(ar.CUST_PAGE_TITLE, header, rows, {5, 6}, {8, 9})])
+
+
+def export_collections_xlsx(rows: Iterable[object], destination: str | Path) -> Path:
+    """Write the (filtered) rows shown in the Payments table."""
+    from app.i18n import ar
+
+    status_labels = {
+        "overdue": ar.PAYT_STATUS_OVERDUE,
+        "due": ar.PAYT_STATUS_DUE,
+        "upcoming": ar.PAYT_STATUS_UPCOMING,
+        "paid": ar.PAYT_STATUS_PAID,
+    }
+    header = [
+        ar.PAYT_COL_STATUS, ar.PAY_COL_CUSTOMER, ar.PAYT_COL_PHONE, ar.PAY_COL_PRODUCT,
+        ar.PAYT_COL_NUMBER, ar.PAY_COL_DUE_DATE, ar.PAY_COL_AMOUNT_DUE, ar.PAY_COL_AMOUNT_PAID,
+        ar.PAY_COL_REMAINING, ar.PAYT_COL_LAST_PAYMENT,
+    ]
+    table = [
+        [
+            status_labels[row.status],
+            row.customer_name,
+            row.customer_phone or "",
+            row.product,
+            ar.PAYT_NUMBER.format(number=row.number, count=row.count) if row.kind == "installment" else ar.PAYT_CREDIT,
+            row.due_date,
+            row.amount_due,
+            row.paid,
+            row.remaining,
+            row.last_payment_date,
+        ]
+        for row in rows
+    ]
+    return _write_workbook(destination, [(ar.PAY_PAGE_TITLE, header, table, {5, 9}, {6, 7, 8})])
 
 
 def export_full_workbook(session: Session, destination: str | Path, *, owner_user_id: int) -> Path:

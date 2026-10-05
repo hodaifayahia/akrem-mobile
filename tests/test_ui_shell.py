@@ -6,7 +6,7 @@ import uuid
 from datetime import date, timedelta
 
 import pytest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QLabel
 from sqlalchemy.engine import Engine
 
@@ -16,6 +16,7 @@ from app.i18n import ar, en, get_language
 from app.services import auth, categories, customers, sales
 from app.services.alerts import CollectionAlert, summarize
 from app.services.seed import seed_defaults
+from app.ui.preferences import app_settings
 
 
 @pytest.fixture(scope="module")
@@ -24,10 +25,8 @@ def qapp() -> QApplication:
 
 
 @pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, qapp):
-    """Keep QSettings writes out of the real profile; close windows afterwards."""
-    QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(tmp_path))
-    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path))
+def close_windows(qapp):
+    """Hide windows and restore Arabic afterwards (conftest isolates QSettings)."""
     yield
     for widget in QApplication.topLevelWidgets():
         widget.hide()
@@ -149,7 +148,7 @@ def test_sidebar_navigation_badges_and_collapse(qapp, memory_engine, shop) -> No
     from app.ui.widgets.sidebar import COLLAPSED_WIDTH, EXPANDED_WIDTH, Sidebar
 
     sidebar = Sidebar(_user(memory_engine, shop["owner_id"]))
-    assert len(sidebar.buttons) == 11
+    assert len(sidebar.buttons) == 12
     sidebar.set_active(3)
     assert sidebar.buttons[3].property("active") is True
     assert sidebar.buttons[0].property("active") is False
@@ -307,21 +306,65 @@ def test_monitor_scans_the_database(qapp, memory_engine, shop) -> None:
 
 
 # -------------------------------------------------------- single instance
+_LAUNCH = """
+import sys
+from PySide6.QtCore import QCoreApplication
+app = QCoreApplication([])
+from app.ui.single_instance import SingleInstance
+second = SingleInstance(sys.argv[1], build=sys.argv[2])
+second._wait_until_free = lambda: print("waited")
+print(second.request_quit() if sys.argv[3] == "quit" else second.notify_existing())
+"""
+
+
+def _launch_second_copy(name: str, build: str, qapp, *, quit_only: bool = False, until=None) -> list:
+    """Run a second launch in a separate process while the first one serves events.
+
+    It must be another process: on Windows the socket is a named pipe without a
+    buffer, so a request is only delivered while the running copy reads it. A
+    launch from this same thread blocks that reader and its request is lost.
+    """
+    import subprocess
+    import sys
+    import time
+
+    # Windows left by earlier tests keep application-wide event filters, so the
+    # first processEvents() can take seconds; drain that backlog now, before the
+    # launcher's short timeouts start, or the running copy reads too late.
+    qapp.processEvents()
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LAUNCH, name, build, "quit" if quit_only else "launch"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    deadline = time.monotonic() + 30
+    while process.poll() is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    # A request read just before the launcher exited may still be waiting for
+    # its readyRead signal; let the running copy handle it.
+    settle = time.monotonic() + 3.0
+    while time.monotonic() < settle:
+        qapp.processEvents()
+        if until is not None and until():
+            break
+        time.sleep(0.01)
+    lines = process.stdout.read().split()
+    return [{"True": True, "False": False}.get(line, line) for line in lines]
+
+
 def test_second_launch_activates_the_first(qapp) -> None:
     from app.ui.single_instance import SingleInstance
 
     name = f"akrem-test-{uuid.uuid4().hex[:8]}"
     first = SingleInstance(name)
-    assert first.notify_existing() is False
+    assert first.notify_existing() is False  # nothing is running yet
     assert first.listen() is True
     activated: list[bool] = []
     first.activation_requested.connect(lambda: activated.append(True))
-    assert SingleInstance(name).notify_existing() is True
-    for _ in range(50):
-        qapp.processEvents()
-        if activated:
-            break
-    first.close()
+    try:
+        assert _launch_second_copy(name, first.build, qapp, until=lambda: bool(activated)) == [True]
+    finally:
+        first.close()
     assert activated
 
 
@@ -347,7 +390,7 @@ def test_language_switch_rebuilds_pages_and_mirrors_layout(qapp, memory_engine, 
     assert window.pages.currentIndex() == 1
     assert window.buttons[1].text() == en.SIDEBAR_ITEMS[1]
     assert window.topbar.page_sub_label.text() == en.PAGE_SUBTITLES[1]
-    assert QSettings("AkremMobile", "AkremMobile").value("language") == "en"
+    assert app_settings().value("language") == "en"
     change_language("ar")
     assert window.layoutDirection() == Qt.LayoutDirection.RightToLeft
     window._quitting = True
@@ -442,37 +485,6 @@ def test_seller_cannot_manage_client_types(qapp, memory_engine, shop) -> None:
     assert page.assign_type_button.isHidden()
 
 
-_LAUNCH = """
-import sys
-from PySide6.QtCore import QCoreApplication
-app = QCoreApplication([])
-from app.ui.single_instance import SingleInstance
-second = SingleInstance(sys.argv[1], build=sys.argv[2])
-second._wait_until_free = lambda: print("waited")
-print(second.request_quit() if sys.argv[3] == "quit" else second.notify_existing())
-"""
-
-
-def _launch_second_copy(name: str, build: str, qapp, *, quit_only: bool = False) -> list:
-    """Run a second launch in a separate process while the first one serves events."""
-    import subprocess
-    import sys
-    import time
-
-    process = subprocess.Popen(
-        [sys.executable, "-c", _LAUNCH, name, build, "quit" if quit_only else "launch"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-    )
-    deadline = time.monotonic() + 30
-    while process.poll() is None and time.monotonic() < deadline:
-        qapp.processEvents()
-        time.sleep(0.01)
-    for _ in range(10):
-        qapp.processEvents()
-    lines = process.stdout.read().split()
-    return [{"True": True, "False": False}.get(line, line) for line in lines]
-
-
 def test_a_newer_build_replaces_a_stale_copy_running_in_the_tray(qapp) -> None:
     from app.ui.single_instance import SingleInstance
 
@@ -485,14 +497,14 @@ def test_a_newer_build_replaces_a_stale_copy_running_in_the_tray(qapp) -> None:
     old.quit_requested.connect(lambda: quit_asked.append(True))
     try:
         # Same build: the running copy shows itself and the new launch exits.
-        assert _launch_second_copy(name, "0.1.0-1000", qapp) == [True]
+        assert _launch_second_copy(name, "0.1.0-1000", qapp, until=lambda: bool(shown)) == [True]
         assert shown and not quit_asked
         # Reinstalled build: the old copy is told to quit and the new launch continues.
-        assert _launch_second_copy(name, "0.1.0-2000", qapp) == ["waited", False]
+        assert _launch_second_copy(name, "0.1.0-2000", qapp, until=lambda: bool(quit_asked)) == ["waited", False]
         assert quit_asked
         # The installer's "--quit".
         quit_asked.clear()
-        assert _launch_second_copy(name, "x", qapp, quit_only=True) == [True]
+        assert _launch_second_copy(name, "x", qapp, quit_only=True, until=lambda: bool(quit_asked)) == [True]
         assert quit_asked
     finally:
         old.close()
@@ -514,7 +526,7 @@ def test_every_sidebar_and_topbar_button_receives_real_mouse_clicks(qapp, memory
         window.monitor.stop()
         window.hide()
         assert report.ok, report.failures
-        assert sum("opens its page" in check for check in report.checks) == 11
+        assert sum("opens its page" in check for check in report.checks) == 12
     apply_language("ar")
 
 
@@ -530,3 +542,125 @@ def test_uncaught_errors_never_block_the_window(qapp, monkeypatch) -> None:
     entry.show_uncaught_exception(RuntimeError, RuntimeError("again"), None)
     assert entry._error_notice is notice  # one notice at a time
     notice.close()
+
+
+def test_sidebar_scrolls_its_pages_and_keeps_the_user_card_whole(qapp, memory_engine, shop) -> None:
+    """On a short window the page list scrolls; the user card is never squeezed."""
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow(current_user=_user(memory_engine, shop["owner_id"]))
+    window.resize(1366, 600)
+    window.show()
+    qapp.processEvents()
+    sidebar = window.sidebar
+    assert sidebar.nav_scroll.verticalScrollBar().maximum() > 0
+    assert sidebar.user_card.height() >= sidebar.user_card.minimumSizeHint().height()
+    assert not sidebar.nav_scroll.isAncestorOf(sidebar.user_card)
+    window.monitor.stop()
+    window._quitting = True
+    window.close()
+
+
+def test_background_mode_logs_in_when_opened_then_hands_over_the_tray(qapp) -> None:
+    from PySide6.QtWidgets import QWidget
+
+    from app.ui.background_mode import BackgroundMode
+    from app.ui.notifications import NotificationHub
+
+    answers = [None, "owner"]
+    events_seen: list[str] = []
+
+    class FakeWindow(QWidget):
+        def restore_from_tray(self) -> None:
+            events_seen.append("restored")
+
+    def open_window(user):
+        events_seen.append(f"opened:{user}")
+        return FakeWindow()
+
+    mode = BackgroundMode(NotificationHub(), lambda: answers.pop(0), open_window)
+    assert mode.tray is not None and mode.monitor is not None
+    mode.open()  # login cancelled: stay in the tray
+    assert mode.window is None and mode.tray is not None
+    mode.tray.open_requested.emit()  # e.g. a click on the tray icon
+    assert events_seen == ["opened:owner"]
+    assert mode.tray is None and mode.monitor is None  # the main window owns them now
+    mode.open()  # a later launch brings the window back
+    assert events_seen[-1] == "restored"
+
+
+def test_is_running_probes_without_activating(qapp) -> None:
+    from app.ui.single_instance import SingleInstance
+
+    name = f"akrem-test-{uuid.uuid4().hex[:8]}"
+    probe = SingleInstance(name)
+    assert probe.is_running() is False
+    first = SingleInstance(name)
+    first.listen()
+    activated: list[bool] = []
+    first.activation_requested.connect(lambda: activated.append(True))
+    try:
+        assert probe.is_running() is True
+        for _ in range(20):
+            qapp.processEvents()
+        assert activated == []  # a sign-in start must not pop the window up
+    finally:
+        first.close()
+
+
+def test_start_with_windows_entry_runs_hidden(qapp) -> None:
+    import sys
+
+    from app.ui import autostart
+
+    command = autostart.startup_command(r"C:\Apps\AkremMobile\AkremMobile.exe")
+    assert command == r'"C:\Apps\AkremMobile\AkremMobile.exe" --background'
+    if sys.platform != "win32":
+        assert autostart.is_enabled() is False
+        return
+    import winreg
+
+    key = r"Software\AkremMobileTests\Run"  # never the real Run key
+    try:
+        assert autostart.set_enabled(True, key_path=key, command=command)
+        assert autostart.is_enabled(key)
+        assert autostart.set_enabled(False, key_path=key)
+        assert not autostart.is_enabled(key)
+    finally:
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\AkremMobileTests")
+        except OSError:
+            pass
+
+
+def test_background_start_opens_sign_up_on_a_fresh_install(qapp, monkeypatch) -> None:
+    """Started hidden by Windows before any account exists: sign up at once."""
+    import app.main as entry
+    from PySide6.QtCore import QObject, Signal
+
+    class FakeInstance(QObject):
+        activation_requested = Signal()
+        quit_requested = Signal()
+
+        def close(self) -> None:
+            pass
+
+    asked: list[bool] = []
+    monkeypatch.setattr(entry, "sign_in", lambda: asked.append(True))  # None: cancelled
+
+    def fake_exec() -> int:
+        for _ in range(5):
+            qapp.processEvents()
+        return 0
+
+    monkeypatch.setattr(QApplication, "exec", staticmethod(fake_exec))
+    quit_on_close = qapp.quitOnLastWindowClosed()
+    try:
+        assert entry.run_in_background(qapp, FakeInstance(), needs_sign_up=True) == 0
+        assert asked == [True]
+        asked.clear()
+        assert entry.run_in_background(qapp, FakeInstance()) == 0
+        assert asked == []  # with an account it waits quietly in the tray
+    finally:
+        qapp.setQuitOnLastWindowClosed(quit_on_close)

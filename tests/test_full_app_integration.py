@@ -118,10 +118,10 @@ def test_main_window_initialization_and_page_navigation(qapp, memory_engine: Eng
         # Assert topbar and toast manager are initialized
         assert window.topbar is not None
         assert window.toast_manager is not None
-        assert window.pages.count() == 11
+        assert window.pages.count() == 12
 
-        # Test switching across all 11 pages (7 original + products, client types and the two debt pages)
-        for page_idx in range(11):
+        # Test switching across all 12 pages (7 original + products, client types, the two debt pages and printed forms)
+        for page_idx in range(12):
             window._select_page(page_idx)
             assert window.pages.currentIndex() == page_idx
             assert window.buttons[page_idx].property("active") is True
@@ -209,18 +209,19 @@ def test_new_sale_page_stepper_and_calc(qapp, memory_engine: Engine, seeded_db: 
         assert "45,000" in page.financed_value.text()
 
 
-def test_payments_page_sections(qapp, memory_engine: Engine, seeded_db: dict[str, int]):
-    """Test PaymentsPage builds and refreshes overdue and reminder tables."""
+def test_payments_page_is_one_table_with_status_tiles(qapp, memory_engine: Engine, seeded_db: dict[str, int]):
+    """PaymentsPage lists every amount to collect in one table, counted by status."""
     with session_scope(memory_engine) as session:
         owner = session.get(User, seeded_db["owner_id"])
         page = PaymentsPage(current_user=owner)
         page.refresh()
 
-        assert page.failed_table is not None
-        assert page.pending_table is not None
-        assert page.paid_table is not None
-        assert page.reminders_table is not None
-        assert page.credit_table is not None
+        assert set(page.tiles) == {"overdue", "due", "upcoming", "paid"}
+        assert page.status_filter.currentData() == "unpaid"
+        assert all(row.status != "paid" for row in page.visible_rows())
+        page.show_status(None)
+        page.period_filter.setCurrentIndex(page.period_filter.findData("all"))
+        assert page.table.model().rowCount() == len(page.visible_rows()) > 0
 
 
 def test_reports_page_cards(qapp, memory_engine: Engine, seeded_db: dict[str, int]):

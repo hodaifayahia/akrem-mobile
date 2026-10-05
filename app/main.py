@@ -116,11 +116,122 @@ def raise_visible_windows() -> None:
             bring_to_front(widget)
 
 
+def _rewire(signal, slot) -> None:
+    """Point a single-instance request at a new handler (dropping the previous one)."""
+    try:
+        signal.disconnect()
+    except (RuntimeError, TypeError):
+        pass  # nothing was connected yet
+    signal.connect(slot)
+
+
+def sign_in():
+    """Create the owner on first run, then log in; ``None`` when cancelled.
+
+    A checkpoint backup follows a successful login, so the daily snapshot
+    contains the owner account.
+    """
+    from app.db.session import session_scope
+    from app.services.auth import owner_exists
+    from app.services.backup import create_automated_checkpoint_backup
+    from app.ui.dialogs.auth_dialogs import LoginDialog, SetupOwnerDialog
+
+    with session_scope() as session:
+        has_owner = owner_exists(session)
+    if not has_owner:
+        setup_dialog = SetupOwnerDialog()
+        if run_modal(setup_dialog) != QDialog.DialogCode.Accepted:
+            return None
+    login_dialog = LoginDialog()
+    if run_modal(login_dialog) != QDialog.DialogCode.Accepted or login_dialog.user is None:
+        return None
+    try:
+        create_automated_checkpoint_backup(max_per_day=3, min_interval_seconds=3600)
+    except (OSError, ValueError):
+        logging.exception("Automatic checkpoint backup could not be created")
+    return login_dialog.user
+
+
+def wait_for_shop_server() -> bool:
+    """When this PC uses the shop server, make sure it answers before starting; False to quit.
+
+    The main PC may still be starting or switched off: the user can retry,
+    change the server settings, or quit. The app never falls back to this
+    PC's local database on its own, which would split the shop's records.
+    """
+    from app.services import shared_db
+    from app.ui.dialogs.server_dialog import check_text, configure_server_and_quit
+
+    details = shared_db.current_server()
+    if details is None:
+        return True  # local database, or a server set by the environment variable
+    while True:
+        check = shared_db.test_connection(details)
+        if check.ok:
+            return True
+        logging.warning("Shop server not reachable: %s", check.detail)
+        box = QMessageBox(QMessageBox.Icon.Warning, ar.SERVER_TITLE,
+                          ar.SERVER_START_FAILED.format(host=details.host, reason=check_text(check)))
+        retry = box.addButton(ar.SERVER_RETRY, QMessageBox.ButtonRole.AcceptRole)
+        settings_button = box.addButton(ar.SERVER_CONFIGURE, QMessageBox.ButtonRole.ActionRole)
+        box.addButton(ar.SERVER_QUIT, QMessageBox.ButtonRole.RejectRole)
+        run_modal(box)
+        clicked = box.clickedButton()
+        if clicked == retry:
+            continue
+        if clicked == settings_button:
+            if configure_server_and_quit(None):
+                return False
+            details = shared_db.current_server()
+            if details is None:
+                return True
+            continue
+        return False
+
+
+def open_main_window(app: QApplication, instance, user) -> MainWindow:
+    """Show the main window for ``user`` and route later launches to it."""
+    # Closing the window hides it in the tray; MainWindow quits explicitly.
+    app.setQuitOnLastWindowClosed(False)
+    window = MainWindow(current_user=user)
+    _rewire(instance.activation_requested, window.restore_from_tray)
+    _rewire(instance.quit_requested, window.quit_application)
+    window.show()
+    bring_to_front(window)
+    window.start_background_services()
+    logging.info("Main window ready")
+    return window
+
+
+def run_in_background(app: QApplication, instance, *, needs_sign_up: bool = False) -> int:
+    """Start hidden in the tray (Windows sign-in); log in when the app is opened.
+
+    On a fresh install there is no account yet, so the sign-up opens at once
+    instead of waiting in the tray.
+    """
+    from app.ui.background_mode import BackgroundMode
+    from app.ui.notifications import hub
+
+    app.setQuitOnLastWindowClosed(False)
+    mode = BackgroundMode(hub, sign_in, lambda user: open_main_window(app, instance, user))
+    _rewire(instance.activation_requested, mode.open)
+    _rewire(instance.quit_requested, app.quit)
+    mode.start()
+    if needs_sign_up:
+        QTimer.singleShot(0, mode.open)
+    logging.info("Running in the background (tray)")
+    exit_code = app.exec()
+    instance.close()
+    return exit_code
+
+
 def main() -> int:
     """Start the desktop application.
 
     ``--quit`` asks a running copy to exit (used by the installer);
-    ``--self-test [report.json]`` checks that the build opens and is clickable.
+    ``--self-test [report.json]`` checks that the build opens and is clickable;
+    ``--background`` starts hidden in the tray (Windows sign-in), showing the
+    login only when the app is opened.
     """
     ensure_standard_streams()
     configure_logging()
@@ -147,7 +258,11 @@ def main() -> int:
         report = sys.argv[position + 1] if len(sys.argv) > position + 1 else None
         load_arabic_font()
         return run_self_test(report)
-    if instance.notify_existing():
+    background = "--background" in sys.argv
+    if background and instance.is_running():
+        # Started at sign-in while a copy already runs: leave it alone.
+        return 0
+    if not background and instance.notify_existing():
         # Already running (possibly hidden in the tray): it shows itself.
         return 0
     instance.listen()
@@ -164,54 +279,33 @@ def main() -> int:
 
     try:
         from app.db.migrate import upgrade_database
-        from app.db.session import session_scope
+        from app.db.session import dispose_database_engines, session_scope
         from app.services.auth import owner_exists
-        from app.services.backup import create_automated_checkpoint_backup
         from app.services.seed import seed_defaults
         from app.services.settings import get_value
-        from app.db.session import dispose_database_engines
-        from app.ui.dialogs.auth_dialogs import LoginDialog, SetupOwnerDialog
 
         atexit.register(dispose_database_engines)
+        if not wait_for_shop_server():
+            return 0
         upgrade_database()
         seed_defaults()
         with session_scope() as session:
-            has_owner = owner_exists(session)
             shop_language = get_value(session, "language", None)
+            has_owner = owner_exists(session)
         if saved_language() is None and shop_language:
             # First run on this PC: start in the shop's default language.
             apply_language(shop_language)
-        if not has_owner:
-            setup_dialog = SetupOwnerDialog()
-            if run_modal(setup_dialog) != QDialog.DialogCode.Accepted:
-                return 0
-        login_dialog = LoginDialog()
-        if run_modal(login_dialog) != QDialog.DialogCode.Accepted:
-            return 0
-        if login_dialog.user is None:
-            return 0
-        try:
-            create_automated_checkpoint_backup(max_per_day=3, min_interval_seconds=3600)
-        except (OSError, ValueError):
-            # Back up only after setup and authentication so the daily
-            # snapshot contains the owner account and runs after successful login.
-            logging.exception("Automatic checkpoint backup could not be created")
+        user = None if background else sign_in()
     except Exception:
         logging.exception("Database initialization failed")
         QMessageBox.critical(None, ar.ERROR_TITLE, ar.ERROR_BODY)
         return 1
 
-    # Closing the window hides it in the tray; MainWindow quits explicitly.
-    app.setQuitOnLastWindowClosed(False)
-    window = MainWindow(current_user=login_dialog.user)
-    instance.activation_requested.disconnect(raise_visible_windows)
-    instance.activation_requested.connect(window.restore_from_tray)
-    instance.quit_requested.disconnect(app.quit)
-    instance.quit_requested.connect(window.quit_application)
-    window.show()
-    bring_to_front(window)
-    window.start_background_services()
-    logging.info("Main window ready")
+    if background:
+        return run_in_background(app, instance, needs_sign_up=not has_owner)
+    if user is None:
+        return 0
+    open_main_window(app, instance, user)
     exit_code = app.exec()
     instance.close()
     return exit_code

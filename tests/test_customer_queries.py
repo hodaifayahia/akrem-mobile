@@ -70,6 +70,7 @@ def test_customer_list_search_status_and_financial_summary(memory_engine: Engine
             cash_price=30_000,
             months=3,
             purchase_date=date(2026, 9, 30),
+            settings={"due_mode": "first_of_month"},
         )
         credit_sale = sales.create_sale(
             session,

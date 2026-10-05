@@ -1,22 +1,37 @@
-"""Online-safe local SQLite backups and atomic database restoration."""
+"""Online-safe database backups and restoration.
+
+Backups are always SQLite files (``akremmobile_*.sqlite3``). With the local
+database they are copied with SQLite's online backup API; when the PCs share
+the shop's PostgreSQL server every table is copied from the server into a new
+SQLite file, so the same files, folder and restore screen work in both
+cases. Restoring onto the server replaces every row in one transaction.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
-from sqlalchemy.engine import make_url
+from sqlalchemy import DateTime, create_engine, select
+from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import data_dir, database_url, read_local_setting, write_local_setting
 from app.db.models import Base
 
+_LOG = logging.getLogger(__name__)
 _BACKUP_PREFIX = "akremmobile_"
 _BACKUP_SUFFIX = ".sqlite3"
 _DEFAULT_RETENTION = 30
+#: Label of the copies made right before a bulk delete, and how many are kept.
+SAFETY_LABEL = "before_delete"
+_SAFETY_RETENTION = 5
+_NO_PRUNING = 1_000_000
 BACKUP_DIRECTORY_SETTING = "backup_directory"
 
 
@@ -104,6 +119,8 @@ def _detect_backup_type(path: Path) -> str:
         return "uploaded"
     if "_pre_upgrade" in name:
         return "pre_upgrade"
+    if f"_{SAFETY_LABEL}" in name:
+        return SAFETY_LABEL
     return "manual"
 
 
@@ -179,9 +196,11 @@ def create_backup(
     """
     if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
         raise ValueError("Backup retention must be a positive whole number")
-    source_path = _configured_database_path()
-    if not source_path.is_file():
-        raise FileNotFoundError(f"Configured SQLite database does not exist: {source_path}")
+    server = _server_url()
+    if server is None:
+        source_path = _configured_database_path()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Configured SQLite database does not exist: {source_path}")
 
     backup_dir = Path(directory) if directory is not None else backup_directory()
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -194,7 +213,10 @@ def create_backup(
     backup_path = _new_backup_path(backup_dir, current_time, label=label)
     temp_path = _make_temporary_path(backup_dir, backup_path.name)
     try:
-        _copy_sqlite_database(source_path, temp_path)
+        if server is None:
+            _copy_sqlite_database(source_path, temp_path)
+        else:
+            _copy_server_to_sqlite(server, temp_path)
         validate_backup(temp_path)
         _sync_file(temp_path)
         os.replace(temp_path, backup_path)
@@ -208,6 +230,28 @@ def create_backup(
         _remove_if_present(temp_path)
         raise
     return backup_path
+
+
+def create_safety_backup(label: str = SAFETY_LABEL) -> Path | None:
+    """Back up the database before a destructive change; never raises.
+
+    Only the newest few safety copies are kept, and making one never prunes
+    the owner's other backups. Returns the backup path, or ``None`` when no
+    copy could be made (for example with a shared-server database).
+    """
+    try:
+        path = create_backup(label=label, retention=_NO_PRUNING)
+    except (OSError, ValueError, sqlite3.Error, SQLAlchemyError):
+        _LOG.warning("Safety backup %s could not be created", label, exc_info=True)
+        return None
+    copies = sorted(
+        path.parent.glob(f"{_BACKUP_PREFIX}*_{label}*{_BACKUP_SUFFIX}"),
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
+    for old_copy in copies[_SAFETY_RETENTION:]:
+        old_copy.unlink(missing_ok=True)
+    return path
 
 
 def _backup_file_time(path: Path) -> float:
@@ -383,6 +427,10 @@ def restore_backup(path: str | Path) -> Path:
     open in another process keep using the old database file after atomic replace.
     """
     source_path = Path(path).expanduser().resolve()
+    server = _server_url()
+    if server is not None:
+        _restore_into_server(source_path, server)
+        return source_path
     destination_path = _configured_database_path()
     if not source_path.is_file():
         raise ValueError(f"Backup file does not exist: {source_path}")
@@ -434,6 +482,79 @@ def _configured_database_path() -> Path:
     ):
         raise ValueError("Backup and restore require a file-backed local SQLite database")
     return Path(raw_path).expanduser().resolve()
+
+
+def _server_url() -> str | None:
+    """The configured PostgreSQL server URL, or None with the local SQLite database."""
+    url = database_url()
+    try:
+        return url if make_url(url).get_backend_name() == "postgresql" else None
+    except Exception:  # noqa: BLE001 - an unparsable URL is reported by the SQLite path
+        return None
+
+
+def _copy_server_to_sqlite(server_url: str, destination: Path) -> None:
+    """Write every application row of the shop server into a new SQLite file (a backup)."""
+    from app.db.migrate import upgrade_database
+
+    file_url = f"sqlite+pysqlite:///{destination.as_posix()}"
+    upgrade_database(file_url)  # the current schema, with its migration revision
+    source = create_engine(server_url, connect_args={"connect_timeout": 8})
+    target = create_engine(file_url)
+    try:
+        with source.connect() as reader, target.begin() as writer:
+            _replace_rows(reader, writer)
+    finally:
+        source.dispose()
+        target.dispose()
+
+
+def _restore_into_server(source_path: Path, server_url: str) -> None:
+    """Replace every row on the shop server with the backup's rows, in one transaction."""
+    from app.db.migrate import upgrade_database
+    from app.db.migrate_sqlite_to_postgres import _reset_postgresql_id_sequence
+
+    if not source_path.is_file():
+        raise ValueError(f"Backup file does not exist: {source_path}")
+    validate_backup(source_path)
+    with tempfile.TemporaryDirectory(prefix="akrem_restore_") as folder:
+        # Work on a copy brought to the current schema (a backup can be older).
+        working = Path(folder) / "restore.sqlite3"
+        _copy_sqlite_database(source_path, working)
+        working_url = f"sqlite+pysqlite:///{working.as_posix()}"
+        upgrade_database(working_url)
+        source = create_engine(working_url)
+        target = create_engine(server_url, connect_args={"connect_timeout": 8})
+        try:
+            with source.connect() as reader, target.begin() as writer:
+                _replace_rows(reader, writer)
+                for table in Base.metadata.sorted_tables:
+                    if "id" in table.c:
+                        _reset_postgresql_id_sequence(writer, table.name)
+        finally:
+            source.dispose()
+            target.dispose()
+
+
+def _replace_rows(reader: Connection, writer: Connection) -> None:
+    """Empty every application table on ``writer`` and copy ``reader``'s rows in (foreign-key order)."""
+    to_sqlite = writer.dialect.name == "sqlite"
+    for table in reversed(Base.metadata.sorted_tables):
+        writer.execute(table.delete())
+    for table in Base.metadata.sorted_tables:
+        rows = []
+        for row in reader.execute(select(table)).mappings():
+            values = dict(row)
+            for column in table.columns:
+                value = values.get(column.name)
+                if not (isinstance(value, datetime) and isinstance(column.type, DateTime) and column.type.timezone):
+                    continue
+                # SQLite keeps UTC without an offset; the server keeps explicit UTC.
+                utc = value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+                values[column.name] = utc.replace(tzinfo=None) if to_sqlite else utc
+            rows.append(values)
+        if rows:
+            writer.execute(table.insert(), rows)
 
 
 def _copy_sqlite_database(source: Path, destination: Path) -> None:

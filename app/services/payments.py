@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Iterable
 from datetime import date, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models import AuditLog, Installment, Payment, Sale, User
@@ -78,6 +80,98 @@ def record_installment_payment(
             installment.paid_date = clean_date
         session.flush()
     return payment
+
+
+def installment_sale_remaining(session: Session, sale_id: int) -> int:
+    """What a client still owes on all the installments of one sale."""
+    rows = session.scalars(select(Installment).where(Installment.sale_id == sale_id))
+    return sum(max(0, row.amount_due - row.amount_paid) for row in rows)
+
+
+def record_sale_payment(
+    session: Session,
+    sale_id: int,
+    amount: int,
+    payment_date: date,
+    method: str,
+    note: str | None = None,
+) -> list[Payment]:
+    """Record any amount a client pays on an installment sale, oldest installment first.
+
+    Clients do not always pay the scheduled amount: they may pay 20,000 one
+    month, nothing the next and 10,000 after that. The amount may be smaller
+    or larger than one installment, up to the sale's whole remaining
+    balance. It fills the unpaid installments in order; each installment it
+    touches gets its own payment row, and the rows share a ``batch_id`` so
+    the amount is undone as one payment.
+    """
+    _validate_amount(amount)
+    clean_date = _validate_payment_date(payment_date)
+    clean_method = _normalize_method(method)
+    clean_note = _clean_note(note)
+    lock_payment_ledger(session)
+    sale = session.get(Sale, sale_id)
+    if sale is None:
+        raise ValueError("Sale not found")
+    if sale.sale_type != "installment":
+        raise ValueError("Payments can only be recorded against installment sales")
+    rows = list(
+        session.scalars(
+            select(Installment)
+            .where(Installment.sale_id == sale_id)
+            .order_by(Installment.installment_index)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    remaining = sum(max(0, row.amount_due - row.amount_paid) for row in rows)
+    if remaining <= 0:
+        raise ValueError("This sale is already fully paid")
+    if amount > remaining:
+        raise ValueError(f"Payment exceeds the remaining sale balance of {remaining}")
+
+    batch_id = uuid.uuid4().hex
+    created: list[Payment] = []
+    left = amount
+    with session.begin_nested():
+        for row in rows:
+            if left <= 0:
+                break
+            open_amount = row.amount_due - row.amount_paid
+            if open_amount <= 0:
+                continue
+            part = min(left, open_amount)
+            payment = Payment(
+                installment_id=row.id,
+                amount=part,
+                payment_date=clean_date,
+                method=clean_method,
+                note=clean_note,
+                batch_id=batch_id,
+            )
+            session.add(payment)
+            row.amount_paid += part
+            row.method = clean_method
+            if row.amount_paid >= row.amount_due:
+                row.paid_date = clean_date
+            created.append(payment)
+            left -= part
+        session.flush()
+    return created
+
+
+def record_sale_payment_for_user(
+    session: Session,
+    user_id: int,
+    sale_id: int,
+    amount: int,
+    payment_date: date,
+    method: str,
+    note: str | None = None,
+) -> list[Payment]:
+    """Record a free-amount installment payment after verifying the active operator role."""
+    _require_active_operator(session, user_id)
+    return record_sale_payment(session, sale_id, amount, payment_date, method, note)
 
 
 def record_credit_payment(
@@ -163,15 +257,27 @@ def undo_last_payment(session: Session, user_id: int, reason: str) -> AuditLog:
     if payment is None:
         raise ValueError("There is no payment to undo")
 
-    installment_id = payment.installment_id
-    if installment_id is not None:
-        installment = session.scalar(
+    # An amount spread over several installments is undone as a whole.
+    group = [payment]
+    if payment.batch_id is not None:
+        group = list(
+            session.scalars(
+                select(Payment)
+                .where(Payment.batch_id == payment.batch_id)
+                .order_by(Payment.id)
+                .with_for_update()
+            )
+        )
+    installment_ids = [part.installment_id for part in group if part.installment_id is not None]
+    installments = list(
+        session.scalars(
             select(Installment)
-            .where(Installment.id == installment_id)
+            .where(Installment.id.in_(installment_ids))
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-    elif payment.sale_id is not None:
+    ) if installment_ids else []
+    if payment.installment_id is None and payment.sale_id is not None:
         session.scalar(
             select(Sale)
             .where(Sale.id == payment.sale_id)
@@ -181,13 +287,18 @@ def undo_last_payment(session: Session, user_id: int, reason: str) -> AuditLog:
 
     details = {
         "payment_id": payment.id,
-        "amount": payment.amount,
+        "amount": sum(part.amount for part in group),
         "payment_date": payment.payment_date.isoformat(),
         "method": payment.method,
         "note": payment.note,
         "installment_id": payment.installment_id,
         "sale_id": payment.sale_id,
     }
+    if len(group) > 1:
+        details["parts"] = [
+            {"payment_id": part.id, "installment_id": part.installment_id, "amount": part.amount}
+            for part in group
+        ]
     audit = AuditLog(
         user_id=owner.id,
         action="undo_payment",
@@ -199,13 +310,63 @@ def undo_last_payment(session: Session, user_id: int, reason: str) -> AuditLog:
     with session.begin_nested():
         session.add(audit)
         session.flush()
-        session.delete(payment)
+        for part in group:
+            session.delete(part)
         session.flush()
-        if installment_id is not None:
-            if installment is not None:
-                _recalculate_installment(session, installment)
+        for installment in installments:
+            _recalculate_installment(session, installment)
         session.flush()
     return audit
+
+
+def delete_payments(
+    session: Session,
+    owner_user_id: int,
+    *,
+    installment_ids: Iterable[int] = (),
+    credit_sale_ids: Iterable[int] = (),
+) -> int:
+    """Delete every payment recorded on some installments and credit sales.
+
+    The installments become unpaid again (their paid amount, date and method
+    are rebuilt), each removed payment is kept in the audit log, and the
+    number of payments removed is returned. A credit down payment belongs to
+    the sale and stays.
+    """
+    owner = auth.require_owner(session, owner_user_id)
+    installments = list(dict.fromkeys(int(value) for value in installment_ids))
+    credit_sales = list(dict.fromkeys(int(value) for value in credit_sale_ids))
+    targets = []
+    if installments:
+        targets.append(Payment.installment_id.in_(installments))
+    if credit_sales:
+        targets.append(Payment.sale_id.in_(credit_sales))
+    if not targets:
+        return 0
+    lock_payment_ledger(session)
+    removed = session.scalars(select(Payment).where(or_(*targets)).order_by(Payment.id)).all()
+    for payment in removed:
+        session.add(AuditLog(
+            user_id=owner.id,
+            action="delete_payment",
+            entity="payment",
+            entity_id=payment.id,
+            details=json.dumps({
+                "amount": payment.amount,
+                "payment_date": payment.payment_date.isoformat(),
+                "method": payment.method,
+                "note": payment.note,
+                "installment_id": payment.installment_id,
+                "sale_id": payment.sale_id,
+            }, ensure_ascii=False, sort_keys=True),
+        ))
+        session.delete(payment)
+    session.flush()
+    if installments:
+        for installment in session.scalars(select(Installment).where(Installment.id.in_(installments))):
+            _recalculate_installment(session, installment)
+        session.flush()
+    return len(removed)
 
 
 def _recalculate_installment(session: Session, installment: Installment) -> None:

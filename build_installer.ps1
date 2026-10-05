@@ -135,7 +135,16 @@ if ($SkipSelfTest) {
     Write-Step "4/6 Self-test: open the packaged app and click every sidebar button"
     $report = Join-Path $DistDir "selftest-report.json"
     Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
-    $process = Start-Process -FilePath $AppExe -ArgumentList @("--self-test", "`"$report`"") -Wait -PassThru
+    # Start the exe directly, not through the Windows shell (Start-Process): from a
+    # network path such as \\wsl.localhost the shell stops at an "Open File -
+    # Security Warning" prompt and the build waits for a click that never comes.
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $AppExe
+    $startInfo.Arguments = "--self-test `"$report`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.WorkingDirectory = Split-Path -Parent $AppExe
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $process.WaitForExit()
     if (Test-Path -LiteralPath $report) {
         Get-Content -LiteralPath $report | Write-Host
     }

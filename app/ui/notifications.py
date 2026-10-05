@@ -21,9 +21,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
 
-from PySide6.QtCore import QObject, QSettings, Signal
+from PySide6.QtCore import QObject, Signal
 
-from app.config import APP_NAME
+from app.ui.preferences import app_settings
 
 HISTORY_LIMIT = 100
 NATIVE_SETTING = "notifications/native"
@@ -141,13 +141,13 @@ class NotificationHub(QObject):
 
 def native_enabled() -> bool:
     """Return the per-PC preference for native Windows toasts (default on)."""
-    value = QSettings(APP_NAME, APP_NAME).value(NATIVE_SETTING, True)
+    value = app_settings().value(NATIVE_SETTING, True)
     return value not in (False, "false", "0", 0)
 
 
 def set_native_enabled(enabled: bool) -> None:
     """Persist the per-PC preference for native Windows toasts."""
-    QSettings(APP_NAME, APP_NAME).setValue(NATIVE_SETTING, bool(enabled))
+    app_settings().setValue(NATIVE_SETTING, bool(enabled))
 
 
 def relative_time(moment: datetime, now: datetime | None = None) -> str:

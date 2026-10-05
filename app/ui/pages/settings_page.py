@@ -33,6 +33,7 @@ from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
 from app.services import auth, backup, calc, settings
+from app.services.schedule import DEFAULT_DUE_MODE
 from app.ui.events import events
 
 
@@ -106,6 +107,7 @@ class SettingsPage(QWidget):
                 self._set_owner_access(False)
         else:
             self.owner_settings_group.hide()
+            self.server_group.hide()
             self.backup_group.hide()
             self.user_group.hide()
             self.owner_access_label.hide()
@@ -138,8 +140,10 @@ class SettingsPage(QWidget):
         self.owner_settings_group = self._build_owner_settings(body)
         self.backup_group = self._build_backup_section(body)
         self.user_group = self._build_user_management(body)
+        self.server_group = self._build_server_section(body)
         if self._is_owner:
             body_layout.addWidget(self.owner_settings_group)
+            body_layout.addWidget(self.server_group)
             body_layout.addWidget(self.backup_group)
             body_layout.addWidget(self.user_group)
 
@@ -155,12 +159,18 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(group)
         form = QFormLayout()
         self.due_mode = QComboBox(group)
-        self.due_mode.addItem(ar.SET_DUE_FIRST_OF_MONTH, "first_of_month")
         self.due_mode.addItem(ar.SET_DUE_PURCHASE_DAY, "purchase_day")
+        self.due_mode.addItem(ar.SET_DUE_FIRST_OF_MONTH, "first_of_month")
         self.grace_days = QSpinBox(group)
         self.grace_days.setRange(0, 365)
         self.inactivity_minutes = QSpinBox(group)
         self.inactivity_minutes.setRange(1, 180)
+        self.business_nis = QLineEdit(group)
+        self.business_nif = QLineEdit(group)
+        self.seller_discount = QSpinBox(group)
+        self.seller_discount.setRange(0, 100)
+        self.seller_discount.setSuffix(" %")
+        self.seller_discount.setToolTip(ar.SET_SELLER_DISCOUNT_HINT)
         self.language_selector = QComboBox(group)
         self.language_selector.addItem(f"🇩🇿  {ar.LANGUAGE_ARABIC}", "ar")
         self.language_selector.addItem(f"🇬🇧  {ar.LANGUAGE_ENGLISH}", "en")
@@ -169,6 +179,9 @@ class SettingsPage(QWidget):
         form.addRow(ar.SET_DUE_MODE, self.due_mode)
         form.addRow(ar.SET_GRACE_DAYS, self.grace_days)
         form.addRow(ar.SET_INACTIVITY_MINUTES, self.inactivity_minutes)
+        form.addRow(ar.SET_NIS, self.business_nis)
+        form.addRow(ar.SET_NIF, self.business_nif)
+        form.addRow(ar.SET_SELLER_DISCOUNT, self.seller_discount)
         layout.addLayout(form)
 
         presets_heading = QLabel(ar.SET_RATE_PRESETS, group)
@@ -200,6 +213,38 @@ class SettingsPage(QWidget):
         self.save_settings_button.clicked.connect(self._save_owner_settings)
         layout.addWidget(self.save_settings_button, alignment=Qt.AlignmentFlag.AlignLeft)
         return group
+
+    def _build_server_section(self, parent: QWidget) -> QGroupBox:
+        """Owner: share the records between several PCs through the main shop PC (PostgreSQL)."""
+        from app.services import shared_db
+
+        group = QGroupBox(ar.SERVER_SECTION, parent)
+        layout = QVBoxLayout(group)
+        server = shared_db.current_server()
+        if server is not None:
+            state = ar.SERVER_MODE_SERVER.format(host=server.host)
+        elif shared_db.is_shared():
+            state = ar.SERVER_MODE_ENVIRONMENT
+        else:
+            state = ar.SERVER_MODE_LOCAL
+        self.server_state = QLabel(state, group)
+        self.server_state.setWordWrap(True)
+        hint = QLabel(ar.SERVER_SECTION_HINT, group)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        self.server_button = QPushButton(f"🖧  {ar.SERVER_CONFIGURE}", group)
+        self.server_button.setProperty("variant", "secondary")
+        self.server_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.server_button.clicked.connect(self._configure_server)
+        layout.addWidget(self.server_state)
+        layout.addWidget(hint)
+        layout.addWidget(self.server_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        return group
+
+    def _configure_server(self) -> None:
+        from app.ui.dialogs.server_dialog import configure_server_and_quit
+
+        configure_server_and_quit(self)
 
     def _build_user_management(self, parent: QWidget) -> QGroupBox:
         """Owner-only list of every account (owners and sellers) and its actions."""
@@ -415,16 +460,22 @@ class SettingsPage(QWidget):
             auth.require_owner(session, self.current_user.id)
             from app.i18n import get_language
             lang = get_language()
-            due_mode = settings.get_value(session, "due_mode", "first_of_month")
+            due_mode = settings.get_value(session, "due_mode", DEFAULT_DUE_MODE)
             grace_days = settings.get_value(session, "grace_days", 5)
             inactivity_minutes = settings.get_value(session, "inactivity_minutes", 15)
+            business_nis = settings.get_value(session, "business_nis", "")
+            business_nif = settings.get_value(session, "business_nif", "")
             presets = settings.get_rate_presets(session)
+            seller_discount = settings.get_seller_max_discount(session)
         lang_idx = self.language_selector.findData(lang)
         if lang_idx >= 0:
             self.language_selector.setCurrentIndex(lang_idx)
         self.due_mode.setCurrentIndex(max(0, self.due_mode.findData(due_mode)))
         self.grace_days.setValue(self._bounded_int(grace_days, 5, 0, 365))
         self.inactivity_minutes.setValue(self._bounded_int(inactivity_minutes, 15, 1, 180))
+        self.business_nis.setText(str(business_nis) if business_nis is not None else "")
+        self.business_nif.setText(str(business_nif) if business_nif is not None else "")
+        self.seller_discount.setValue(seller_discount)
         self.rate_table.setRowCount(0)
         for months, rate in sorted(presets.items()):
             self._append_rate_row(months, rate)
@@ -440,6 +491,9 @@ class SettingsPage(QWidget):
                 settings.set_value(session, "due_mode", self.due_mode.currentData())
                 settings.set_value(session, "grace_days", self.grace_days.value())
                 settings.set_value(session, "inactivity_minutes", self.inactivity_minutes.value())
+                settings.set_value(session, "business_nis", self.business_nis.text().strip())
+                settings.set_value(session, "business_nif", self.business_nif.text().strip())
+                settings.set_seller_max_discount(session, self.current_user.id, self.seller_discount.value())
                 settings.set_value(
                     session,
                     "rate_presets",
@@ -616,6 +670,8 @@ class SettingsPage(QWidget):
                 type_label = f"📤 {ar.SET_BACKUP_TYPE_UPLOADED}"
             elif info.backup_type == "pre_upgrade":
                 type_label = f"🛡️ {ar.SET_BACKUP_TYPE_PRE_UPGRADE}"
+            elif info.backup_type == backup.SAFETY_LABEL:
+                type_label = f"🛡️ {ar.SET_BACKUP_TYPE_BEFORE_DELETE}"
             type_item = QTableWidgetItem(type_label)
             self.backup_table.setItem(row, 1, type_item)
 
@@ -781,11 +837,13 @@ class SettingsPage(QWidget):
 
     @staticmethod
     def _supports_local_backups() -> bool:
-        """Check the same local, file-backed SQLite limits as the backup service."""
+        """Check the same limits as the backup service: a local SQLite file, or the shop server."""
         try:
             url = make_url(database_url())
         except Exception:
             return False
+        if url.get_backend_name() == "postgresql":
+            return True
         path = url.database
         return bool(
             url.get_backend_name() == "sqlite"

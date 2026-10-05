@@ -10,6 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -33,6 +34,7 @@ from app.ui import icons
 from app.ui.dialogs.auth_dialogs import InlineError
 from app.ui.events import events
 from app.ui.theme import TYPE_COLOR_HEX, token
+from app.ui.widgets import row_selection
 from app.ui.widgets.client_types import color_dot
 
 _ERROR_KEYS = {
@@ -163,6 +165,8 @@ class ClientTypesPanel(QWidget):
         super().__init__(parent)
         self.owner_user_id = owner_user_id
         self._types: list[ClientType] = []
+        self._checked: set[int] = set()
+        self.row_boxes: dict[int, QCheckBox] = {}
         self.changed = False
 
         layout = QVBoxLayout(self)
@@ -186,6 +190,27 @@ class ClientTypesPanel(QWidget):
         header.addWidget(self.add_button, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
         layout.addSpacing(6)
+
+        # A checkbox on each type (except the protected one), "select all"
+        # and "delete selected".
+        tools = QHBoxLayout()
+        tools.setSpacing(10)
+        self.select_all_box = QCheckBox(ar.SEL_ALL, self)
+        self.select_all_box.setTristate(True)
+        self.select_all_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_all_box.clicked.connect(self._select_all_clicked)
+        self.count_label = QLabel(self)
+        self.count_label.setObjectName("sectionHint")
+        self.delete_button = QPushButton(ar.SEL_DELETE, self)
+        self.delete_button.setProperty("variant", "secondary")
+        self.delete_button.setIcon(icons.icon("trash", "failed", 16))
+        self.delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_button.clicked.connect(self._delete_checked)
+        tools.addWidget(self.select_all_box)
+        tools.addWidget(self.count_label)
+        tools.addWidget(self.delete_button)
+        tools.addStretch(1)
+        layout.addLayout(tools)
 
         self.error = InlineError(self)
         layout.addWidget(self.error)
@@ -213,10 +238,13 @@ class ClientTypesPanel(QWidget):
             item = self.rows.takeAt(0)
             if item.widget() is not None:
                 item.widget().deleteLater()
+        self.row_boxes.clear()
         movable = [item for item in self._types if not item.is_system]
+        self._checked &= {item.id for item in movable}
         for item in self._types:
             self.rows.addWidget(self._row(item, movable))
         self.rows.addStretch(1)
+        self._update_selection()
 
     def _row(self, item: ClientType, movable: list[ClientType]) -> QFrame:
         row = QFrame(self.list_widget)
@@ -224,6 +252,17 @@ class ClientTypesPanel(QWidget):
         line = QHBoxLayout(row)
         line.setContentsMargins(14, 10, 10, 10)
         line.setSpacing(10)
+        box = QCheckBox(row)
+        box.setCursor(Qt.CursorShape.PointingHandCursor)
+        box.setAccessibleName(item.name)
+        if item.is_system:
+            box.setEnabled(False)  # keeps the rows aligned; the protected type is never deleted
+            box.setToolTip(ar.CT_SYSTEM_HINT)
+        else:
+            box.setChecked(item.id in self._checked)
+            box.toggled.connect(lambda checked, type_id=item.id: self._set_checked(type_id, checked))
+            self.row_boxes[item.id] = box
+        line.addWidget(box)
         dot = QLabel(row)
         dot.setPixmap(color_dot(item.color, 14).pixmap(14, 14))
         line.addWidget(dot)
@@ -316,10 +355,88 @@ class ClientTypesPanel(QWidget):
         order[index], order[target] = order[target], order[index]
         self._run(lambda session: categories.reorder_client_types(session, self.owner_user_id, order))
 
+    # ------------------------------------------------------------ selection
+    def checked_types(self) -> list[ClientType]:
+        """The ticked types, in list order."""
+        return [item for item in self._types if item.id in self._checked]
+
+    def set_checked(self, type_id: int, checked: bool) -> None:
+        """Tick or untick one type (its checkbox follows)."""
+        box = self.row_boxes.get(type_id)
+        if box is not None:
+            box.setChecked(checked)
+
+    def _set_checked(self, type_id: int, checked: bool) -> None:
+        if checked:
+            self._checked.add(type_id)
+        else:
+            self._checked.discard(type_id)
+        self._update_selection()
+
+    def _select_all_clicked(self, *_args: object) -> None:
+        everything = bool(self.row_boxes) and self._checked.issuperset(self.row_boxes)
+        for box in self.row_boxes.values():
+            box.setChecked(not everything)
+        self._update_selection()
+
+    def _update_selection(self) -> None:
+        count = len(self._checked)
+        state = Qt.CheckState.Unchecked
+        if count and count == len(self.row_boxes):
+            state = Qt.CheckState.Checked
+        elif count:
+            state = Qt.CheckState.PartiallyChecked
+        self.select_all_box.blockSignals(True)
+        self.select_all_box.setCheckState(state)
+        self.select_all_box.blockSignals(False)
+        self.select_all_box.setEnabled(bool(self.row_boxes))
+        self.count_label.setText(ar.SEL_COUNT.format(count=count) if count else "")
+        self.count_label.setVisible(bool(count))
+        self.delete_button.setEnabled(count > 0)
+        self.delete_button.setText(f"{ar.SEL_DELETE} ({count})" if count > 1 else ar.SEL_DELETE)
+
+    def _delete_checked(self) -> None:
+        """Delete the ticked types; their clients move to a type the owner picks."""
+        chosen = self.checked_types()
+        if not chosen:
+            return
+        used = sum(item.customer_count for item in chosen)
+        reassign_to: int | None = None
+        if used:
+            others = [item for item in self._types if item.id not in self._checked]
+            dialog = _ReassignDialog(
+                ar.CT_DELETE_MANY_CONFIRM.format(count=len(chosen)),
+                ar.CT_DELETE_MANY_REASSIGN.format(count=used), others, self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            reassign_to = dialog.target_id()
+        else:
+            message = ar.CT_DELETE_MANY_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+                [item.name for item in chosen]
+            )
+            if row_selection.ask_delete(self, ar.CT_DELETE, message) is None:
+                return
+        self.delete_types([item.id for item in chosen], reassign_to)
+
+    def delete_types(self, type_ids: list[int], reassign_to: int | None = None) -> None:
+        """Delete several types at once (all or nothing)."""
+        self._checked.difference_update(type_ids)
+        self._run(
+            lambda session: categories.delete_client_types(
+                session, self.owner_user_id, type_ids, reassign_to_id=reassign_to
+            ),
+            ar.CT_DELETED_MANY_TOAST.format(count=len(type_ids)),
+        )
+
     def _delete(self, item: ClientType) -> None:
         reassign_to: int | None = None
         if item.customer_count:
-            dialog = _ReassignDialog(item, [t for t in self._types if t.id != item.id], self)
+            dialog = _ReassignDialog(
+                ar.CT_DELETE_CONFIRM.format(name=item.name),
+                ar.CT_DELETE_REASSIGN.format(count=item.customer_count),
+                [t for t in self._types if t.id != item.id], self,
+            )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             reassign_to = dialog.target_id()
@@ -358,14 +475,14 @@ class ClientTypesPanel(QWidget):
 class _ReassignDialog(QDialog):
     """Pick where a deleted type's clients go."""
 
-    def __init__(self, item: ClientType, others: list[ClientType], parent: QWidget) -> None:
+    def __init__(self, title: str, text: str, others: list[ClientType], parent: QWidget) -> None:
         super().__init__(parent)
-        self.setWindowTitle(ar.CT_DELETE_CONFIRM.format(name=item.name))
+        self.setWindowTitle(title)
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(10)
-        message = QLabel(ar.CT_DELETE_REASSIGN.format(count=item.customer_count), self)
+        message = QLabel(text, self)
         message.setWordWrap(True)
         layout.addWidget(message)
         self.target = QComboBox(self)

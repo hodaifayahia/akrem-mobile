@@ -332,8 +332,21 @@ class SetupOwnerDialog(_AuthShell):
         self.create_button.clicked.connect(self._create_owner)
         self.password_confirmation.returnPressed.connect(self._create_owner)
         self.form.addWidget(self.create_button)
+        # Another PC of a shop that already has its records on the main PC:
+        # connect to that server instead of creating a new, empty shop here.
+        self.server_button = QPushButton(self.card)
+        self.server_button.setProperty("variant", "ghost")
+        self.server_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.server_button.clicked.connect(self._connect_to_server)
+        self.form.addWidget(self.server_button)
         self.retranslate()
         self.username.setFocus()
+
+    def _connect_to_server(self) -> None:
+        from app.ui.dialogs.server_dialog import configure_server_and_quit
+
+        if configure_server_and_quit(self):
+            self.reject()
 
     def retranslate(self) -> None:
         super().retranslate()
@@ -349,6 +362,7 @@ class SetupOwnerDialog(_AuthShell):
         self.password.retranslate()
         self.password_confirmation.retranslate()
         self.create_button.setText(ar.CREATE_OWNER_BUTTON)
+        self.server_button.setText(f"🖧  {ar.SERVER_SETUP_LINK}")
 
     def _create_owner(self) -> None:
         """Create the owner through the auth service."""

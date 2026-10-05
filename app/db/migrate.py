@@ -23,7 +23,10 @@ def upgrade_database(url: str | None = None) -> None:
         ensure_data_dirs()
         try:
             db_file = database_path()
-            if db_file.is_file() and db_file.stat().st_size > 0:
+            # Only the local database gets a copy at every start; a shared
+            # server is covered by the daily backups made from each PC.
+            local = database_url().startswith("sqlite")
+            if local and db_file.is_file() and db_file.stat().st_size > 0:
                 from app.services.backup import create_backup
                 create_backup(label="pre_upgrade")
                 logger.info("Automatic pre-upgrade safety backup created before database migration.")

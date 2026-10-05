@@ -273,3 +273,57 @@ def test_generate_cash_sale_receipt_pdf(tmp_path: Path):
     )
     assert out_credit.exists()
     assert out_credit.stat().st_size > 1000
+
+
+def test_cash_receipt_shows_only_the_logo_and_the_sale_facts() -> None:
+    """The owner wants the logo, then nine rows: no shop line, signer or signature."""
+    from app.i18n import ar
+    from app.services.pdf_forms import _cash_receipt_html
+
+    html = _cash_receipt_html(
+        "اشرف ناقوص", None, "11PM", "cash", 140000, 140000, 0, date(2026, 10, 1), None,
+        "file:///logo.png", "admin@admin.com",
+    )
+    assert html.count("<tr class='fact'>") == 9
+    for label in (
+        ar.PDF_CASH_DATE, ar.PDF_CUSTOMER_NAME, ar.PDF_PHONE, ar.PDF_PRODUCT, ar.PDF_CASH_KIND,
+        ar.CASH_TOTAL_INVOICE, ar.CASH_AMOUNT_PAID, ar.CASH_REMAINING_BALANCE, ar.PDF_CASH_STATUS,
+    ):
+        assert label in html
+    assert ar.PDF_CASH_STATUS_PAID in html and "140,000" in html
+    for removed in (ar.PDF_SHOP_NAME, ar.PDF_RECEIVED_BY, ar.PDF_RECEIVER_SIGNATURE, "admin@admin.com"):
+        assert removed not in html
+    assert "<img" in html.split("<table", 1)[0]  # the logo comes first
+
+    credit = _cash_receipt_html(
+        "عمر", "0555123456", "iPhone", "credit", 180000, 50000, 130000, date(2026, 10, 1),
+        date(2026, 11, 1), "file:///logo.png", None,
+    )
+    assert ar.PDF_CASH_KIND_CREDIT in credit and ar.PDF_CASH_STATUS_DUE in credit
+
+
+def test_cash_sale_quantity_multiplies_the_price_and_reduces_stock(
+    qapp, memory_engine: Engine, sales_test_db: dict[str, int], monkeypatch: pytest.MonkeyPatch
+):
+    """5 phones in stock, 2 sold in one sale: the price doubles and 3 stay in stock."""
+    from app.services import stock
+
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
+    with session_scope(memory_engine) as session:
+        stock.add_units(session, sales_test_db["owner_id"], product_id=sales_test_db["prod_id"], quantity=5)
+        session.commit()
+        owner = session.get(User, sales_test_db["owner_id"])
+        page = NewSalePage(current_user=owner)
+
+        page.cash_product.setCurrentText("Redmi Note 13")
+        assert page.cash_details.quantity.maximum() == 5
+        page.cash_details.quantity.setValue(2)
+        assert (page.cash_total.value(), page.cash_wholesale.value()) == (64000, 50000)
+        page._save_cash_sale()
+
+        saved = session.query(Sale).filter_by(sale_type="cash").one()
+        assert (saved.quantity, saved.total, saved.profit) == (2, 64000, 14000)
+        assert len(stock.available_units(session, sales_test_db["prod_id"])) == 3
+        assert page.cash_details.quantity.value() == 1
+        assert page.cash_details.quantity.maximum() == 3

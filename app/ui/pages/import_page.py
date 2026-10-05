@@ -11,11 +11,12 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
     QFileDialog,
     QGroupBox,
@@ -36,7 +37,10 @@ from app import config
 from app.db.session import session_scope
 from app.i18n import ar
 from app.services import categories, importer
+from app.ui import icons
 from app.ui.events import events
+from app.ui.screen_fit import fit_to_screen
+from app.ui.widgets.row_selection import SelectionBar
 
 
 def _field_labels() -> dict[str, str]:
@@ -109,6 +113,7 @@ class ImportPage(QWidget):
         self._mapping_widgets: dict[str, QComboBox] = {}
         self._sale_type_overrides: dict[int, str] = {}
         self._sheet_value_rows: set[int] = set()
+        self._removed_rows: set[int] = set()
         self._uncategorized_id: int | None = None
         self._loading_preview = False
 
@@ -222,6 +227,28 @@ class ImportPage(QWidget):
         self.preview_table.setAlternatingRowColors(True)
         self.preview_table.setShowGrid(False)
         self.preview_table.setMinimumHeight(270)
+
+        # Tick rows to leave them out of the import ("select all" works too);
+        # removed rows can be brought back until the file is imported.
+        selection_row = QHBoxLayout()
+        selection_row.setSpacing(10)
+        self.selection = SelectionBar(self.preview_table, self._key_at, self, delete_text=ar.IMP_REMOVE_ROWS)
+        self.selection.delete_requested.connect(self._remove_selected_rows)
+        self.removed_label = QLabel(self)
+        self.removed_label.setObjectName("sectionHint")
+        self.restore_button = QPushButton(ar.IMP_RESTORE_ROWS, self)
+        self.restore_button.setProperty("variant", "ghost")
+        self.restore_button.setProperty("compact", True)
+        self.restore_button.setIcon(icons.icon("refresh", "text", 14))
+        self.restore_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.restore_button.clicked.connect(self.restore_removed_rows)
+        selection_row.addWidget(self.selection)
+        selection_row.addStretch(1)
+        selection_row.addWidget(self.removed_label)
+        selection_row.addWidget(self.restore_button)
+        layout.addLayout(selection_row)
+        self._update_removed_label()
+
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.preview_table)
@@ -243,18 +270,17 @@ class ImportPage(QWidget):
 
     def _pick_file(self) -> None:
         """Choose a workbook and load its available worksheet names."""
-        selected, _filter = QFileDialog.getOpenFileName(
-            self,
-            ar.IMP_PICK_FILE,
-            "",
-            ar.IMP_FILE_FILTER,
-        )
-        if not selected:
-            return
-        self._path = Path(selected)
+        selected = choose_workbook(self)
+        if selected is not None:
+            self.load_file(selected)
+
+    def load_file(self, path: Path) -> None:
+        """Load a workbook's worksheet names and preview the installment sheet."""
+        self._path = Path(path)
         self.file_path.setText(str(self._path))
         self._sale_type_overrides.clear()
         self._sheet_value_rows.clear()
+        self._removed_rows.clear()
         self.sheet_selector.blockSignals(True)
         self.sheet_selector.clear()
         self.sheet_selector.blockSignals(False)
@@ -281,6 +307,7 @@ class ImportPage(QWidget):
         if self._path is not None and self.sheet_selector.currentText():
             self._sale_type_overrides.clear()
             self._sheet_value_rows.clear()
+            self._removed_rows.clear()
             self._load_preview()
 
     def _load_preview(
@@ -300,6 +327,7 @@ class ImportPage(QWidget):
                 mapping=mapping,
                 sale_type_overrides=overrides,
             )
+            self._preview = importer.without_rows(self._preview, self._removed_rows)
         except Exception:
             self._preview = None
             self.mapping_section.setVisible(False)
@@ -455,7 +483,45 @@ class ImportPage(QWidget):
         self.preview_table.setColumnWidth(17, 210)
         self.preview_table.resizeRowsToContents()
         self._loading_preview = False
+        self.selection.refresh()
+        self._update_removed_label()
         self._refresh_import_availability()
+
+    # ------------------------------------------------------------ row removal
+    def _key_at(self, row: int) -> int | None:
+        """The Excel row number shown on a preview row (the row's checkbox key)."""
+        if self._preview is None or not 0 <= row < len(self._preview.rows):
+            return None
+        return self._preview.rows[row].source_row
+
+    def _remove_selected_rows(self) -> None:
+        self.remove_rows(self.selection.target_keys())
+
+    def remove_rows(self, source_rows: list[int]) -> None:
+        """Leave some Excel rows out of the import (nothing is saved yet)."""
+        if self._preview is None or not source_rows:
+            return
+        self._removed_rows.update(source_rows)
+        for source_row in source_rows:
+            self._sale_type_overrides.pop(source_row, None)
+            self._sheet_value_rows.discard(source_row)
+        self._preview = importer.without_rows(self._preview, source_rows)
+        self.selection.clear()
+        self._render_preview()
+
+    def restore_removed_rows(self) -> None:
+        """Bring back every row removed from this sheet."""
+        if not self._removed_rows:
+            return
+        self._removed_rows.clear()
+        mapping = dict(self._preview.mapping) if self._preview is not None else None
+        self._load_preview(mapping=mapping, preserve_overrides=True)
+
+    def _update_removed_label(self) -> None:
+        count = len(self._removed_rows)
+        self.removed_label.setText(ar.IMP_REMOVED_ROWS.format(count=count) if count else "")
+        self.removed_label.setVisible(bool(count))
+        self.restore_button.setVisible(bool(count))
 
     def _make_sale_type_selector(self, source_row: int) -> QComboBox:
         """Create a per-row selector for missing or unrecognized sale types."""
@@ -601,25 +667,7 @@ class ImportPage(QWidget):
 
     def _create_template(self) -> None:
         """Create an Excel template with headers and common-value dropdowns."""
-        selected, _filter = QFileDialog.getSaveFileName(
-            self,
-            ar.IMP_TEMPLATE_TITLE,
-            ar.IMP_TEMPLATE_FILENAME,
-            ar.IMP_TEMPLATE_FILTER,
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        if path.suffix.casefold() != ".xlsx":
-            path = path.with_suffix(".xlsx")
-        try:
-            with session_scope() as session:
-                client_types = [category.name for category in categories.list_client_types(session)]
-            _write_template(path, client_types)
-        except Exception:
-            self._show_error(ar.IMP_TEMPLATE_ERROR)
-            return
-        QMessageBox.information(self, ar.IMP_TEMPLATE_TITLE, ar.IMP_TEMPLATE_SAVED)
+        save_import_template(self)
 
     def _sale_type_label(self, sale_type: str) -> str:
         """Translate internal sale type codes for the preview."""
@@ -635,6 +683,59 @@ class ImportPage(QWidget):
     def _show_error(self, message: str) -> None:
         """Show an import-page message in Arabic."""
         QMessageBox.warning(self, ar.IMP_PAGE_TITLE, message)
+
+
+class ImportDialog(QDialog):
+    """The Excel import, opened from the clients or payments page."""
+
+    def __init__(self, current_user: Any, path: Path | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(ar.IMP_PAGE_TITLE)
+        self.setMinimumSize(720, 480)
+        self.page = ImportPage(current_user, self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.page)
+        if path is not None and hasattr(self.page, "file_path"):
+            self.page.load_file(path)
+        fit_to_screen(self, QSize(1180, 820))
+
+
+def choose_workbook(parent: QWidget) -> Path | None:
+    """Ask for an Excel workbook to import; ``None`` when cancelled."""
+    selected, _filter = QFileDialog.getOpenFileName(parent, ar.IMP_PICK_FILE, "", ar.IMP_FILE_FILTER)
+    return Path(selected) if selected else None
+
+
+def open_import(current_user: Any, parent: QWidget) -> None:
+    """Pick a workbook, then preview and import it in :class:`ImportDialog`."""
+    path = choose_workbook(parent)
+    if path is not None:
+        ImportDialog(current_user, path, parent).exec()
+
+
+def save_import_template(parent: QWidget) -> Path | None:
+    """Ask where to save the import template and write it; ``None`` if not saved."""
+    selected, _filter = QFileDialog.getSaveFileName(
+        parent,
+        ar.IMP_TEMPLATE_TITLE,
+        str(config.data_dir() / "exports" / ar.IMP_TEMPLATE_FILENAME),
+        ar.IMP_TEMPLATE_FILTER,
+    )
+    if not selected:
+        return None
+    path = Path(selected)
+    if path.suffix.casefold() != ".xlsx":
+        path = path.with_suffix(".xlsx")
+    try:
+        with session_scope() as session:
+            client_types = [category.name for category in categories.list_client_types(session)]
+        _write_template(path, client_types)
+    except Exception:
+        QMessageBox.warning(parent, ar.IMP_PAGE_TITLE, ar.IMP_TEMPLATE_ERROR)
+        return None
+    QMessageBox.information(parent, ar.IMP_TEMPLATE_TITLE, ar.IMP_TEMPLATE_SAVED)
+    return path
 
 
 def _sheet_names(path: Path) -> list[str]:

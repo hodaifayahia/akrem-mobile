@@ -21,7 +21,7 @@ DEFAULT_CATEGORY_STYLES: tuple[tuple[str, str, int], ...] = (
 )
 DEFAULT_CATEGORIES = tuple(name for name, _color, _order in DEFAULT_CATEGORY_STYLES)
 DEFAULT_SETTINGS = {
-    "due_mode": "first_of_month",
+    "due_mode": "purchase_day",
     "grace_days": 5,
     "rate_presets": {"4": 35, "5": 35, "6": 35, "7": 35, "10": 40, "12": 45},
 }

@@ -91,7 +91,8 @@ def test_customer_details_dialog_switches_sales_and_hides_owner_fields(
     assert owner_dialog.financial_table.item(0, 6).text() == "10,000 دج"
 
     owner_dialog.sale_selector.setCurrentIndex(1)
-    assert owner_dialog.details_table.item(0, 1).text() == "Cash phone"
+    # Latin product names stay in reading order inside the right-to-left table.
+    assert owner_dialog.details_table.item(0, 1).text() == "\u2066Cash phone\u2069"
     owner_dialog.close()
 
     seller_dialog = CustomerDetailsDialog(
@@ -115,3 +116,33 @@ def test_customer_details_dialog_switches_sales_and_hides_owner_fields(
     seller_dialog._request_edit()
     assert requested == [customer_id]
     assert seller_dialog.result() == QDialog.DialogCode.Accepted
+
+
+def test_customer_details_dialog_scrolls_and_fits_the_screen(
+    memory_engine: Engine,
+    qt_app: QApplication,
+) -> None:
+    """A long schedule scrolls inside the sale tab; the dialog stays on screen."""
+    with session_scope(memory_engine) as session:
+        category = Category(name="Long plan")
+        session.add(category)
+        session.flush()
+        customer = customers.create_customer(session, full_name="Long Plan", category_id=category.id)
+        customer_id = customer.id
+        sales.create_sale(
+            session, customer_id=customer.id, product="Phone", sale_type="installment",
+            wholesale_price=30_000, cash_price=40_000, rate=0, months=24, purchase_date=date(2026, 9, 1),
+        )
+    dialog = CustomerDetailsDialog(
+        customer_id, User(username="owner", password_hash="unused", role="owner"), engine=memory_engine,
+    )
+    dialog.show()
+    qt_app.processEvents()
+    area = dialog.screen().availableGeometry()
+    assert area.contains(dialog.frameGeometry())
+    table = dialog.schedule_table
+    assert table.rowCount() == 24
+    # Every schedule row is laid out; the sale tab scrolls instead of the table.
+    assert table.height() >= sum(table.rowHeight(row) for row in range(24))
+    assert dialog.sale_scroll.verticalScrollBar().maximum() > 0
+    dialog.close()

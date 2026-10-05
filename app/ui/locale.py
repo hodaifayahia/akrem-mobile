@@ -7,12 +7,12 @@ which is why widgets must not call ``setLayoutDirection`` themselves.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import QApplication, QLabel
 
-from app.config import APP_NAME
 from app.i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, get_layout_direction, set_language
 from app.ui import icons
+from app.ui.preferences import app_settings
 from app.ui.theme import apply_theme
 
 LANGUAGE_SETTING = "language"
@@ -77,7 +77,7 @@ def install_label_direction_filter(app: QApplication) -> None:
 
 def saved_language() -> str | None:
     """Return this PC's saved interface language, if one was chosen."""
-    value = QSettings(APP_NAME, APP_NAME).value(LANGUAGE_SETTING, None)
+    value = app_settings().value(LANGUAGE_SETTING, None)
     return value if value in SUPPORTED_LANGUAGES else None
 
 
@@ -103,5 +103,5 @@ def change_language(code: str) -> None:
     The language is a per-PC preference (stored in QSettings, not in the
     shared database) so one seller's choice doesn't change another PC.
     """
-    QSettings(APP_NAME, APP_NAME).setValue(LANGUAGE_SETTING, code)
+    app_settings().setValue(LANGUAGE_SETTING, code)
     apply_language(code)

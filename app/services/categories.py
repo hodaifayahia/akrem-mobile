@@ -175,6 +175,32 @@ def delete_client_type(
     return moved
 
 
+def delete_client_types(
+    session: Session,
+    owner_user_id: int,
+    type_ids: Iterable[int],
+    *,
+    reassign_to_id: int | None = None,
+) -> int:
+    """Delete several non-system types; their customers move to ``reassign_to_id``.
+
+    All or nothing: a system type, a missing target while customers would be
+    left without a type, or a target that is itself being deleted raises
+    ``ClientTypeError``. Returns the number of customers moved.
+    """
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(type_id) for type_id in type_ids))
+    if reassign_to_id is not None and reassign_to_id in unique_ids:
+        raise ClientTypeError("invalid_reassign", "Choose a client type that is not being deleted")
+    rows = [_require_type(session, type_id) for type_id in unique_ids]
+    if any(category.is_system for category in rows):
+        raise ClientTypeError("system_type", "The system client type cannot be deleted")
+    moved = 0
+    for category in rows:
+        moved += delete_client_type(session, owner_user_id, category.id, reassign_to_id=reassign_to_id)
+    return moved
+
+
 def assign_client_type(
     session: Session, owner_user_id: int, customer_ids: Iterable[int], type_id: int
 ) -> int:

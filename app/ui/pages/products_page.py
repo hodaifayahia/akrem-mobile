@@ -1,9 +1,10 @@
 """Product catalog: prices, an installment quote, sales count, archive state.
 
-Everyone can browse active products and their selling price (sellers use
-them to quote customers). Wholesale prices, margins, editing, archiving and
-the Excel template/upload are owner-only, and the product service re-checks
-the owner role. A product needs only a name and a selling price.
+Everyone can browse active products, their selling price and how many are
+in stock (sellers use them to quote customers). Wholesale prices, margins,
+editing (including the quantity in stock), archiving, receiving new goods and
+the Excel template/upload are owner-only, and the services re-check the owner
+role. A product needs only a name and a selling price.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.db.models import Product, User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, calc, product_sheet, products, stock
+from app.services import auth, calc, products, stock
 from app.services.customers import normalize_search_text
 from app.services.settings import get_rate_presets
 from app.ui import icons
@@ -47,6 +48,8 @@ from app.ui.pages.stock_panel import StockPanel
 from app.i18n.plan_text import every_text, plan_description, plan_summary
 from app.i18n.stock_text import battery_text, ltr_text
 from app.ui.theme import qcolor, repolish
+from app.ui.widgets import row_selection
+from app.ui.widgets.row_selection import SelectionBar
 
 _LOG = logging.getLogger(__name__)
 
@@ -54,7 +57,10 @@ _LOG = logging.getLogger(__name__)
 class ProductDialog(QDialog):
     """Name and selling price (required), optional wholesale price and default plan."""
 
-    def __init__(self, *, title: str, product: Product | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, *, title: str, product: Product | None = None, available: int = 0, parent: QWidget | None = None
+    ) -> None:
+        """``available`` is how many of the product are in stock now (shown in the quantity field)."""
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(440)
@@ -92,10 +98,20 @@ class ProductDialog(QDialog):
         self.plan_months.setValue(plan.months)
         self.plan_interval.setValue(plan.interval)
         self.plan_rate.setValue(-1 if plan.rate is None else plan.rate)
+        self.quantity = QSpinBox(self)
+        self.quantity.setRange(0, stock.MAX_SALE_QUANTITY)
+        self.quantity.setValue(available)
+        self.quantity.setMaximumWidth(160)
+        self.initial_quantity = available
+        quantity_hint = QLabel(ar.PROD_QUANTITY_HINT, self)
+        quantity_hint.setObjectName("sectionHint")
+        quantity_hint.setWordWrap(True)
         form = QFormLayout()
         form.addRow(f"{ar.SET_PRODUCT_NAME} *", self.name)
         form.addRow(f"{ar.SET_PRODUCT_CASH} *", self.cash_price)
         form.addRow(f"{ar.SET_PRODUCT_WHOLESALE} ({ar.PROD_OPTIONAL})", self.wholesale_price)
+        form.addRow(ar.PROD_QUANTITY, self.quantity)
+        form.addRow("", quantity_hint)
         layout.addLayout(form)
         plan_title = QLabel(ar.PLAN_SECTION, self)
         plan_title.setObjectName("sectionTitle")
@@ -150,8 +166,8 @@ class ProductDialog(QDialog):
 class ProductsPage(QWidget):
     """Browse and (for the owner) manage the product catalog."""
 
-    COLUMNS_OWNER = ("name", "wholesale", "cash", "margin", "plan", "quote", "stock", "sold", "last_sold", "state")
-    COLUMNS_SELLER = ("name", "cash", "plan", "quote", "stock", "sold", "state")
+    COLUMNS_OWNER = ("name", "stock", "wholesale", "cash", "margin", "plan", "quote", "sold", "last_sold", "state")
+    COLUMNS_SELLER = ("name", "stock", "cash", "plan", "quote", "sold", "state")
 
     def __init__(self, current_user: User, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -188,9 +204,11 @@ class ProductsPage(QWidget):
         self.upload_button = self._action(ar.PROD_UPLOAD_BUTTON, "upload", "secondary")
         self.upload_button.setToolTip(ar.PROD_UPLOAD_TOOLTIP)
         self.upload_button.clicked.connect(self._upload)
-        self.export_button = self._action(ar.STOCK_EXPORT, "import", "secondary")
-        self.export_button.clicked.connect(self._export_stock)
-        for button in (self.template_button, self.upload_button, self.export_button):
+        # New goods bought for the shop: one or many phones of a product (new or existing).
+        self.receive_button = self._action(ar.PROD_RECEIVE, "plus", None)
+        self.receive_button.setToolTip(ar.PROD_RECEIVE_TOOLTIP)
+        self.receive_button.clicked.connect(self._receive_goods)
+        for button in (self.template_button, self.upload_button, self.receive_button):
             button.setVisible(self._is_owner)
             header.addWidget(button)
         layout.addLayout(header)
@@ -252,6 +270,15 @@ class ProductsPage(QWidget):
         self.table.itemSelectionChanged.connect(self._update_actions)
         if self._is_owner:
             self.table.itemDoubleClicked.connect(lambda _item: self._edit_selected())
+        # Owner: a checkbox per product, "select all" and "delete selected".
+        self.selection: SelectionBar | None = None
+        if self._is_owner:
+            self.selection = SelectionBar(self.table, self._key_at, catalog)
+            self.selection.delete_requested.connect(self._delete_selected)
+            selection_row = QHBoxLayout()
+            selection_row.addWidget(self.selection)
+            selection_row.addStretch(1)
+            catalog_layout.addLayout(selection_row)
         catalog_layout.addWidget(self.table, 1)
 
         self.empty_card = QFrame(catalog)
@@ -287,7 +314,7 @@ class ProductsPage(QWidget):
             "margin": ar.PROD_COL_MARGIN,
             "plan": ar.PROD_COL_PLAN,
             "quote": ar.INSTALLMENT_AMOUNT,
-            "stock": ar.PROD_COL_STOCK,
+            "stock": ar.PROD_COL_AVAILABLE,
             "sold": ar.PROD_COL_SOLD,
             "last_sold": ar.PROD_COL_LAST_SOLD,
             "state": ar.SET_PRODUCT_ACTIVE,
@@ -337,12 +364,20 @@ class ProductsPage(QWidget):
                     item.setForeground(self.palette().placeholderText())
                 if key == "quote" and self._plan_rate(product) is None:
                     item.setToolTip(ar.PLAN_NO_RATE.format(months=products.plan_of(product).months))
+                if key == "stock":
+                    available = self._stock.get(product.id, (0, 0))[0]
+                    item.setForeground(qcolor("paid" if available > 0 else "failed"))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
                 self.table.setItem(row, column, item)
         active = sum(1 for product in getattr(self, "_catalog", []) if product.active)
         self._active_count = active
         self._update_count_label()
         self.empty_card.setVisible(not self._rows)
         self.table.setVisible(bool(self._rows))
+        if self.selection is not None:
+            self.selection.refresh()
         self._update_actions()
 
     def _cell(self, product: Product, key: str) -> str:
@@ -409,7 +444,8 @@ class ProductsPage(QWidget):
         product = self.selected_product()
         if product is None or not self._is_owner:
             return
-        dialog = ProductDialog(title=ar.SET_PRODUCT_EDIT, product=product, parent=self)
+        available = self._stock.get(product.id, (0, 0))[0]
+        dialog = ProductDialog(title=ar.SET_PRODUCT_EDIT, product=product, available=available, parent=self)
         dialog.save_button.clicked.connect(lambda: self.save_dialog(dialog, product.id))
         dialog.exec()
 
@@ -429,9 +465,13 @@ class ProductsPage(QWidget):
         try:
             with session_scope() as session:
                 if product_id is None:
-                    products.create_product(session, self.current_user.id, **values)
+                    saved = products.create_product(session, self.current_user.id, **values)
                 else:
-                    products.update_product(session, self.current_user.id, product_id, **values)
+                    saved = products.update_product(session, self.current_user.id, product_id, **values)
+                if dialog.quantity.value() != dialog.initial_quantity:
+                    stock.set_available_quantity(
+                        session, self.current_user.id, product_id=saved.id, quantity=dialog.quantity.value()
+                    )
         except auth.AuthorizationError:
             dialog.error.show_message(ar.SET_OWNER_ONLY)
             return False
@@ -479,36 +519,10 @@ class ProductsPage(QWidget):
         events.notify.emit("success", ar.NAV_PRODUCTS, ar.PROD_TEMPLATE_SAVED.format(path=path), 5000)
         return path
 
-    def _export_stock(self) -> None:
-        selected, _filter = QFileDialog.getSaveFileName(
-            self, ar.STOCK_EXPORT, ar.STOCK_EXPORT_FILE, ar.IMP_TEMPLATE_FILTER
-        )
-        if selected:
-            self.export_stock(selected)
-
-    def export_stock(self, destination: str | Path) -> Path | None:
-        """Write the stock list as shown (current filters) in the re-importable layout."""
-        path = Path(destination)
-        if path.suffix.casefold() != ".xlsx":
-            path = path.with_suffix(".xlsx")
-        panel = self.stock_panel
-        try:
-            with session_scope() as session:
-                units = stock.list_units(
-                    session,
-                    status=panel.status_filter.currentData(),
-                    product_id=panel.product_filter.currentData(),
-                    color=panel.color_filter.currentData(),
-                    condition=panel.condition_filter.currentData(),
-                    search=panel.search.text(),
-                )
-                product_sheet.export_stock_workbook(session, path, units)
-        except (OSError, SQLAlchemyError):
-            _LOG.exception("Stock export failed")
-            QMessageBox.warning(self, ar.ERROR_TITLE, ar.PROD_TEMPLATE_ERROR)
-            return None
-        events.notify.emit("success", ar.NAV_PRODUCTS, ar.STOCK_EXPORT_DONE.format(path=path), 5000)
-        return path
+    def _receive_goods(self) -> None:
+        """Record goods bought for the shop: opens the stock tab's "add phones" form."""
+        self.tabs.setCurrentWidget(self.stock_panel)
+        self.stock_panel.receive_goods()
 
     def _upload(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(self, ar.PROD_UPLOAD_CHOOSE, "", ar.IMP_TEMPLATE_FILTER)
@@ -563,6 +577,62 @@ class ProductsPage(QWidget):
             )
         events.notify.emit("success", ar.NAV_PRODUCTS, message, 5000)
         return result
+
+    def _key_at(self, row: int) -> int | None:
+        """The product id on a catalog row (the row's checkbox key)."""
+        return self._rows[row].id if 0 <= row < len(self._rows) else None
+
+    def _delete_selected(self) -> None:
+        """Delete the ticked products (or the highlighted one) after confirmation."""
+        if self.selection is None:
+            return
+        wanted = set(self.selection.target_keys())
+        chosen = [product for product in self._rows if product.id in wanted]
+        if not chosen:
+            return
+        message = ar.PROD_DELETE_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+            [product.name for product in chosen]
+        )
+        if row_selection.ask_delete(self, ar.SEL_DELETE, message) is None:
+            return
+        self.delete_products([product.id for product in chosen])
+
+    def delete_products(self, product_ids: list[int]) -> products.ProductDeleteResult | None:
+        """Delete unused products; offer to archive the ones that sales still use."""
+        try:
+            with session_scope() as session:
+                result = products.delete_products(session, self.current_user.id, product_ids)
+                in_use_names = [session.get(Product, product_id).name for product_id in result.in_use]
+        except (ValueError, auth.AuthorizationError, SQLAlchemyError):
+            _LOG.exception("Product delete failed")
+            QMessageBox.warning(self, ar.ERROR_TITLE, ar.SET_PRODUCT_ERROR)
+            return None
+        if self.selection is not None:
+            self.selection.clear()
+        events.data_changed.emit()
+        if result.deleted:
+            events.notify.emit("success", ar.NAV_PRODUCTS, ar.PROD_DELETED.format(count=result.deleted), 3000)
+        if result.in_use:
+            answer = row_selection.ask_choice(
+                self, ar.NAV_PRODUCTS,
+                ar.PROD_DELETE_IN_USE.format(count=len(result.in_use), names="، ".join(in_use_names)),
+                [("archive", ar.PROD_ARCHIVE_INSTEAD)],
+            )
+            if answer == "archive":
+                self.archive_products(list(result.in_use))
+        return result
+
+    def archive_products(self, product_ids: list[int]) -> int:
+        """Archive several products (hidden from sales, history kept)."""
+        try:
+            with session_scope() as session:
+                archived = products.archive_products(session, self.current_user.id, product_ids)
+        except (ValueError, auth.AuthorizationError, SQLAlchemyError):
+            QMessageBox.warning(self, ar.ERROR_TITLE, ar.SET_PRODUCT_ERROR)
+            return 0
+        events.data_changed.emit()
+        events.notify.emit("success", ar.NAV_PRODUCTS, ar.PROD_ARCHIVED_MANY.format(count=archived), 3000)
+        return archived
 
     def _toggle_selected(self) -> None:
         product = self.selected_product()

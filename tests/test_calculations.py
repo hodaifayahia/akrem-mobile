@@ -73,14 +73,20 @@ def test_end_date_uses_edate_month_clamping(purchase_date, months, expected):
     assert sale.end_date == expected
 
 
-def test_installment_schedule_defaults_to_first_of_following_months():
+def test_installment_schedule_defaults_to_the_purchase_day():
+    sale = SimpleNamespace(sale_type="installment", months=1, financed=1_000, purchase_date=date(2026, 2, 2))
+    assert [row.due_date for row in build(sale, {})] == [date(2026, 3, 2)]
+    assert build(sale, None) == build(sale, {"due_mode": "purchase_day"})
+
+
+def test_first_of_month_schedule_uses_first_of_following_months():
     sale = SimpleNamespace(
         sale_type="installment",
         months=3,
         financed=69_500,
         purchase_date=date(2025, 1, 31),
     )
-    rows = build(sale, {})
+    rows = build(sale, {"due_mode": "first_of_month"})
     assert rows == [
         ScheduledInstallment(1, date(2025, 2, 1), 23_166),
         ScheduledInstallment(2, date(2025, 3, 1), 23_166),

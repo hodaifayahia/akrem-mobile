@@ -121,6 +121,7 @@ def create_sale(
     is_new: bool = False,
     imei: str | None = None,
     reference: str | None = None,
+    quantity: int = 1,
 ) -> Sale:
     """Create a sale record using already-computed integer amounts."""
     sale = Sale(
@@ -146,6 +147,7 @@ def create_sale(
         is_new=is_new,
         imei=imei,
         reference=reference,
+        quantity=quantity,
     )
     if not sale.product:
         raise ValueError("Product cannot be empty")

@@ -11,6 +11,7 @@ the Excel template, upload and export are in :mod:`app.services.product_sheet`.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, NamedTuple
@@ -19,8 +20,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import Product, Sale
+from app.db.models import Product, Sale, StockItem
 from app.services import auth, calc
+from app.services.stock import STATUS_AVAILABLE, STATUS_SOLD
 
 
 class ProductNameTakenError(ValueError):
@@ -149,16 +151,27 @@ def update_product(
 ) -> Product:
     """Update the active catalog price while old sales keep their stored snapshot.
 
-    ``wholesale_price=None`` and ``plan=None`` keep the stored values.
+    ``wholesale_price=None`` and ``plan=None`` keep the stored values. Phones
+    still in stock that carried the old catalog price follow the new one, so
+    the sale forms never offer a unit at a stale price; a unit priced on its
+    own (a used phone, for example) keeps its price.
     """
     auth.require_owner(session, owner_user_id)
     product = session.get(Product, product_id)
     if product is None:
         raise ValueError("Catalog product not found")
+    old_cash, old_wholesale = product.cash_price, product.wholesale_price
     product.name = _validate_name(name)
     if wholesale_price is not None:
         product.wholesale_price = _validate_amount("wholesale price", wholesale_price)
     product.cash_price = _validate_price(cash_price)
+    for unit in session.scalars(
+        select(StockItem).where(StockItem.product_id == product.id, StockItem.status == STATUS_AVAILABLE)
+    ):
+        if unit.cash_price == old_cash:
+            unit.cash_price = product.cash_price
+        if unit.wholesale_price == old_wholesale:
+            unit.wholesale_price = product.wholesale_price
     if plan is not None:
         _set_plan(product, _validate_plan(plan))
     try:
@@ -190,6 +203,58 @@ def set_product_active(
     product.active = active
     session.flush()
     return product
+
+
+@dataclass(frozen=True, slots=True)
+class ProductDeleteResult:
+    """Outcome of deleting several catalog products at once."""
+
+    deleted: int
+    units_deleted: int
+    in_use: tuple[int, ...]
+
+
+def delete_products(session: Session, owner_user_id: int, product_ids: Iterable[int]) -> ProductDeleteResult:
+    """Delete catalog products that no sale uses, together with their unsold phones.
+
+    A product linked to a sale, or with a sold phone, is part of the shop's
+    history: it is kept and its id listed in ``in_use`` so it can be archived.
+    """
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(product_id) for product_id in product_ids))
+    if not unique_ids:
+        return ProductDeleteResult(0, 0, ())
+    used = set(session.scalars(select(Sale.product_id).where(Sale.product_id.in_(unique_ids))))
+    used.update(session.scalars(
+        select(StockItem.product_id).where(StockItem.product_id.in_(unique_ids), StockItem.status == STATUS_SOLD)
+    ))
+    in_use: list[int] = []
+    deleted = units_deleted = 0
+    for product in session.scalars(select(Product).where(Product.id.in_(unique_ids)).order_by(Product.id)).all():
+        if product.id in used:
+            in_use.append(product.id)
+            continue
+        for unit in session.scalars(select(StockItem).where(StockItem.product_id == product.id)).all():
+            session.delete(unit)
+            units_deleted += 1
+        session.flush()
+        session.expire(product, ["stock_items"])
+        session.delete(product)
+        deleted += 1
+    session.flush()
+    return ProductDeleteResult(deleted, units_deleted, tuple(in_use))
+
+
+def archive_products(session: Session, owner_user_id: int, product_ids: Iterable[int]) -> int:
+    """Archive several products (kept for history, hidden from sales); returns how many changed."""
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(product_id) for product_id in product_ids))
+    rows = session.scalars(select(Product).where(Product.id.in_(unique_ids), Product.active.is_(True))).all() \
+        if unique_ids else []
+    for product in rows:
+        product.active = False
+    session.flush()
+    return len(rows)
 
 
 def find_active_product(session: Session, name: str) -> Product | None:

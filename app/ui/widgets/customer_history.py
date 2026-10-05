@@ -2,28 +2,29 @@
 
 The summary strip answers "who is this customer for us?" at a glance:
 purchase count, money bought/paid/remaining, and whether they pay cash or
-little by little. The purchase table lists each sale with its type tag and
-current status; the payment table is the full payment timeline.
+little by little. The purchase tree lists each sale with its type tag and
+current status, and under it every transaction made for that product (down
+payment, each payment, and what was still owed after it).
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QTableWidget,
-    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.i18n import ar
-from app.services.customers import CustomerHistory, PurchaseRecord
+from app.services.customers import CustomerHistory, PurchaseRecord, TransactionRecord
 from app.services.status import Status
 from app.i18n.plan_text import plan_summary
 from app.i18n.stock_text import battery_text, ltr_text
@@ -48,9 +49,32 @@ def status_label(status: Status) -> str:
     }[status]
 
 
+def method_label(method: str | None) -> str:
+    """Localized payment method (CCP and BaridiMob keep their names)."""
+    if not method:
+        return ""
+    return ar.PDF_METHOD_CASH if method.casefold() == "cash" else method
+
+
+def transaction_label(transaction: TransactionRecord) -> str:
+    """What a transaction was: the down payment, a payment for installment N, ..."""
+    if transaction.kind == "full_payment":
+        return ar.HIST_TX_FULL
+    if transaction.kind == "down_payment":
+        return ar.HIST_TX_DOWN_PAYMENT
+    if transaction.kind == "earlier":
+        return ar.HIST_TX_EARLIER.format(n=transaction.installment_index)
+    if transaction.installment_index is not None:
+        return ar.HIST_TX_INSTALLMENT.format(n=transaction.installment_index)
+    return ar.HIST_TX_PAYMENT
+
+
 def _product_text(purchase: PurchaseRecord) -> str:
-    """Product name with the phone's colour, battery and REF when recorded."""
-    parts = [ltr_text(purchase.product)]
+    """Product name (with the quantity) and the phone's colour, battery and REF when recorded."""
+    name = ltr_text(purchase.product)
+    if purchase.quantity > 1:
+        name += f" ×{purchase.quantity}"
+    parts = [name]
     if purchase.color:
         parts.append(ltr_text(purchase.color))
     if purchase.is_new or purchase.battery_health is not None:
@@ -128,9 +152,11 @@ class HistorySummary(QFrame):
 
 
 class CustomerHistoryPanel(QWidget):
-    """Purchases and payment timeline; double-click a purchase to open it."""
+    """Purchases, each with every transaction made for it; double-click a row to open its sale."""
 
     purchase_activated = Signal(int)
+
+    SALE_ROLE = Qt.ItemDataRole.UserRole
 
     def __init__(self, *, is_owner: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -141,101 +167,108 @@ class CustomerHistoryPanel(QWidget):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
         purchases_title = QLabel(ar.HIST_PURCHASES_TITLE, self)
         purchases_title.setObjectName("sectionTitle")
-        header.addWidget(purchases_title, 1)
+        titles.addWidget(purchases_title)
+        hint = QLabel(ar.HIST_PURCHASES_HINT, self)
+        hint.setObjectName("sectionHint")
+        titles.addWidget(hint)
+        header.addLayout(titles, 1)
         self.dates_label = QLabel(self)
         self.dates_label.setObjectName("sectionHint")
-        header.addWidget(self.dates_label)
+        header.addWidget(self.dates_label, 0, Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(header)
-        self.purchases_table = self._table([
-            ar.HIST_COL_DATE, ar.PRODUCT, ar.HIST_COL_TYPE, ar.HIST_COL_TOTAL, ar.HIST_COL_PAID,
+
+        self.purchases_tree = QTreeWidget(self)
+        self.purchases_tree.setObjectName("historyTree")
+        self.purchases_tree.setHeaderLabels([
+            ar.HIST_COL_DATE, ar.HIST_COL_ITEM, ar.HIST_COL_TYPE, ar.HIST_COL_TOTAL, ar.HIST_COL_PAID,
             ar.HIST_REMAINING, ar.HIST_COL_PLAN, ar.HIST_COL_STATUS,
         ])
-        self.purchases_table.cellDoubleClicked.connect(self._activate)
-        layout.addWidget(self.purchases_table, 3)
-
-        payments_title = QLabel(ar.HIST_PAYMENTS_TITLE, self)
-        payments_title.setObjectName("sectionTitle")
-        layout.addWidget(payments_title)
-        self.payments_table = self._table([
-            ar.HIST_COL_DATE, ar.HIST_COL_AMOUNT, ar.HIST_COL_METHOD, ar.PRODUCT,
-            ar.HIST_COL_INSTALLMENT, ar.CUST_NOTES,
-        ])
-        layout.addWidget(self.payments_table, 2)
-        self.empty_payments = QLabel(ar.HIST_NO_PAYMENTS, self)
-        self.empty_payments.setObjectName("emptyStateSub")
-        self.empty_payments.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.empty_payments)
-
-    def _table(self, headers: list[str]) -> QTableWidget:
-        table = QTableWidget(0, len(headers), self)
-        table.setHorizontalHeaderLabels(headers)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(36)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setAlternatingRowColors(True)
-        table.setShowGrid(False)
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(True)
-        return table
+        self.purchases_tree.setRootIsDecorated(True)
+        self.purchases_tree.setIndentation(18)
+        self.purchases_tree.setSelectionBehavior(QTreeWidget.SelectionBehavior.SelectRows)
+        self.purchases_tree.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
+        tree_header = self.purchases_tree.header()
+        tree_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tree_header.setStretchLastSection(True)
+        tree_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.purchases_tree.itemDoubleClicked.connect(self._activate)
+        layout.addWidget(self.purchases_tree, 1)
+        self.empty_purchases = QLabel(ar.HIST_PROFILE_NONE, self)
+        self.empty_purchases.setObjectName("emptyStateSub")
+        self.empty_purchases.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_purchases.setVisible(False)
+        layout.addWidget(self.empty_purchases)
 
     def show_history(self, history: CustomerHistory) -> None:
-        """Fill both tables."""
+        """Fill the tree: one row per purchase (newest first), its transactions under it (oldest first)."""
         self._purchases = history.purchases
-        self.purchases_table.setRowCount(len(history.purchases))
-        for row, purchase in enumerate(history.purchases):
-            plan = (
-                plan_summary(purchase.monthly_amount or 0, purchase.payment_interval, purchase.payment_count)
-                if purchase.sale_type == "installment" and purchase.months
-                else ar.HIST_PLAN_CASH if purchase.sale_type == "cash"
-                else ar.HIST_PLAN_CREDIT
-            )
-            cells = [
-                (purchase.purchase_date.strftime("%d/%m/%Y"), None),
-                (_product_text(purchase), None),
-                (type_label(purchase.sale_type), _TYPE_TONES.get(purchase.sale_type)),
-                (money(purchase.total), None),
-                (money(purchase.paid), "paid" if purchase.paid else None),
-                (money(purchase.remaining), "failed" if purchase.overdue_installments else None),
-                (plan, None),
-                (status_label(purchase.status), _STATUS_TONES[purchase.status]),
-            ]
-            self._fill_row(self.purchases_table, row, cells)
-            self.purchases_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, purchase.sale_id)
-
-        self.payments_table.setRowCount(len(history.payments))
-        for row, payment in enumerate(history.payments):
-            installment = (
-                ar.HIST_INSTALLMENT_N.format(n=payment.installment_index)
-                if payment.installment_index is not None
-                else type_label(payment.sale_type)
-            )
-            self._fill_row(self.payments_table, row, [
-                (payment.payment_date.strftime("%d/%m/%Y"), None),
-                (money(payment.amount), "paid"),
-                (payment.method, None),
-                (payment.product, None),
-                (installment, None),
-                (payment.note or "", None),
-            ])
-        self.empty_payments.setVisible(not history.payments)
-        self.payments_table.setVisible(bool(history.payments))
+        self.purchases_tree.clear()
+        for purchase in history.purchases:
+            parent = self._purchase_item(purchase)
+            self.purchases_tree.addTopLevelItem(parent)
+            for transaction in purchase.transactions:
+                parent.addChild(self._transaction_item(purchase.sale_id, transaction))
+            if not purchase.transactions:
+                parent.addChild(self._note_item(purchase.sale_id, ar.HIST_TX_NONE))
+        self.purchases_tree.expandAll()
+        self.purchases_tree.setVisible(bool(history.purchases))
+        self.empty_purchases.setVisible(not history.purchases)
         first = history.first_purchase.strftime("%d/%m/%Y") if history.first_purchase else "—"
         last_payment = history.last_payment.strftime("%d/%m/%Y") if history.last_payment else "—"
         self.dates_label.setText(ar.HIST_DATES.format(first=first, last_payment=last_payment))
 
-    @staticmethod
-    def _fill_row(table: QTableWidget, row: int, cells: list[tuple[str, str | None]]) -> None:
-        for column, (text, tone) in enumerate(cells):
-            item = QTableWidgetItem(text)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if tone is not None:
-                item.setForeground(QColor(qcolor(tone)))
-            table.setItem(row, column, item)
+    def _purchase_item(self, purchase: PurchaseRecord) -> QTreeWidgetItem:
+        plan = (
+            plan_summary(purchase.monthly_amount or 0, purchase.payment_interval, purchase.payment_count)
+            if purchase.sale_type == "installment" and purchase.months
+            else ar.HIST_PLAN_CASH if purchase.sale_type == "cash"
+            else ar.HIST_PLAN_CREDIT
+        )
+        item = self._item(purchase.sale_id, [
+            (purchase.purchase_date.strftime("%d/%m/%Y"), None),
+            (_product_text(purchase), None),
+            (type_label(purchase.sale_type), _TYPE_TONES.get(purchase.sale_type)),
+            (money(purchase.total), None),
+            (money(purchase.paid), "paid" if purchase.paid else None),
+            (money(purchase.remaining), "failed" if purchase.overdue_installments else None),
+            (plan, None),
+            (status_label(purchase.status), _STATUS_TONES[purchase.status]),
+        ])
+        bold = QFont(item.font(0))
+        bold.setBold(True)
+        for column in range(item.columnCount()):
+            item.setFont(column, bold)
+        return item
 
-    def _activate(self, row: int, _column: int) -> None:
-        if 0 <= row < len(self._purchases):
-            self.purchase_activated.emit(self._purchases[row].sale_id)
+    def _transaction_item(self, sale_id: int, transaction: TransactionRecord) -> QTreeWidgetItem:
+        return self._item(sale_id, [
+            (transaction.transaction_date.strftime("%d/%m/%Y"), "text-muted"),
+            (transaction_label(transaction), None),
+            (method_label(transaction.method), "text-muted"),
+            ("", None),
+            (f"+{money(transaction.amount)}", "paid"),
+            (money(transaction.remaining_after), "text-muted" if transaction.remaining_after else "paid"),
+            (transaction.note or "", "text-muted"),
+            ("", None),
+        ])
+
+    def _note_item(self, sale_id: int, text: str) -> QTreeWidgetItem:
+        return self._item(sale_id, [("", None), (text, "text-muted")] + [("", None)] * 6)
+
+    def _item(self, sale_id: int, cells: list[tuple[str, str | None]]) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([text for text, _tone in cells])
+        for column, (_text, tone) in enumerate(cells):
+            item.setTextAlignment(column, Qt.AlignmentFlag.AlignCenter)
+            if tone is not None:
+                item.setForeground(column, QColor(qcolor(tone)))
+        item.setData(0, self.SALE_ROLE, sale_id)
+        return item
+
+    def _activate(self, item: QTreeWidgetItem, _column: int) -> None:
+        sale_id = item.data(0, self.SALE_ROLE)
+        if sale_id is not None:
+            self.purchase_activated.emit(int(sale_id))

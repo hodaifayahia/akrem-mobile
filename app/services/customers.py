@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import json
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import Category, Customer, Installment, Payment, Sale, Setting
-from app.services import repositories
+from app.services import auth, repositories
 from app.services.calc import add_months
 from app.services.settings import get_grace_days
 from app.services.status import Status, for_customer, for_month
@@ -56,6 +57,8 @@ class CustomerSummary:
     status: Status
     customer: Customer
     sales: tuple[Sale, ...]
+    # Set on the one-row-per-sale list: the (first) sale this row shows (None for a client without sales).
+    sale_id: int | None = None
 
     @property
     def purchase_date(self) -> date | None:
@@ -114,6 +117,25 @@ def _payment_profile(sale_types: tuple[str, ...] | set[str]) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class TransactionRecord:
+    """One amount received for a sale, with what was still owed after it.
+
+    ``kind`` is ``"full_payment"`` (a cash sale), ``"down_payment"``,
+    ``"payment"`` (a recorded installment or credit payment) or ``"earlier"``
+    (an installment amount marked paid without payment rows, e.g. imported).
+    """
+
+    kind: str
+    transaction_date: date
+    amount: int
+    remaining_after: int
+    method: str | None = None
+    installment_index: int | None = None
+    note: str | None = None
+    payment_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PurchaseRecord:
     """One sale in a customer's purchase history, with paid and remaining amounts."""
 
@@ -142,6 +164,10 @@ class PurchaseRecord:
     is_new: bool = False
     imei: str | None = None
     reference: str | None = None
+    quantity: int = 1
+    basket_id: str | None = None
+    # Every amount received for this sale, oldest first.
+    transactions: tuple[TransactionRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +319,48 @@ def _purchase_record(sale: Sale, today: date, grace_days: int) -> PurchaseRecord
         is_new=sale.is_new,
         imei=sale.imei,
         reference=sale.reference,
+        quantity=sale.quantity or 1,
+        basket_id=sale.basket_id,
+        transactions=_transactions(sale),
     )
+
+
+def _transactions(sale: Sale) -> tuple[TransactionRecord, ...]:
+    """Every amount received for an eagerly loaded sale, oldest first, with a running balance.
+
+    The amounts add up to the ledger's paid amount (see ``_sale_paid``).
+    """
+    # (date, order within the sale, kind, amount, method, installment index, note, payment id)
+    rows: list[tuple[date, int, str, int, str | None, int | None, str | None, int | None]] = []
+    if sale.sale_type == "cash":
+        rows.append((sale.purchase_date, 0, "full_payment", sale.total, None, None, None, None))
+    elif sale.down_payment:
+        rows.append((sale.purchase_date, 0, "down_payment", sale.down_payment, None, None, None, None))
+    if sale.sale_type == "credit":
+        for payment in sale.credit_payments:
+            rows.append((payment.payment_date, payment.id, "payment", payment.amount,
+                         payment.method, None, payment.note, payment.id))
+    elif sale.sale_type == "installment":
+        for installment in sale.installments:
+            recorded = 0
+            for payment in installment.payments:
+                recorded += payment.amount
+                rows.append((payment.payment_date, payment.id, "payment", payment.amount, payment.method,
+                             installment.installment_index, payment.note, payment.id))
+            earlier = installment.amount_paid - recorded
+            if earlier > 0:
+                rows.append((installment.paid_date or installment.due_date, 0, "earlier", earlier,
+                             installment.method, installment.installment_index, installment.note, None))
+    rows.sort(key=lambda row: (row[0], row[1], row[5] or 0))
+    remaining = sale.total
+    result: list[TransactionRecord] = []
+    for when, _order, kind, amount, method, index, note, payment_id in rows:
+        remaining = max(0, remaining - amount)
+        result.append(TransactionRecord(
+            kind=kind, transaction_date=when, amount=amount, remaining_after=remaining, method=method,
+            installment_index=index, note=note, payment_id=payment_id,
+        ))
+    return tuple(result)
 
 
 def _payment_records(sale: Sale) -> list[PaymentRecord]:
@@ -361,8 +428,16 @@ def list_customers(
     balance: str | None = None,
     purchased: str | None = None,
     deduction: str | None = None,
+    per_sale: bool = False,
 ) -> list[CustomerSummary]:
     """Return customer rows with selected-month status and outstanding balances.
+
+    With ``per_sale`` every sale is its own row (a client who bought three
+    phones on three visits shows three rows, each with that sale's status,
+    amounts and dates), except that products bought together in one basket
+    share a row; a client without sales still shows one row. Filters then
+    apply to each row on its own, and a search keeps a basket row when one of
+    its products matches.
 
     ``payment_kind``: ``"cash"`` keeps customers who paid every purchase in
     full; ``"facilities"`` keeps customers paying at least one purchase over
@@ -398,26 +473,31 @@ def list_customers(
         base_query = base_query.where(Customer.category_id == category_id)
 
     matching_ids: list[int] | None = None
+    # Searching by product/IMEI/REF on the per-sale list keeps only the matching sales.
+    name_matches: set[int] = set()
+    sale_matches: set[int] = set()
     if search_key:
         candidates_query = select(Customer.id, Customer.full_name, Customer.phone)
         if category_id is not None:
             candidates_query = candidates_query.where(Customer.category_id == category_id)
-        matching = {
+        name_matches = {
             customer_id
             for customer_id, full_name, phone in session.execute(candidates_query)
             if search_key in normalize_search_text(full_name)
             or search_key in normalize_search_text(phone)
         }
-        product_query = select(Sale.customer_id, Sale.product, Sale.imei, Sale.reference)
+        matching = set(name_matches)
+        product_query = select(Sale.id, Sale.customer_id, Sale.product, Sale.imei, Sale.reference)
         if category_id is not None:
             product_query = product_query.join(Customer).where(Customer.category_id == category_id)
-        matching.update(
-            customer_id
-            for customer_id, product, imei, reference in session.execute(product_query)
-            if search_key in normalize_search_text(product)
-            or search_key in normalize_search_text(imei or "")
-            or search_key in normalize_search_text(reference or "")
-        )
+        for sale_id, customer_id, product, imei, reference in session.execute(product_query):
+            if (
+                search_key in normalize_search_text(product)
+                or search_key in normalize_search_text(imei or "")
+                or search_key in normalize_search_text(reference or "")
+            ):
+                matching.add(customer_id)
+                sale_matches.add(sale_id)
         matching_ids = sorted(matching)
         if not matching_ids:
             return []
@@ -453,59 +533,104 @@ def list_customers(
             customer.sales,
             key=lambda sale: (sale.purchase_date, sale.id),
         ))
-        customer_status = for_customer(
-            customer_sales, year, month, today, grace_days=grace_days
-        )
-        if selected_status is not None and customer_status != selected_status:
-            continue
-        if payment_kind and not _matches_payment_kind(customer_sales, payment_kind):
-            continue
-        if purchased and not _bought_in(customer_sales, purchased, today):
-            continue
-        if deduction and not _matches_deduction(customer_sales, deduction, today):
-            continue
-
-        monthly_amount = sum(
-            installment.amount_due
-            for sale in customer_sales
-            for installment in sale.installments
-            if installment.due_date.year == year and installment.due_date.month == month
-        )
-        remaining_balance = 0
-        for sale in customer_sales:
-            if sale.sale_type == "credit":
-                paid = sum(payment.amount for payment in sale.credit_payments)
-                remaining_balance += max(0, sale.financed - paid)
-            elif sale.sale_type == "installment":
-                for installment in sale.installments:
-                    paid = max(
-                        installment.amount_paid,
-                        sum(payment.amount for payment in installment.payments),
-                    )
-                    remaining_balance += max(0, installment.amount_due - paid)
-
-        if balance == "open" and remaining_balance <= 0:
-            continue
-        if balance == "settled" and remaining_balance > 0:
-            continue
-
-        summary = CustomerSummary(
-            id=customer.id,
-            full_name=customer.full_name,
-            phone=customer.phone,
-            category_id=customer.category_id,
-            category_name=customer.category.name,
-            products=tuple(sale.product for sale in customer_sales),
-            purchase_dates=tuple(sale.purchase_date for sale in customer_sales),
-            end_dates=tuple(sale.end_date for sale in customer_sales),
-            monthly_amount=monthly_amount,
-            remaining_balance=remaining_balance,
-            status=customer_status,
-            customer=customer,
-            sales=customer_sales,
-        )
-        result.append(summary)
+        if not per_sale:
+            groups: list[tuple[tuple[Sale, ...], int | None]] = [(customer_sales, None)]
+        else:
+            rows_of_sales = _basket_rows(customer_sales)
+            if search_key and customer.id not in name_matches:
+                rows_of_sales = [
+                    group for group in rows_of_sales if any(sale.id in sale_matches for sale in group)
+                ]
+            groups = [(group, group[0].id) for group in rows_of_sales] or [((), None)]
+        for group, sale_id in groups:
+            summary = _summary_row(
+                customer, group, sale_id,
+                year=year, month=month, today=today, grace_days=grace_days,
+                status=selected_status, payment_kind=payment_kind, balance=balance,
+                purchased=purchased, deduction=deduction,
+            )
+            if summary is not None:
+                result.append(summary)
     return result
+
+
+def _basket_rows(sales: tuple[Sale, ...]) -> list[tuple[Sale, ...]]:
+    """Split a client's sales into list rows: one per basket, one per sale bought on its own.
+
+    Rows keep the order of their first sale.
+    """
+    rows: dict[object, list[Sale]] = {}
+    for sale in sales:
+        rows.setdefault(sale.basket_id or ("sale", sale.id), []).append(sale)
+    return [tuple(group) for group in rows.values()]
+
+
+def _summary_row(
+    customer: Customer,
+    customer_sales: tuple[Sale, ...],
+    sale_id: int | None,
+    *,
+    year: int,
+    month: int,
+    today: date,
+    grace_days: int,
+    status: Status | None,
+    payment_kind: str | None,
+    balance: str | None,
+    purchased: str | None,
+    deduction: str | None,
+) -> CustomerSummary | None:
+    """One list row for ``customer_sales`` (all of a client's sales, or one), or None when filtered out."""
+    customer_status = for_customer(customer_sales, year, month, today, grace_days=grace_days)
+    if status is not None and customer_status != status:
+        return None
+    if payment_kind and not _matches_payment_kind(customer_sales, payment_kind):
+        return None
+    if purchased and not _bought_in(customer_sales, purchased, today):
+        return None
+    if deduction and not _matches_deduction(customer_sales, deduction, today):
+        return None
+
+    monthly_amount = sum(
+        installment.amount_due
+        for sale in customer_sales
+        for installment in sale.installments
+        if installment.due_date.year == year and installment.due_date.month == month
+    )
+    remaining_balance = 0
+    for sale in customer_sales:
+        if sale.sale_type == "credit":
+            paid = sum(payment.amount for payment in sale.credit_payments)
+            remaining_balance += max(0, sale.financed - paid)
+        elif sale.sale_type == "installment":
+            for installment in sale.installments:
+                paid = max(
+                    installment.amount_paid,
+                    sum(payment.amount for payment in installment.payments),
+                )
+                remaining_balance += max(0, installment.amount_due - paid)
+
+    if balance == "open" and remaining_balance <= 0:
+        return None
+    if balance == "settled" and remaining_balance > 0:
+        return None
+
+    return CustomerSummary(
+        id=customer.id,
+        full_name=customer.full_name,
+        phone=customer.phone,
+        category_id=customer.category_id,
+        category_name=customer.category.name,
+        products=tuple(sale.product for sale in customer_sales),
+        purchase_dates=tuple(sale.purchase_date for sale in customer_sales),
+        end_dates=tuple(sale.end_date for sale in customer_sales),
+        monthly_amount=monthly_amount,
+        remaining_balance=remaining_balance,
+        status=customer_status,
+        customer=customer,
+        sales=customer_sales,
+        sale_id=sale_id,
+    )
 
 
 def _matches_payment_kind(sales: tuple[Sale, ...], payment_kind: str) -> bool:
@@ -757,3 +882,47 @@ def _matches_deduction(customer_sales: tuple[Sale, ...], kind: str, today: date)
 def delete_customer(session: Session, customer_id: int) -> None:
     """Delete a customer who has no sales; financial history is never removed."""
     repositories.delete_customer(session, customer_id)
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerDeleteResult:
+    """Outcome of deleting several customers at once."""
+
+    deleted: int
+    sales_deleted: int
+    kept: tuple[str, ...]
+
+
+def delete_customers(
+    session: Session,
+    owner_user_id: int,
+    customer_ids: Iterable[int],
+    *,
+    with_sales: bool = False,
+) -> CustomerDeleteResult:
+    """Delete customers chosen by the owner.
+
+    A customer who has sales is kept (and named in ``kept``) unless
+    ``with_sales`` is set; then their sales, installments and payments are
+    deleted first, with an audit entry for each sale.
+    """
+    from app.services.sales import delete_sales  # here: the sales service imports this module
+
+    auth.require_owner(session, owner_user_id)
+    unique_ids = list(dict.fromkeys(int(customer_id) for customer_id in customer_ids))
+    rows = session.scalars(
+        select(Customer).where(Customer.id.in_(unique_ids)).options(selectinload(Customer.sales))
+    ).all() if unique_ids else []
+    kept: list[str] = []
+    deleted = sales_deleted = 0
+    for customer in rows:
+        if customer.sales:
+            if not with_sales:
+                kept.append(customer.full_name)
+                continue
+            sales_deleted += delete_sales(session, owner_user_id, [sale.id for sale in customer.sales])
+            session.expire(customer, ["sales"])
+        session.delete(customer)
+        deleted += 1
+    session.flush()
+    return CustomerDeleteResult(deleted=deleted, sales_deleted=sales_deleted, kept=tuple(kept))

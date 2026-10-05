@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -30,21 +31,23 @@ from app.ui.theme import qcolor, repolish
 #: appended, so their position in the sidebar differs from their index.
 NAV_ICONS = (
     "dashboard", "users", "cart", "wallet", "import", "reports", "settings", "tag", "users",
-    "debt-in", "debt-out",
+    "debt-in", "debt-out", "print",
 )
 PAGE_COUNT = len(NAV_ICONS)
 MAIN_PAGES = (0, 1, 2, 3)
 DEBT_PAGES = (9, 10)
 CATALOG_PAGES = (7, 8)
-MANAGE_PAGES = (4, 5, 6)
-OWNER_ONLY_PAGES = frozenset({4, 6, 8, 9, 10})
+MANAGE_PAGES = (4, 5, 11, 6)
+OWNER_ONLY_PAGES = frozenset({4, 6, 8, 9, 10, 11})
 
 
 def page_title(index: int) -> str:
     """Return a page's title in the active language."""
     if index < len(ar.SIDEBAR_ITEMS):
         return ar.SIDEBAR_ITEMS[index]
-    return (ar.NAV_PRODUCTS, ar.NAV_CLIENT_TYPES, ar.NAV_DEBTS_IN, ar.NAV_DEBTS_OUT)[index - len(ar.SIDEBAR_ITEMS)]
+    return (
+        ar.NAV_PRODUCTS, ar.NAV_CLIENT_TYPES, ar.NAV_DEBTS_IN, ar.NAV_DEBTS_OUT, ar.NAV_PRINT_FORMS,
+    )[index - len(ar.SIDEBAR_ITEMS)]
 
 
 def page_subtitle(index: int) -> str:
@@ -53,6 +56,7 @@ def page_subtitle(index: int) -> str:
         return ar.PAGE_SUBTITLES[index]
     return (
         ar.PAGE_SUBTITLE_PRODUCTS, ar.PAGE_SUBTITLE_CLIENT_TYPES, ar.PAGE_SUBTITLE_DEBTS_IN, ar.PAGE_SUBTITLE_DEBTS_OUT,
+        ar.PAGE_SUBTITLE_PRINT_FORMS,
     )[index - len(ar.PAGE_SUBTITLES)]
 
 EXPANDED_WIDTH = 248
@@ -185,24 +189,41 @@ class Sidebar(QFrame):
         layout.addWidget(self._build_brand())
         layout.addSpacing(10)
 
+        # The page list scrolls on short screens, so the user card and the
+        # collapse button below it keep their full size instead of being
+        # squeezed and clipped.
+        nav = QWidget(self)
+        nav.setObjectName("sidebarNav")
+        nav_layout = QVBoxLayout(nav)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(2)
         for section, pages in (
             ("NAV_SECTION_MAIN", MAIN_PAGES),
             ("NAV_SECTION_DEBTS", DEBT_PAGES),
             ("NAV_SECTION_CATALOG", CATALOG_PAGES),
             ("NAV_SECTION_MANAGE", MANAGE_PAGES),
         ):
-            label = self._add_section(layout, section)
+            label = self._add_section(nav_layout, section)
             if all(self._is_restricted(index) for index in pages):
                 label.hide()
             for index in pages:
-                layout.addWidget(self._make_nav(index))
+                nav_layout.addWidget(self._make_nav(index))
 
         if self.current_user is not None and self.current_user.role != "owner":
             self.password_button = NavButton("lock", ar.SET_CHANGE_PASSWORD, self)
             self.password_button.clicked.connect(self.password_requested.emit)
-            layout.addWidget(self.password_button)
+            nav_layout.addWidget(self.password_button)
+        nav_layout.addStretch(1)
 
-        layout.addStretch(1)
+        self.nav_scroll = QScrollArea(self)
+        self.nav_scroll.setObjectName("sidebarScroll")
+        self.nav_scroll.setWidget(nav)
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self.nav_scroll, 1)
+
+        layout.addSpacing(6)
         if self.current_user is not None:
             layout.addWidget(self._build_user_card())
         layout.addSpacing(6)

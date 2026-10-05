@@ -32,10 +32,18 @@ def database_path() -> Path:
     return data_dir() / DATABASE_FILENAME
 
 
+DATABASE_URL_SETTING = "database_url"
+
+
 def database_url() -> str:
-    """Build the SQLAlchemy URL for the configured database backend."""
-    configured_url = os.environ.get("AKREMMOBILE_DATABASE_URL")
-    if configured_url:
+    """Build the SQLAlchemy URL for the configured database backend.
+
+    The ``AKREMMOBILE_DATABASE_URL`` environment variable wins; otherwise this
+    PC's own setting (the shop's shared server, chosen in Settings); otherwise
+    the local SQLite file.
+    """
+    configured_url = os.environ.get("AKREMMOBILE_DATABASE_URL") or read_local_setting(DATABASE_URL_SETTING)
+    if isinstance(configured_url, str) and configured_url:
         if configured_url.startswith(("postgresql://", "postgres://")):
             return "postgresql+psycopg://" + configured_url.split("://", 1)[1]
         return configured_url
