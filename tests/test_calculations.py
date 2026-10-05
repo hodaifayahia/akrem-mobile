@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services.calc import compute_sale
+from app.services.calc import compute_sale, share_basket_plan, split_amount
 from app.services.schedule import ScheduledInstallment, build
 from app.services.status import Status, combine_statuses, for_customer, for_month
 
@@ -200,3 +200,69 @@ def test_schedule_rejects_unknown_due_mode():
     )
     with pytest.raises(ValueError, match="due_mode"):
         build(sale, {"due_mode": "purchase_week"})
+
+
+# ------------------------------------------------- products bought together
+def test_split_amount_adds_up_exactly():
+    assert split_amount(67_500, [90_000, 30_000]) == [50_625, 16_875]
+    assert sum(split_amount(99, [3, 5, 7])) == 99
+    assert split_amount(10, [1, 1, 1]) == [4, 3, 3]  # the remainder goes to the first share
+    assert split_amount(0, [5, 5]) == [0, 0]
+    assert split_amount(7, []) == []
+    assert split_amount(7, [0, 0]) == [7, 0]  # nothing to go by: the first line takes it
+
+
+def test_two_products_bought_together_share_one_plan_and_one_percentage():
+    lines = [
+        {"sale_type": "installment", "cash_price": 90_000, "rate": 35, "down_payment": 5_000,
+         "months": 6, "payment_interval": 1},
+        {"sale_type": "installment", "cash_price": 30_000, "rate": 50, "down_payment": 5_000,
+         "months": 12, "payment_interval": 3},
+    ]
+
+    share_basket_plan(lines)
+
+    # One rate, one duration and one rhythm for the whole visit (the last line's plan).
+    assert [(line["rate"], line["months"], line["payment_interval"]) for line in lines] == [
+        (50, 12, 3), (50, 12, 3),
+    ]
+    # The percentage is applied once, to the combined amount, and split between the lines.
+    combined = compute_sale(120_000, 50, 0, 12, 0, "installment", interval=3)
+    assert sum(line["total"] for line in lines) == combined.total == 180_000
+    assert [line["total"] for line in lines] == [135_000, 45_000]
+    # A down payment typed once is charged once, so the financed amount is right too.
+    assert sum(line["down_payment"] for line in lines) == 5_000
+    assert sum(line["total"] - line["down_payment"] for line in lines) == 175_000
+
+
+def test_one_product_bought_on_its_own_keeps_its_own_plan():
+    lines = [{"sale_type": "installment", "cash_price": 30_000, "rate": 35, "down_payment": 2_000,
+              "months": 6, "payment_interval": 1}]
+    cash = [{"sale_type": "cash", "cash_price": 1_500}]
+
+    share_basket_plan(lines)
+    share_basket_plan(cash)
+    share_basket_plan([*lines, *cash])  # a cash line changes nothing for the single installment line
+
+    assert lines == [{"sale_type": "installment", "cash_price": 30_000, "rate": 35, "down_payment": 2_000,
+                      "months": 6, "payment_interval": 1}]
+    assert cash == [{"sale_type": "cash", "cash_price": 1_500}]
+
+
+def test_an_incomplete_price_leaves_every_line_to_its_own_calculation():
+    lines = [
+        {"sale_type": "installment", "cash_price": 30_000, "rate": 35, "down_payment": 0, "months": 6},
+        {"sale_type": "installment", "cash_price": 0, "rate": 50, "down_payment": 0, "months": 12},
+    ]
+
+    share_basket_plan(lines)
+
+    assert "total" not in lines[0] and "total" not in lines[1]
+    assert [line["months"] for line in lines] == [6, 12]
+
+
+def test_a_shared_total_drives_the_installment_amounts():
+    result = compute_sale(30_000, 35, 0, 12, 0, "installment", interval=3, total_override=33_750)
+
+    assert (result.total, result.financed) == (33_750, 33_750)
+    assert result.payment_count == 4 and sum(result.monthly_list) == 33_750

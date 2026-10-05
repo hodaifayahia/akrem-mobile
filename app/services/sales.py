@@ -274,6 +274,7 @@ def create_sales_batch(
     if len(picked) != len(set(picked)):
         raise stock.StockError("sold", "The same phone is in the basket twice")
     order = sorted(range(len(batch)), key=lambda index: batch[index].get("stock_item_id") is None)
+    calc.share_basket_plan(batch)
     saved: dict[int, Sale] = {}
     with session.begin_nested():
         for index in order:
@@ -330,6 +331,7 @@ def create_sale(
     imei: str | None = None,
     reference: str | None = None,
     quantity: int = 1,
+    total: int | None = None,
 ) -> Sale:
     """Calculate and save a sale with its schedule as one session transaction.
 
@@ -348,6 +350,8 @@ def create_sale(
     oldest available units of the product (see ``stock.units_to_sell``). The
     prices are for the whole quantity. A typed IMEI/REF that matches no unit
     in stock describes a phone outside the stock, so no unit is taken then.
+    ``total`` is the amount this sale carries of a basket total already
+    calculated on the products bought together (see ``calc.share_basket_plan``).
     """
     if session.get(Customer, customer_id) is None:
         raise ValueError("Customer not found")
@@ -391,6 +395,7 @@ def create_sale(
         sale_type=values["sale_type"],
         purchase_date=values["purchase_date"],
         interval=values["payment_interval"],
+        total_override=total,
     )
     resolved_settings = _schedule_settings(session, settings)
     with session.begin_nested():

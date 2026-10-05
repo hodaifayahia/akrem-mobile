@@ -224,3 +224,95 @@ def test_previews_render_every_document(qapp, kind: str, tmp_path: Path) -> None
 
     output = pdf_forms.write_preview_pdf(kind, templates, tmp_path / f"{kind}.pdf")
     assert output.stat().st_size > 1000
+
+
+# ------------------------------------------------- the shop's NIS and NIF
+NIS = "099810000123456"
+NIF = "000016001234567"
+
+
+def _shop_templates() -> PrintTemplates:
+    """The print templates of a shop that filled in its three identifiers."""
+    return replace(
+        print_templates.default_templates(),
+        business_nis=NIS, business_nif=NIF, business_rc="16/00-1234567",
+    )
+
+
+def _ids(html: str) -> str:
+    return html[html.index("class='ids'") : html.index("</div>", html.index("class='ids'"))] if "class='ids'" in html else ""
+
+
+def test_the_convention_prints_the_business_nis_and_nif(qapp) -> None:
+    customer, sale, _payment = pdf_forms._sample_documents()
+
+    html = pdf_forms.commitment_html(customer, sale, _shop_templates(), "file:///logo.png")
+
+    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
+    assert "RC: 16/00-1234567" in html  # the third identifier of the same line
+    ids = _ids(html)
+    assert f"NIS: {NIS}" in ids and f"NIF: {NIF}" in ids  # the line sits in the document header
+
+
+def test_the_taahud_and_the_iltizam_print_the_business_nis_and_nif(qapp, tmp_path: Path) -> None:
+    # "تعهد والتزام" is one form: the pledge and the undertaking are the same document.
+    customer, sale, _payment = pdf_forms._sample_documents()
+    templates = _shop_templates()
+
+    output = pdf_forms.generate_commitment_pdf(tmp_path / "commitment.pdf", customer, sale, templates=templates)
+    html = pdf_forms.commitment_html(customer, sale, templates, "file:///logo.png")
+
+    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
+    assert output.stat().st_size > 1000
+    # An explicit value still wins over the saved one (the sale receipt's rule).
+    overridden = pdf_forms.commitment_html(
+        customer, sale, templates, "file:///logo.png", business_nis="111", business_nif="222",
+    )
+    assert "NIS: 111" in overridden and "NIS: 222" not in overridden
+
+
+def test_the_ticket_prints_the_business_nis_and_nif(qapp, tmp_path: Path) -> None:
+    templates = _shop_templates()
+    items = [pdf_forms.ReceiptItem("Redmi 13", 1, 32_000)]
+
+    html = pdf_forms._cash_receipt_html(
+        "زبون", None, "", "cash", 35_000, 35_000, 0, date(2026, 10, 4), None, "file:///logo.png", "seller",
+        items=items, receipt_number=12, templates=templates,
+    )
+    output = pdf_forms.generate_cash_sale_receipt_pdf(
+        tmp_path / "ticket.pdf", "زبون", None, "", "cash", 35_000, 35_000, 0, date(2026, 10, 4),
+        items=items, receipt_number=12, templates=templates,
+    )
+
+    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
+    assert output.stat().st_size > 1000
+
+
+def test_the_payment_receipt_prints_the_business_nis_and_nif(qapp, tmp_path: Path) -> None:
+    customer, sale, payment = pdf_forms._sample_documents()
+    templates = _shop_templates()
+    details = pdf_forms._receipt_payment_details(sale, payment)
+
+    html = pdf_forms._receipt_html(
+        customer, sale, payment, details, "file:///logo.png", "seller", templates,
+    )
+    output = pdf_forms.generate_payment_receipt_pdf(
+        tmp_path / "receipt.pdf", customer, sale, payment, issued_by="seller", templates=templates,
+    )
+
+    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
+    ids = _ids(html)
+    assert f"NIS: {NIS}" in ids and f"NIF: {NIF}" in ids  # the line sits in the document header
+    assert output.stat().st_size > 1000
+
+
+def test_documents_without_identifiers_keep_no_empty_ids_line(qapp) -> None:
+    customer, sale, payment = pdf_forms._sample_documents()
+    templates = print_templates.default_templates()  # a shop that filled nothing in
+    details = pdf_forms._receipt_payment_details(sale, payment)
+
+    commitment = pdf_forms.commitment_html(customer, sale, templates, "file:///logo.png")
+    receipt = pdf_forms._receipt_html(customer, sale, payment, details, "file:///logo.png", None, templates)
+
+    assert "class='ids'" not in commitment and "NIS" not in commitment
+    assert "class='ids'" not in receipt and "NIS" not in receipt
