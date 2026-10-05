@@ -92,12 +92,15 @@ def generate_commitment_pdf(
     include_sensitive: bool | None = None,
     logo_path: str | Path | None = None,
     templates: PrintTemplates | None = None,
+    business_nis: str | None = None,
+    business_nif: str | None = None,
 ) -> Path:
     """Create the A4 commitment form of an installment sale (up to 12 payments).
 
     Stored installment rows are authoritative; missing rows are filled from
     the standard schedule. ``include_sensitive`` adds the wholesale price and
     the profit (an owner's copy); ``None`` follows the owner's print setting.
+    ``business_nis``/``business_nif`` override the saved NIS and NIF.
     """
     if sale.sale_type != "installment":
         raise ValueError("Commitment forms are available for installment sales only")
@@ -110,7 +113,10 @@ def generate_commitment_pdf(
     templates = templates or default_templates()
     if include_sensitive is None:
         include_sensitive = templates.commitment_owner_figures
-    body = commitment_html(customer, sale, templates, _logo_uri(logo_path), include_sensitive=include_sensitive)
+    body = commitment_html(
+        customer, sale, templates, _logo_uri(logo_path), include_sensitive=include_sensitive,
+        business_nis=business_nis, business_nif=business_nif,
+    )
     output_path = _pdf_path(path)
     _write_pdf(output_path, body, templates.commitment_title, _commitment_page(templates), logo_path)
     return output_path
@@ -125,11 +131,19 @@ def generate_payment_receipt_pdf(
     issued_by: str | None = None,
     logo_path: str | Path | None = None,
     templates: PrintTemplates | None = None,
+    business_nis: str | None = None,
+    business_nif: str | None = None,
 ) -> Path:
-    """Create an A5 receipt for one payment present in the sale's loaded history."""
+    """Create an A5 receipt for one payment present in the sale's loaded history.
+
+    ``business_nis``/``business_nif`` override the saved NIS and NIF.
+    """
     templates = templates or default_templates()
     details = _receipt_payment_details(sale, payment)
-    body = _receipt_html(customer, sale, payment, details, _logo_uri(logo_path), issued_by, templates)
+    body = _receipt_html(
+        customer, sale, payment, details, _logo_uri(logo_path), issued_by, templates,
+        business_nis=business_nis, business_nif=business_nif,
+    )
     output_path = _pdf_path(path)
     _write_pdf(output_path, body, ar.PDF_RECEIPT_TITLE, _receipt_page(templates), logo_path)
     return output_path
@@ -211,6 +225,8 @@ def commitment_html(
     logo_uri: str,
     *,
     include_sensitive: bool = False,
+    business_nis: str | None = None,
+    business_nif: str | None = None,
 ) -> str:
     """Escaped RTL HTML of the commitment form, laid out like the shop's paper form."""
     schedule_rows = _commitment_schedule(sale)
@@ -294,7 +310,8 @@ def commitment_html(
         for label in signatures
     ))
     header_row = _tr(
-        f"<td width='40%' style='vertical-align: middle;'>{_shop_block(templates)}</td>",
+        f"<td width='40%' style='vertical-align: middle;'>{_shop_block(templates)}"
+        f"{_ids_line(templates, business_nis, business_nif)}</td>",
         "<td width='36%' align='center' style='vertical-align: middle;'>"
         f"<div class='title' align='center'>{_escape(templates.commitment_title)}</div>"
         f"<div class='meta' align='center'>{_escape(ar.PRINT_CONTRACT_NUMBER)} <b>{_ltr(f'{sale.id:06d}' if sale.id else '—')}</b>"
@@ -321,6 +338,7 @@ td, th, div, p {{ font-size: 10pt; line-height: 88%; }}
 td {{ vertical-align: middle; }}
 .title {{ font-size: 23pt; font-weight: bold; color: {NAVY}; }}
 .meta {{ font-size: 8.5pt; color: {MUTED}; }}
+.ids {{ font-size: 8pt; color: {MUTED}; }}
 .section {{ font-size: 10.5pt; font-weight: bold; color: {NAVY}; background-color: {SOFT}; padding: 3px 9px; }}
 .field {{ padding: 3px 2px 1px 2px; border-bottom: 1px dotted #94A3B8; vertical-align: bottom; }}
 .label {{ font-size: 7.5pt; color: {MUTED}; font-weight: bold; }}
@@ -462,11 +480,7 @@ def _cash_receipt_html(
     """
     templates = templates or default_templates()
     settled = remaining_balance <= 0
-    nis = (business_nis or "").strip() or templates.business_nis
-    nif = (business_nif or "").strip() or templates.business_nif
-    ids = [f"NIS: {nis}" if nis else "", f"NIF: {nif}" if nif else "",
-           f"RC: {templates.business_rc}" if templates.business_rc else ""]
-    ids_html = " &nbsp;·&nbsp; ".join(_ltr_html(value) for value in ids if value)
+    ids_html = _business_ids(templates, business_nis, business_nif)
 
     mark = _RLM if is_rtl() else ""
     if items:
@@ -580,6 +594,8 @@ def _receipt_html(
     logo_uri: str,
     issued_by: str | None,
     templates: PrintTemplates | None = None,
+    business_nis: str | None = None,
+    business_nif: str | None = None,
 ) -> str:
     """A5 receipt of one installment or credit payment: the amount first, then the details."""
     templates = templates or default_templates()
@@ -617,7 +633,8 @@ def _receipt_html(
     balance_color, balance_fill = (PAID, PAID_FILL) if settled else (DUE, DUE_FILL)
     end = _end_side()
     header_row = _tr(
-        f"<td width='62%' style='vertical-align: middle;'>{_shop_block(templates, compact=True)}</td>",
+        f"<td width='62%' style='vertical-align: middle;'>{_shop_block(templates, compact=True)}"
+        f"{_ids_line(templates, business_nis, business_nif)}</td>",
         f"<td width='38%' align='{end}' style='vertical-align: middle;'>"
         f"<img src='{_escape(logo_uri)}' width='70' height='70'></td>",
     )
@@ -650,6 +667,7 @@ body {{ direction: {_direction()}; font-family: '{_cairo_font_family()}'; color:
 td, th, div, p {{ font-size: 10pt; }}
 .title {{ font-size: 16pt; font-weight: bold; color: {NAVY}; }}
 .meta {{ font-size: 8.5pt; color: {MUTED}; }}
+.ids {{ font-size: 8pt; color: {MUTED}; }}
 .thanks {{ font-size: 9pt; color: {MUTED}; }}
 </style></head><body>
 <table width="100%" cellspacing="0" cellpadding="0">{header_row}</table>
@@ -685,6 +703,30 @@ def _shop_block(templates: PrintTemplates, *, compact: bool = False) -> str:
         f"<div style=\"font-family:'{_rajdhani_font_family()}'; font-size:{size}; font-weight:bold; color:{NAVY}\">"
         f"{start}{_escape(templates.shop_name)}<span style='color:{BLUE}'>{_escape(location)}</span>{stop}</div>{lines}"
     )
+
+
+def _business_ids(
+    templates: PrintTemplates, business_nis: str | None = None, business_nif: str | None = None
+) -> str:
+    """The shop's NIS, NIF and RC, one small left-to-right run, empty when none is set.
+
+    The saved print templates are the source; the arguments only override them
+    (the sale receipt passes the values a caller already had).
+    """
+    values = [
+        f"NIS: {(business_nis or '').strip() or templates.business_nis}",
+        f"NIF: {(business_nif or '').strip() or templates.business_nif}",
+        f"RC: {templates.business_rc}",
+    ]
+    return " &nbsp;·&nbsp; ".join(_ltr_html(value) for value in values if value.split(": ", 1)[1])
+
+
+def _ids_line(
+    templates: PrintTemplates, business_nis: str | None = None, business_nif: str | None = None
+) -> str:
+    """The business IDs under the shop's name (the ``""`` of an empty document header stays)."""
+    ids = _business_ids(templates, business_nis, business_nif)
+    return f"<div class='ids'>{ids}</div>" if ids else ""
 
 
 def _contact_line(templates: PrintTemplates) -> str:

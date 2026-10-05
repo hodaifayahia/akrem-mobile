@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Category, Sale
 from app.db.session import session_scope
-from app.services import auth, customers, debts, finance, payments, products, sales, stock
+from app.services import auth, calc, customers, debts, finance, payments, products, sales, stock
 from app.services.seed import seed_defaults
 
 PASSWORD = "StrongPass123"
@@ -240,3 +240,73 @@ def test_net_money_is_what_people_owe_me_minus_what_i_owe(session: Session, owne
     assert position.clients_owe == 42000
     assert position.net_money == 30000 + 12000 + 7000 - 10000
     assert position.net == position.net_money + position.stock_value
+
+
+# ------------------------------------------- two products are one purchase
+def test_two_products_share_one_duration_and_one_percentage(session: Session, owner_id: int) -> None:
+    _product(session, owner_id, "13 PRO", 0)
+    _product(session, owner_id, "Redmi 13C", 0)
+    client = _customer(session)
+
+    phone, case = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
+        _line("13 PRO", cash=90000, rate=35, months=6, down_payment=5000),
+        _line("Redmi 13C", cash=30000, rate=50, months=12, down_payment=5000, payment_interval=3),
+    ])
+
+    # Two products, two sales, one basket.
+    assert (phone.product, case.product) == ("13 PRO", "Redmi 13C")
+    assert phone.basket_id == case.basket_id
+    # One rate and one duration for both, whatever each line carried.
+    assert (phone.rate, case.rate) == (50, 50)
+    assert (phone.months, case.months) == (12, 12)
+    # The percentage is applied once, to the combined amount, and split between the lines.
+    assert (phone.total, case.total) == (135_000, 45_000)
+    assert phone.total + case.total == 180_000
+    # The down payment typed once is charged once.
+    assert (phone.down_payment, case.down_payment) == (5_000, 0)
+    assert phone.financed + case.financed == 175_000
+    # Both schedules run over the same months, on the same dates.
+    assert len(phone.installments) == len(case.installments) == 4
+    assert [row.due_date for row in phone.installments] == [row.due_date for row in case.installments]
+    assert phone.end_date == case.end_date
+
+
+def test_both_products_stay_visible_in_the_client_details(session: Session, owner_id: int) -> None:
+    _product(session, owner_id, "13 PRO", 0)
+    _product(session, owner_id, "Redmi 13C", 0)
+    client = _customer(session)
+    sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
+        _line("13 PRO", cash=90000), _line("Redmi 13C", cash=30000),
+    ])
+
+    history = customers.customer_history(session, client, today=TODAY)
+    rows = customers.list_customers(session, year=2026, month=10, today=TODAY, per_sale=True)
+    buyer_rows = [row for row in rows if row.id == client]
+
+    # Both products are listed, as two purchases (newest first) and as two lines of one row.
+    assert [purchase.product for purchase in history.purchases] == ["Redmi 13C", "13 PRO"]
+    assert len(buyer_rows) == 1
+    assert buyer_rows[0].products == ("13 PRO", "Redmi 13C")
+    assert len(buyer_rows[0].sales) == 2
+    # One row, but the money of both products: the shared 35 % on 120 000, once.
+    assert buyer_rows[0].total == 162_000
+    assert history.total_bought == 162_000
+    assert history.remaining == 162_000
+
+
+def test_a_single_product_sale_is_unchanged(session: Session, owner_id: int) -> None:
+    _product(session, owner_id, "13 PRO", 0)
+    client = _customer(session)
+
+    alone = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
+        _line("13 PRO", cash=90000, rate=35, months=6, down_payment=5000),
+    ])[0]
+    reference = calc.compute_sale(90_000, 35, 5_000, 6, 72_000, "installment")
+
+    assert (alone.total, alone.financed, alone.down_payment) == (
+        reference.total, reference.financed, 5_000,
+    )
+    assert (alone.rate, alone.months) == (35, 6)
+    assert alone.monthly_amount == reference.monthly_list[0]
+    assert len(alone.installments) == 6
+    assert alone.basket_id is None
