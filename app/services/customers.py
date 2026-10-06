@@ -53,6 +53,7 @@ class CustomerSummary:
     purchase_dates: tuple[date, ...]
     end_dates: tuple[date | None, ...]
     monthly_amount: int
+    total: int
     remaining_balance: int
     status: Status
     customer: Customer
@@ -133,6 +134,7 @@ class TransactionRecord:
     installment_index: int | None = None
     note: str | None = None
     payment_id: int | None = None
+    product: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +168,7 @@ class PurchaseRecord:
     reference: str | None = None
     quantity: int = 1
     basket_id: str | None = None
+    products: tuple[str, ...] = ()
     # Every amount received for this sale, oldest first.
     transactions: tuple[TransactionRecord, ...] = ()
 
@@ -238,7 +241,8 @@ def customer_history(session: Session, customer_id: int, *, today: date) -> Cust
     ordered_sales = sorted(
         customer.sales, key=lambda sale: (sale.purchase_date, sale.id), reverse=True
     )
-    purchases = tuple(_purchase_record(sale, today, grace_days) for sale in ordered_sales)
+    purchase_groups = list(reversed(group_basket_sales(ordered_sales)))
+    purchases = tuple(_purchase_record(group, today, grace_days) for group in purchase_groups)
     payments = tuple(sorted(
         (record for sale in ordered_sales for record in _payment_records(sale)),
         key=lambda record: (record.payment_date, record.payment_id),
@@ -254,11 +258,11 @@ def customer_history(session: Session, customer_id: int, *, today: date) -> Cust
         total_bought=sum(purchase.total for purchase in purchases),
         total_paid=sum(purchase.paid for purchase in purchases),
         remaining=sum(purchase.remaining for purchase in purchases),
-        cash_purchases=sum(1 for purchase in purchases if purchase.sale_type == "cash"),
+        cash_purchases=sum(1 for group in purchase_groups if any(sale.sale_type == "cash" for sale in group)),
         installment_purchases=sum(
-            1 for purchase in purchases if purchase.sale_type == "installment"
+            1 for group in purchase_groups if any(sale.sale_type == "installment" for sale in group)
         ),
-        credit_purchases=sum(1 for purchase in purchases if purchase.sale_type == "credit"),
+        credit_purchases=sum(1 for group in purchase_groups if any(sale.sale_type == "credit" for sale in group)),
         first_purchase=min(purchase_dates, default=None),
         last_purchase=max(purchase_dates, default=None),
         last_payment=payments[0].payment_date if payments else None,
@@ -290,39 +294,103 @@ def _overdue_count(sale: Sale, today: date, grace_days: int) -> int:
     )
 
 
-def _purchase_record(sale: Sale, today: date, grace_days: int) -> PurchaseRecord:
-    """Summarize one eagerly loaded sale for the history view."""
-    paid = _sale_paid(sale)
+def group_basket_sales(sales: Iterable[Sale]) -> list[tuple[Sale, ...]]:
+    """Group every product bought in one basket into a single displayed purchase.
+
+    The database keeps a sale row per basket line so stock and payments retain
+    their own records. Purchases made outside a basket always stay separate.
+    """
+    groups: dict[tuple[object, ...], list[Sale]] = {}
+    for sale in sorted(sales, key=lambda item: (item.purchase_date, item.id)):
+        if sale.basket_id is None:
+            key = ("sale", sale.id)
+        else:
+            key = ("basket", sale.basket_id)
+        groups.setdefault(key, []).append(sale)
+    return [tuple(group) for group in groups.values()]
+
+
+def basket_product_label(sales: Iterable[Sale]) -> str:
+    """Return the basket's item list, combining repeated product names and quantities."""
+    quantities: dict[str, int] = {}
+    for sale in sales:
+        quantities[sale.product] = quantities.get(sale.product, 0) + (sale.quantity or 1)
+    return " + ".join(
+        f"{product} ×{quantity}" if quantity > 1 else product
+        for product, quantity in quantities.items()
+    )
+
+
+def _purchase_record(sales: tuple[Sale, ...], today: date, grace_days: int) -> PurchaseRecord:
+    """Summarize one basket, including every item and transaction in it."""
+    sale = sales[0]
+    installment_sales = [item for item in sales if item.sale_type == "installment"]
+    sale_types = {item.sale_type for item in sales}
+    months = {item.months for item in installment_sales}
+    rates = {item.rate for item in installment_sales}
+    intervals = {item.payment_interval or 1 for item in installment_sales}
+    total = sum(item.total for item in sales)
+    paid = sum(_sale_paid(item) for item in sales)
+    transactions = _group_transactions(sales, total)
     return PurchaseRecord(
         sale_id=sale.id,
         purchase_date=sale.purchase_date,
-        product=sale.product,
-        sale_type=sale.sale_type,
-        cash_price=sale.cash_price,
-        wholesale_price=sale.wholesale_price,
-        rate=sale.rate,
-        total=sale.total,
-        down_payment=sale.down_payment,
-        months=sale.months,
-        monthly_amount=sale.monthly_amount,
-        end_date=sale.end_date,
-        expected_pay_date=sale.expected_pay_date,
+        product=basket_product_label(sales),
+        sale_type=sale.sale_type if len(sale_types) == 1 else "mixed",
+        cash_price=sum(item.cash_price for item in sales),
+        wholesale_price=sum(item.wholesale_price for item in sales),
+        rate=next(iter(rates)) if len(rates) == 1 else 0,
+        total=total,
+        down_payment=sum(item.down_payment for item in sales),
+        months=next(iter(months)) if len(months) == 1 else None,
+        monthly_amount=(sum(item.monthly_amount or 0 for item in installment_sales) if installment_sales else None),
+        end_date=max((item.end_date for item in sales if item.end_date is not None), default=None),
+        expected_pay_date=max((item.expected_pay_date for item in sales if item.expected_pay_date is not None), default=None),
         paid=paid,
-        remaining=max(0, sale.total - paid),
-        profit=sale.profit,
-        status=for_month(sale.installments, today.year, today.month, today, grace_days),
-        overdue_installments=_overdue_count(sale, today, grace_days),
-        payment_interval=sale.payment_interval or 1,
-        payment_count=len(sale.installments),
-        color=sale.color,
-        battery_health=sale.battery_health,
-        is_new=sale.is_new,
-        imei=sale.imei,
-        reference=sale.reference,
-        quantity=sale.quantity or 1,
+        remaining=max(0, total - paid),
+        profit=sum(item.profit for item in sales),
+        status=for_customer(sales, today.year, today.month, today, grace_days),
+        overdue_installments=sum(_overdue_count(item, today, grace_days) for item in sales),
+        payment_interval=next(iter(intervals)) if len(intervals) == 1 else 1,
+        payment_count=max((len(item.installments) for item in installment_sales), default=0),
+        color=sale.color if len(sales) == 1 else None,
+        battery_health=sale.battery_health if len(sales) == 1 else None,
+        is_new=sale.is_new if len(sales) == 1 else False,
+        imei=sale.imei if len(sales) == 1 else None,
+        reference=sale.reference if len(sales) == 1 else None,
+        quantity=1,
         basket_id=sale.basket_id,
-        transactions=_transactions(sale),
+        products=tuple(dict.fromkeys(item.product for item in sales)),
+        transactions=transactions,
     )
+
+
+def _group_transactions(sales: tuple[Sale, ...], total: int) -> tuple[TransactionRecord, ...]:
+    """Merge same-product transaction lines into one running purchase balance."""
+    records = [
+        (sale.id, index, transaction)
+        for sale in sales
+        for index, transaction in enumerate(_transactions(sale))
+    ]
+    records.sort(key=lambda item: (
+        item[2].transaction_date, item[2].payment_id or 0, item[0], item[1],
+    ))
+    remaining = total
+    result: list[TransactionRecord] = []
+    for _sale_id, _index, transaction in records:
+        remaining = max(0, remaining - transaction.amount)
+        result.append(TransactionRecord(
+            kind=transaction.kind,
+            transaction_date=transaction.transaction_date,
+            amount=transaction.amount,
+            remaining_after=remaining,
+            method=transaction.method,
+            installment_index=transaction.installment_index,
+            note=transaction.note,
+            payment_id=transaction.payment_id,
+            product=transaction.product,
+        ))
+    return tuple(result)
 
 
 def _transactions(sale: Sale) -> tuple[TransactionRecord, ...]:
@@ -359,6 +427,7 @@ def _transactions(sale: Sale) -> tuple[TransactionRecord, ...]:
         result.append(TransactionRecord(
             kind=kind, transaction_date=when, amount=amount, remaining_after=remaining, method=method,
             installment_index=index, note=note, payment_id=payment_id,
+            product=sale.product,
         ))
     return tuple(result)
 
@@ -625,6 +694,7 @@ def _summary_row(
         purchase_dates=tuple(sale.purchase_date for sale in customer_sales),
         end_dates=tuple(sale.end_date for sale in customer_sales),
         monthly_amount=monthly_amount,
+        total=sum(sale.total for sale in customer_sales),
         remaining_balance=remaining_balance,
         status=customer_status,
         customer=customer,

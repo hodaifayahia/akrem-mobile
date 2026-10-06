@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 from PySide6.QtCore import QDate, QSize, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.db.models import Customer, Installment, Payment, Sale, User
+from app.db.models import Customer, Payment, Sale, User
 from app.config import data_dir, ensure_data_dirs
 from app.db.session import session_scope
 from app.i18n import ar
@@ -43,7 +45,6 @@ from app.services import auth, customers, payments, sales as sales_service
 from app.services import print_templates, schedule
 from app.services.sales import PaidInstallmentEditError
 from app.services.pdf_forms import generate_commitment_pdf, generate_payment_receipt_pdf
-from app.services.schedule import ScheduledInstallment
 from app.services.settings import get_value
 from app.ui.widgets.customer_history import CustomerHistoryPanel, HistorySummary
 from app.services.status import Status, for_customer, for_month
@@ -134,6 +135,7 @@ class CustomerDetailsDialog(QDialog):
         self._due_mode = schedule.DEFAULT_DUE_MODE
         self._sale_id: int | None = sale_id
         self._payments_by_id: dict[int, Payment] = {}
+        self._payment_sales_by_id: dict[int, Sale] = {}
         self.setWindowTitle(ar.CUST_DETAILS_TITLE)
         self.setMinimumSize(640, 480)
         self._reload_customer()
@@ -397,7 +399,7 @@ class CustomerDetailsDialog(QDialog):
 
     def _show_sale_from_history(self, sale_id: int) -> None:
         """Open a purchase picked in the history tab."""
-        index = self.sale_selector.findData(sale_id)
+        index = self.sale_selector.findData(self._representative_sale_id(sale_id))
         if index >= 0:
             self.sale_selector.setCurrentIndex(index)
         self.tabs.setCurrentIndex(0)
@@ -423,12 +425,15 @@ class CustomerDetailsDialog(QDialog):
             grace_days=self._grace_days,
         )
         self._set_status(customer_status)
-        selected_sale_id = self._sale_id
+        selected_sale_id = self._representative_sale_id(self._sale_id) if self._sale_id is not None else None
         self.sale_selector.blockSignals(True)
         self.sale_selector.clear()
-        for sale in sorted(self._customer.sales, key=lambda item: (item.purchase_date, item.id)):
-            kind = self._sale_type_label(sale.sale_type)
-            label = f"{ltr_text(sale.product)} · {self._format_date(sale.purchase_date)} · {kind}"
+        for group in customers.group_basket_sales(self._customer.sales):
+            sale = group[0]
+            kinds = tuple(dict.fromkeys(item.sale_type for item in group))
+            kind = " + ".join(self._sale_type_label(value) for value in kinds)
+            product = ltr_text(customers.basket_product_label(group))
+            label = f"{product} · {self._format_date(sale.purchase_date)} · {kind}"
             self.sale_selector.addItem(label, sale.id)
         selected_index = self.sale_selector.findData(selected_sale_id)
         self.sale_selector.setCurrentIndex(selected_index if selected_index >= 0 else 0)
@@ -437,15 +442,15 @@ class CustomerDetailsDialog(QDialog):
         self._render_selected_sale(self.sale_selector.currentIndex())
 
     def _render_selected_sale(self, _index: int = -1) -> None:
-        """Show fields and schedule rows for the selected sale."""
-        sale_id = self.sale_selector.currentData()
-        sale = next((item for item in self._customer.sales if item.id == sale_id), None)
+        """Show the combined amounts and schedule for the selected product."""
+        selected_sales = self._selected_sales()
+        sale = selected_sales[0] if selected_sales else None
         self._sale_id = sale.id if sale is not None else None
         self.details_table.setRowCount(0)
         self.schedule_table.setRowCount(0)
         self.empty_schedule.hide()
         self.credit_payment_panel.hide()
-        self._refresh_print_actions(sale)
+        self._refresh_print_actions(selected_sales)
         self.schedule_table.show()
         if sale is None:
             self.financial_summary_title.hide()
@@ -457,37 +462,49 @@ class CustomerDetailsDialog(QDialog):
 
         self.financial_summary_title.show()
         self.financial_table.show()
-        self._populate_financial_summary(sale)
-        self._populate_details(sale)
-        if sale.sale_type == "installment":
+        self._populate_financial_summary(selected_sales)
+        self._populate_details(selected_sales)
+        installment_sales = tuple(item for item in selected_sales if item.sale_type == "installment")
+        credit_sales = tuple(item for item in selected_sales if item.sale_type == "credit")
+        if installment_sales:
             self.schedule_title.show()
             self.empty_schedule.hide()
-            self._populate_schedule(sale)
-        elif sale.sale_type == "credit":
-            self.schedule_table.hide()
-            self.schedule_title.hide()
-            self.empty_schedule.setText(ar.CUST_NO_SCHEDULE)
-            self.empty_schedule.show()
-            self._populate_credit_balance(sale)
+            self._populate_schedule(installment_sales)
         else:
             self.schedule_table.hide()
             self.schedule_title.hide()
+        if credit_sales:
+            self._populate_credit_balance(credit_sales)
+        elif not installment_sales:
             self.empty_schedule.setText(ar.CUST_NO_SCHEDULE)
             self.empty_schedule.show()
 
-    def _populate_financial_summary(self, sale: Sale) -> None:
+    def _populate_financial_summary(self, sales: tuple[Sale, ...]) -> None:
         """Render the 7 core installment fields requested by the shop owner."""
+        sale = sales[0]
+        installment_sales = [item for item in sales if item.sale_type == "installment"]
+        total = sum(item.total for item in sales)
+        cash_price = sum(item.cash_price for item in sales)
+        wholesale_price = sum(item.wholesale_price for item in sales)
+        profit = sum(item.profit for item in sales)
+        monthly_amount = sum(item.monthly_amount or 0 for item in installment_sales)
         is_owner = self.current_user.role == "owner"
-        wholesale_text = self._money(sale.wholesale_price) if is_owner else "—"
-        cash_price_text = self._money(sale.cash_price)
-        rate_text = f"{sale.rate}%"
-        total_text = self._money(sale.total)
-        interval = sale.payment_interval or 1
-        monthly_text = self._money(sale.monthly_amount)
-        if sale.monthly_amount is not None and interval > 1:
+        wholesale_text = self._money(wholesale_price) if is_owner else "—"
+        cash_price_text = self._money(cash_price)
+        rates = {item.rate for item in installment_sales}
+        rate_text = f"{next(iter(rates))}%" if len(rates) == 1 else "—"
+        total_text = self._money(total)
+        intervals = {item.payment_interval or 1 for item in installment_sales}
+        interval = next(iter(intervals)) if len(intervals) == 1 else 1
+        monthly_text = self._money(monthly_amount) if installment_sales else "—"
+        if installment_sales and interval > 1:
             monthly_text = f"{monthly_text} {every_text(interval)}"
-        months_text = ar.MONTHS_COUNT.format(count=sale.months) if sale.months is not None else "—"
-        profit_text = self._money(sale.profit) if is_owner else "—"
+        durations = {item.months for item in installment_sales}
+        months_text = (
+            ar.MONTHS_COUNT.format(count=next(iter(durations)))
+            if len(durations) == 1 and next(iter(durations)) is not None else "—"
+        )
+        profit_text = self._money(profit) if is_owner else "—"
 
         values = [
             (wholesale_text, "#3B92D9"),
@@ -509,39 +526,56 @@ class CustomerDetailsDialog(QDialog):
             item.setFont(font)
             self.financial_table.setItem(0, col, item)
 
-    def _populate_details(self, sale: Sale) -> None:
+    def _populate_details(self, sales: tuple[Sale, ...]) -> None:
         """Render sale fields in two compact label/value pairs per row."""
+        sale = sales[0]
+        product = ltr_text(customers.basket_product_label(sales))
+        installment_sales = [item for item in sales if item.sale_type == "installment"]
+        kinds = tuple(dict.fromkeys(item.sale_type for item in sales))
+        kind_label = " + ".join(self._sale_type_label(kind) for kind in kinds)
+        rates = {item.rate for item in installment_sales}
+        durations = {item.months for item in installment_sales}
+        intervals = {item.payment_interval or 1 for item in installment_sales}
         fields: list[tuple[str, str]] = [
-            (ar.PRODUCT, ltr_text(sale.product)),
-            (ar.CUST_SALE_TYPE, self._sale_type_label(sale.sale_type)),
+            (ar.PRODUCT, product),
+            (ar.CUST_SALE_TYPE, kind_label),
         ]
         if self.current_user.role == "owner":
-            fields.append((ar.WHOLESALE_PRICE, self._money(sale.wholesale_price)))
+            fields.append((ar.WHOLESALE_PRICE, self._money(sum(item.wholesale_price for item in sales))))
+        monthly_total = (
+            sum(item.monthly_amount or 0 for item in installment_sales)
+            if installment_sales
+            else None
+        )
         fields.extend(
             (
-                (ar.CASH_PRICE, self._money(sale.cash_price)),
-                (ar.RATE, f"{sale.rate}%"),
-                (ar.DOWN_PAYMENT, self._money(sale.down_payment)),
-                (ar.TOTAL_PRICE, self._money(sale.total)),
-                (amount_label(sale.payment_interval or 1), self._money(sale.monthly_amount)),
-                (ar.MONTHS, "—" if sale.months is None else str(sale.months)),
+                (ar.CASH_PRICE, self._money(sum(item.cash_price for item in sales))),
+                (ar.RATE, f"{next(iter(rates))}%" if len(rates) == 1 else "—"),
+                (ar.DOWN_PAYMENT, self._money(sum(item.down_payment for item in sales))),
+                (ar.TOTAL_PRICE, self._money(sum(item.total for item in sales))),
+                (amount_label(next(iter(intervals)) if len(intervals) == 1 else 1), self._money(monthly_total)),
+                (ar.MONTHS, str(next(iter(durations))) if len(durations) == 1 and next(iter(durations)) is not None else "—"),
             )
         )
-        if sale.sale_type == "installment":
-            fields.append((ar.PLAN_INTERVAL, every_text(sale.payment_interval or 1)))
-        if sale.is_new or sale.battery_health is not None:
+        if installment_sales:
+            fields.append((ar.PLAN_INTERVAL, every_text(next(iter(intervals)) if len(intervals) == 1 else 1)))
+        if len(sales) == 1 and (sale.is_new or sale.battery_health is not None):
             fields.append((ar.PROD_TPL_BATTERY, battery_text(sale.is_new, sale.battery_health)))
-        for label, value in (
-            (ar.PROD_TPL_COLOR, sale.color), (ar.PROD_TPL_IMEI, sale.imei), (ar.PROD_TPL_REF, sale.reference),
-        ):
+        for label, value in ((ar.PROD_TPL_COLOR, sale.color),):
+            if len({item.product for item in sales}) > 1 or (len(sales) > 1 and any(item.color != sale.color for item in sales)):
+                value = None
             if value:
                 fields.append((label, ltr_text(value)))
+        if len(sales) == 1:
+            for label, value in ((ar.PROD_TPL_IMEI, sale.imei), (ar.PROD_TPL_REF, sale.reference)):
+                if value:
+                    fields.append((label, ltr_text(value)))
         if self.current_user.role == "owner":
-            fields.append((ar.PROFIT, self._money(sale.profit)))
+            fields.append((ar.PROFIT, self._money(sum(item.profit for item in sales))))
         fields.extend(
             (
                 (ar.PURCHASE_DATE, self._format_date(sale.purchase_date)),
-                (ar.END_DATE, self._format_date(sale.end_date)),
+                (ar.END_DATE, self._format_date(max((item.end_date for item in sales if item.end_date), default=None))),
             )
         )
         self.details_table.setRowCount((len(fields) + 1) // 2)
@@ -552,76 +586,87 @@ class CustomerDetailsDialog(QDialog):
             self.details_table.setItem(row, column + 1, QTableWidgetItem(value))
         fit_table_to_rows(self.details_table)
 
-    def _populate_schedule(self, sale: Sale) -> None:
-        """Render monthly due rows with per-row status and payment actions."""
-        installments = sorted(sale.installments, key=lambda item: item.installment_index)
-        if installments:
-            rows: list[tuple[Installment | None, Installment | ScheduledInstallment]] = [
-                (installment, installment) for installment in installments
-            ]
-        else:
-            # Older/imported sale rows may lack stored installments; show the
-            # calculated schedule for context but keep payment actions disabled.
-            rows = [(None, draft) for draft in schedule.build(sale, {"due_mode": self._due_mode})]
+    def _populate_schedule(self, sales: tuple[Sale, ...]) -> None:
+        """Render one combined schedule for the installment items in a basket."""
+        grouped: dict[tuple[int, date], dict[str, object]] = {}
+        for sale in sales:
+            stored = sorted(sale.installments, key=lambda item: item.installment_index)
+            if stored:
+                entries = [
+                    (
+                        item.installment_index,
+                        item.due_date,
+                        item.amount_due,
+                        max(item.amount_paid, sum(payment.amount for payment in item.payments)),
+                        True,
+                    )
+                    for item in stored
+                ]
+            else:
+                # Older/imported rows may lack stored installments. Keep their
+                # calculated schedule visible, with payment actions disabled.
+                entries = [
+                    (item.installment_index, item.due_date, item.amount_due, 0, False)
+                    for item in schedule.build(sale, {"due_mode": self._due_mode})
+                ]
+            for index, due_date, amount_due, paid, is_stored in entries:
+                values = grouped.setdefault(
+                    (index, due_date), {"amount": 0, "paid": 0, "stored": True}
+                )
+                values["amount"] = int(values["amount"]) + amount_due
+                values["paid"] = int(values["paid"]) + paid
+                values["stored"] = bool(values["stored"]) and is_stored
+
+        rows = sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))
         self.schedule_table.setRowCount(len(rows))
         now = date.today()
-        for row, (installment, planned) in enumerate(rows):
-            index = installment.installment_index if installment is not None else planned.installment_index
-            due_date = installment.due_date if installment is not None else planned.due_date
-            amount_due = installment.amount_due if installment is not None else planned.amount_due
-            paid_amount = (
-                max(
-                    installment.amount_paid,
-                    sum(payment.amount for payment in installment.payments),
-                )
-                if installment is not None
-                else 0
-            )
+        for row_index, ((index, due_date), values) in enumerate(rows):
+            amount_due = int(values["amount"])
+            paid_amount = int(values["paid"])
             remaining = max(0, amount_due - paid_amount)
-            self.schedule_table.setItem(row, 0, QTableWidgetItem(str(index)))
-            self.schedule_table.setItem(row, 1, QTableWidgetItem(self._format_date(due_date)))
-            self.schedule_table.setItem(row, 2, QTableWidgetItem(self._money(amount_due)))
-            self.schedule_table.setItem(row, 3, QTableWidgetItem(self._money(paid_amount)))
+            self.schedule_table.setItem(row_index, 0, QTableWidgetItem(str(index)))
+            self.schedule_table.setItem(row_index, 1, QTableWidgetItem(self._format_date(due_date)))
+            self.schedule_table.setItem(row_index, 2, QTableWidgetItem(self._money(amount_due)))
+            self.schedule_table.setItem(row_index, 3, QTableWidgetItem(self._money(paid_amount)))
+            state_row = SimpleNamespace(amount_due=amount_due, amount_paid=paid_amount, due_date=due_date)
             state = for_month(
-                [installment if installment is not None else planned],
-                due_date.year,
-                due_date.month,
-                now,
-                grace_days=self._grace_days,
+                [state_row], due_date.year, due_date.month, now, grace_days=self._grace_days
             )
-            status_dot = QLabel("●", self.schedule_table)
+            status_dot = QLabel("\u25cf", self.schedule_table)
             status_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
             status_dot.setStyleSheet(f"color: {self._status_color(state)}; font-size: 18px;")
             status_dot.setToolTip(self._status_label(state))
-            self.schedule_table.setCellWidget(row, 4, status_dot)
-            if installment is not None and remaining > 0:
-                action = QPushButton(f"💳  {ar.CUST_RECORD_PAYMENT}", self.schedule_table)
+            self.schedule_table.setCellWidget(row_index, 4, status_dot)
+            if bool(values["stored"]) and remaining > 0:
+                action = QPushButton(ar.CUST_RECORD_PAYMENT, self.schedule_table)
                 action.setProperty("variant", "success")
                 action.setProperty("compact", True)
                 action.setCursor(Qt.CursorShape.PointingHandCursor)
                 action.clicked.connect(
-                    lambda _checked=False, installment_id=installment.id, outstanding=remaining:
-                        self._open_installment_payment(installment_id, outstanding)
+                    lambda _checked=False, group=sales, outstanding=remaining:
+                        self._open_installment_payment(group, outstanding)
                 )
-                self.schedule_table.setCellWidget(row, 5, action)
+                self.schedule_table.setCellWidget(row_index, 5, action)
             else:
-                self.schedule_table.setItem(row, 5, QTableWidgetItem("—"))
+                self.schedule_table.setItem(row_index, 5, QTableWidgetItem("\u2014"))
         fit_table_to_rows(self.schedule_table, resize_rows=True)
 
-    def _populate_credit_balance(self, sale: Sale) -> None:
-        """Offer partial payment recording for a credit sale without installments."""
-        paid = sum(payment.amount for payment in sale.credit_payments)
-        remaining = max(0, sale.financed - paid)
+    def _populate_credit_balance(self, sales: tuple[Sale, ...]) -> None:
+        """Offer partial payment recording for the credit items in a basket."""
+        remaining = sum(
+            max(0, sale.financed - sum(payment.amount for payment in sale.credit_payments))
+            for sale in sales
+        )
         self.credit_balance_label.setText(f"{ar.CUST_CREDIT_BALANCE}: {self._money(remaining)}")
         self.credit_payment_button.setEnabled(remaining > 0)
         self.credit_payment_panel.show()
 
-    def _refresh_print_actions(self, sale: Sale | None) -> None:
-        """Show the commitment action and load selectable payments for receipts."""
-        self.edit_sale_button.setVisible(
-            self.current_user.role == "owner" and sale is not None
-        )
+    def _refresh_print_actions(self, sales: tuple[Sale, ...]) -> None:
+        """Show document actions and load payment receipts across grouped lines."""
+        sale = sales[0] if sales else None
+        self.edit_sale_button.setVisible(self.current_user.role == "owner" and sale is not None)
         self._payments_by_id = {}
+        self._payment_sales_by_id = {}
         self.receipt_history.clear()
         if sale is None:
             self.commitment_pdf_button.setVisible(False)
@@ -630,20 +675,25 @@ class CustomerDetailsDialog(QDialog):
             self.receipt_pdf_button.setVisible(False)
             return
 
-        self.commitment_pdf_button.setVisible(sale.sale_type == "installment")
-        history: list[Payment] = []
-        if sale.sale_type == "credit":
-            history.extend(sale.credit_payments)
-        else:
-            for installment in sale.installments:
-                history.extend(installment.payments)
-        history.sort(key=lambda payment: (payment.payment_date, payment.id), reverse=True)
-        for payment in history:
+        self.commitment_pdf_button.setVisible(any(item.sale_type == "installment" for item in sales))
+        history: list[tuple[Payment, Sale]] = []
+        for item in sales:
+            if item.sale_type == "credit":
+                history.extend((payment, item) for payment in item.credit_payments)
+            else:
+                history.extend(
+                    (payment, item)
+                    for installment in item.installments
+                    for payment in installment.payments
+                )
+        history.sort(key=lambda entry: (entry[0].payment_date, entry[0].id), reverse=True)
+        for payment, payment_sale in history:
             self._payments_by_id[payment.id] = payment
+            self._payment_sales_by_id[payment.id] = payment_sale
             method = self._payment_method_label(payment.method)
             label = (
-                f"{self._format_date(payment.payment_date)} · "
-                f"{self._money(payment.amount)} · {method}"
+                f"{self._format_date(payment.payment_date)} \u00b7 "
+                f"{self._money(payment.amount)} \u00b7 {method}"
             )
             self.receipt_history.addItem(label, payment.id)
         has_history = bool(history)
@@ -653,10 +703,11 @@ class CustomerDetailsDialog(QDialog):
         self.receipt_pdf_button.setEnabled(has_history)
 
     def _print_commitment(self) -> None:
-        """Choose a path and generate the selected sale's commitment form."""
-        sale = self._selected_sale()
-        if sale is None or sale.sale_type != "installment":
+        """Create a commitment form for all installment items in the selected basket."""
+        sales = tuple(item for item in self._selected_sales() if item.sale_type == "installment")
+        if not sales:
             return
+        sale = self._combined_commitment_sale(sales)
         default_name = self._suggested_pdf_name(sale, "commitment")
         try:
             path = self._choose_pdf_path(ar.PDF_COMMITMENT_ACTION, default_name)
@@ -667,7 +718,6 @@ class CustomerDetailsDialog(QDialog):
                 path,
                 self._customer,
                 sale,
-                # The owner's figures (wholesale price, profit) only when the owner turned them on.
                 include_sensitive=self.current_user.role == "owner" and templates.commitment_owner_figures,
                 templates=templates,
             )
@@ -676,14 +726,88 @@ class CustomerDetailsDialog(QDialog):
             return
         self._offer_open_pdf(output)
 
+    @staticmethod
+    def _combined_commitment_sale(sales: tuple[Sale, ...]) -> Sale:
+        """Build an in-memory sale-shaped view for the combined printed schedule."""
+        if len(sales) == 1:
+            return sales[0]
+        first = sales[0]
+        installments: dict[tuple[int, date], dict[str, object]] = {}
+        for sale in sales:
+            rows = sale.installments or schedule.build(sale, {"due_mode": schedule.DEFAULT_DUE_MODE})
+            for row in rows:
+                values = installments.setdefault(
+                    (row.installment_index, row.due_date),
+                    {"amount": 0, "paid": 0, "paid_date": None},
+                )
+                values["amount"] = int(values["amount"]) + row.amount_due
+                payments_for_row = getattr(row, "payments", ()) or ()
+                paid = max(
+                    getattr(row, "amount_paid", 0),
+                    sum(payment.amount for payment in payments_for_row),
+                )
+                values["paid"] = int(values["paid"]) + paid
+                dates = [payment.payment_date for payment in payments_for_row]
+                if getattr(row, "paid_date", None) is not None:
+                    dates.append(row.paid_date)
+                if dates:
+                    old_date = values["paid_date"]
+                    values["paid_date"] = max([*dates, old_date] if old_date else dates)
+        combined_installments = [
+            SimpleNamespace(
+                installment_index=index,
+                due_date=due_date,
+                amount_due=int(values["amount"]),
+                amount_paid=int(values["paid"]),
+                paid_date=values["paid_date"],
+                payments=[],
+            )
+            for (index, due_date), values in sorted(installments.items())
+        ]
+        return SimpleNamespace(
+            id=first.id,
+            product=customers.basket_product_label(sales),
+            quantity=1,
+            sale_type="installment",
+            wholesale_price=sum(sale.wholesale_price for sale in sales),
+            cash_price=sum(sale.cash_price for sale in sales),
+            rate=first.rate,
+            down_payment=sum(sale.down_payment for sale in sales),
+            months=first.months,
+            payment_interval=first.payment_interval or 1,
+            total=sum(sale.total for sale in sales),
+            financed=sum(sale.financed for sale in sales),
+            monthly_amount=sum(sale.monthly_amount or 0 for sale in sales),
+            profit=sum(sale.profit for sale in sales),
+            purchase_date=first.purchase_date,
+            end_date=first.end_date,
+            expected_pay_date=first.expected_pay_date,
+            installments=combined_installments,
+            color=(
+                first.color
+                if len({sale.product for sale in sales}) == 1
+                and all(sale.color == first.color for sale in sales)
+                else None
+            ),
+            battery_health=(
+                first.battery_health
+                if len({sale.product for sale in sales}) == 1
+                and all(sale.battery_health == first.battery_health for sale in sales)
+                else None
+            ),
+            is_new=all(sale.is_new for sale in sales),
+            imei=first.imei if len(sales) == 1 else None,
+            reference=first.reference if len(sales) == 1 else None,
+        )
+
     def _print_payment_receipt(self) -> None:
         """Choose a path and print the selected payment from the sale history."""
-        sale = self._selected_sale()
         payment_id = self.receipt_history.currentData()
-        if sale is None or payment_id is None:
+        if payment_id is None:
             return
         payment = self._payments_by_id.get(int(payment_id))
-        if payment is None:
+        sale = self._payment_sales_by_id.get(int(payment_id))
+        if payment is None or sale is None:
             return
         default_name = self._suggested_pdf_name(sale, f"receipt_{payment.id}")
         try:
@@ -746,20 +870,25 @@ class CustomerDetailsDialog(QDialog):
             "baridimob": ar.PDF_METHOD_BARIDIMOB,
         }.get(method.casefold(), method)
 
-    def _open_installment_payment(self, installment_id: int, remaining: int) -> None:
-        """Collect any amount on the selected sale, starting with its oldest unpaid installment.
-
-        The client may pay more or less than this installment, up to what is
-        left on the whole sale.
-        """
-        sale = self._selected_sale()
-        if sale is None or not any(row.id == installment_id for row in sale.installments):
+    def _open_installment_payment(self, sales: tuple[Sale, ...], suggested: int) -> None:
+        """Collect one payment across the basket's installment items."""
+        if not sales or any(sale.sale_type != "installment" for sale in sales):
             return
-        sale_remaining = max(
-            remaining, sum(max(0, row.amount_due - row.amount_paid) for row in sale.installments)
+        sale_remaining = sum(
+            max(
+                0,
+                installment.amount_due - max(
+                    installment.amount_paid,
+                    sum(payment.amount for payment in installment.payments),
+                ),
+            )
+            for sale in sales
+            for installment in sale.installments
         )
+        if sale_remaining <= 0:
+            return
         dialog = PaymentEntryDialog(
-            sale_remaining, self, suggested=remaining,
+            sale_remaining, self, suggested=min(suggested, sale_remaining),
             hint=ar.PAY_FLEXIBLE_HINT.format(remaining=f"{sale_remaining:,} {ar.CURRENCY_SUFFIX}"),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -767,28 +896,30 @@ class CustomerDetailsDialog(QDialog):
         amount, payment_date, method, note = dialog.values()
         try:
             with session_scope(self._engine) as session:
-                recorded = payments.record_sale_payment_for_user(
+                recorded = payments.record_sales_payment_for_user(
                     session,
                     int(self.current_user.id),
-                    sale.id,
+                    [sale.id for sale in sales],
                     amount,
                     payment_date,
                     method,
                     note,
                 )
-                payment_id = recorded[-1].id
+                payment_ids = [payment.id for payment in recorded]
         except (PermissionError, ValueError, RuntimeError, SQLAlchemyError):
             QMessageBox.warning(self, ar.PAYMENT_DIALOG_TITLE, ar.PAYMENT_SAVE_ERROR)
             return
-        self._notify_payment_changed(payment_id)
+        self._notify_payment_changed(payment_ids)
 
     def _record_credit_payment(self) -> None:
-        """Collect a payment and save it against the selected credit sale."""
-        sale = self._selected_sale()
-        if sale is None or sale.sale_type != "credit":
+        """Collect one payment across the basket's credit items."""
+        sales = self._selected_sales()
+        if not sales or any(sale.sale_type != "credit" for sale in sales):
             return
-        paid = sum(payment.amount for payment in sale.credit_payments)
-        remaining = max(0, sale.financed - paid)
+        remaining = sum(
+            max(0, sale.financed - sum(payment.amount for payment in sale.credit_payments))
+            for sale in sales
+        )
         if remaining <= 0:
             return
         dialog = PaymentEntryDialog(remaining, self)
@@ -797,26 +928,27 @@ class CustomerDetailsDialog(QDialog):
         amount, payment_date, method, note = dialog.values()
         try:
             with session_scope(self._engine) as session:
-                payment = payments.record_credit_payment_for_user(
+                recorded = payments.record_credit_sales_payment_for_user(
                     session,
                     int(self.current_user.id),
-                    sale.id,
+                    [sale.id for sale in sales],
                     amount,
                     payment_date,
                     method,
                     note,
                 )
-                payment_id = payment.id
+                payment_ids = [payment.id for payment in recorded]
         except (PermissionError, ValueError, RuntimeError, SQLAlchemyError):
             QMessageBox.warning(self, ar.PAYMENT_DIALOG_TITLE, ar.PAYMENT_SAVE_ERROR)
             return
-        self._notify_payment_changed(payment_id)
+        self._notify_payment_changed(payment_ids)
 
-    def _notify_payment_changed(self, payment_id: int) -> None:
-        """Broadcast payment changes, then refresh this dialog's detached data."""
-        events.payment_changed.emit(payment_id)
-        if self._sale_id is not None:
-            events.sale_changed.emit(self._sale_id)
+    def _notify_payment_changed(self, payment_ids: list[int]) -> None:
+        """Broadcast a grouped payment, then refresh this dialog's detached data."""
+        for payment_id in payment_ids:
+            events.payment_changed.emit(payment_id)
+        for sale in self._selected_sales():
+            events.sale_changed.emit(sale.id)
         events.customer_changed.emit(self.customer_id)
         events.data_changed.emit()
         events.notify.emit("success", ar.PAYMENT_DIALOG_TITLE, ar.PAY_SAVE_DONE, 4000)
@@ -832,9 +964,18 @@ class CustomerDetailsDialog(QDialog):
         """Edit the selected sale through the owner-guarded sales service."""
         if self.current_user.role != "owner":
             return
-        sale = self._selected_sale()
-        if sale is None:
+        selected_sales = self._selected_sales()
+        if not selected_sales:
             return
+        sale = selected_sales[0]
+        if len(selected_sales) > 1:
+            choices = [f"{ltr_text(item.product)} - #{item.id}" for item in selected_sales]
+            choice, accepted = QInputDialog.getItem(
+                self, ar.CUST_EDIT_SALE, ar.PRODUCT, choices, 0, False
+            )
+            if not accepted:
+                return
+            sale = selected_sales[choices.index(choice)]
         dialog = SaleEditDialog(sale, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -878,6 +1019,25 @@ class CustomerDetailsDialog(QDialog):
         self._populate_sales()
         QMessageBox.information(self, ar.CUST_EDIT_SALE, ar.CUST_EDIT_SALE_SAVED)
 
+    def _selected_sales(self) -> tuple[Sale, ...]:
+        """Return all sale rows represented by the selected basket purchase."""
+        selected_id = self.sale_selector.currentData()
+        if selected_id is None:
+            return ()
+        for group in customers.group_basket_sales(self._customer.sales):
+            if group[0].id == selected_id:
+                return group
+        return ()
+
+    def _representative_sale_id(self, sale_id: int | None) -> int | None:
+        """Map a sale row to its basket selector entry."""
+        if sale_id is None:
+            return None
+        for group in customers.group_basket_sales(self._customer.sales):
+            if any(sale.id == sale_id for sale in group):
+                return group[0].id
+        return sale_id
+
     def _selected_sale(self) -> Sale | None:
         """Return the currently selected sale object, if one exists."""
         selected_id = self.sale_selector.currentData()
@@ -894,6 +1054,7 @@ class CustomerDetailsDialog(QDialog):
             "cash": ar.SALE_CASH,
             "installment": ar.SALE_INSTALLMENT,
             "credit": ar.SALE_CREDIT,
+            "mixed": ar.SALE_MIXED,
         }.get(sale_type, sale_type)
 
     @staticmethod

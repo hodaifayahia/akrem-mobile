@@ -36,7 +36,12 @@ _STATUS_TONES = {Status.PAID: "paid", Status.PENDING: "pending", Status.FAILED: 
 
 def type_label(kind: str) -> str:
     """Localized sale type."""
-    return {"cash": ar.SALE_CASH, "installment": ar.SALE_INSTALLMENT, "credit": ar.SALE_CREDIT}.get(kind, kind)
+    return {
+        "cash": ar.SALE_CASH,
+        "installment": ar.SALE_INSTALLMENT,
+        "credit": ar.SALE_CREDIT,
+        "mixed": ar.SALE_MIXED,
+    }.get(kind, kind)
 
 
 def status_label(status: Status) -> str:
@@ -211,7 +216,7 @@ class CustomerHistoryPanel(QWidget):
             parent = self._purchase_item(purchase)
             self.purchases_tree.addTopLevelItem(parent)
             for transaction in purchase.transactions:
-                parent.addChild(self._transaction_item(purchase.sale_id, transaction))
+                parent.addChild(self._transaction_item(purchase, transaction))
             if not purchase.transactions:
                 parent.addChild(self._note_item(purchase.sale_id, ar.HIST_TX_NONE))
         self.purchases_tree.expandAll()
@@ -226,7 +231,8 @@ class CustomerHistoryPanel(QWidget):
             plan_summary(purchase.monthly_amount or 0, purchase.payment_interval, purchase.payment_count)
             if purchase.sale_type == "installment" and purchase.months
             else ar.HIST_PLAN_CASH if purchase.sale_type == "cash"
-            else ar.HIST_PLAN_CREDIT
+            else ar.HIST_PLAN_CREDIT if purchase.sale_type == "credit"
+            else ar.HIST_PLAN_MIXED
         )
         item = self._item(purchase.sale_id, [
             (purchase.purchase_date.strftime("%d/%m/%Y"), None),
@@ -244,10 +250,13 @@ class CustomerHistoryPanel(QWidget):
             item.setFont(column, bold)
         return item
 
-    def _transaction_item(self, sale_id: int, transaction: TransactionRecord) -> QTreeWidgetItem:
-        return self._item(sale_id, [
+    def _transaction_item(self, purchase: PurchaseRecord, transaction: TransactionRecord) -> QTreeWidgetItem:
+        description = transaction_label(transaction)
+        if len(purchase.products) > 1 and transaction.product:
+            description = f"{ltr_text(transaction.product)} · {description}"
+        return self._item(purchase.sale_id, [
             (transaction.transaction_date.strftime("%d/%m/%Y"), "text-muted"),
-            (transaction_label(transaction), None),
+            (description, None),
             (method_label(transaction.method), "text-muted"),
             ("", None),
             (f"+{money(transaction.amount)}", "paid"),

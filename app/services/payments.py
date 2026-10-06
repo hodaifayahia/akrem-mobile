@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from datetime import date, datetime
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.db.models import AuditLog, Installment, Payment, Sale, User
 from app.services import auth
@@ -172,6 +172,153 @@ def record_sale_payment_for_user(
     """Record a free-amount installment payment after verifying the active operator role."""
     _require_active_operator(session, user_id)
     return record_sale_payment(session, sale_id, amount, payment_date, method, note)
+
+
+def record_sales_payment_for_user(
+    session: Session,
+    user_id: int,
+    sale_ids: Iterable[int],
+    amount: int,
+    payment_date: date,
+    method: str,
+    note: str | None = None,
+) -> list[Payment]:
+    """Record one payment across several matching installment sale lines.
+
+    Every created row shares a batch id, so the amount can be undone as one
+    payment even when a duplicate product was stored on separate sale lines.
+    """
+    _require_active_operator(session, user_id)
+    ids = list(dict.fromkeys(int(value) for value in sale_ids))
+    if not ids:
+        raise ValueError("At least one sale is required")
+    _validate_amount(amount)
+    clean_date = _validate_payment_date(payment_date)
+    clean_method = _normalize_method(method)
+    clean_note = _clean_note(note)
+    lock_payment_ledger(session)
+    sales = list(session.scalars(
+        select(Sale)
+        .where(Sale.id.in_(ids))
+        .order_by(Sale.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ))
+    if len(sales) != len(ids) or any(sale.sale_type != "installment" for sale in sales):
+        raise ValueError("Payments can only be recorded against the selected installment sales")
+    if len({sale.customer_id for sale in sales}) != 1:
+        raise ValueError("The selected sales must belong to one customer")
+    rows = list(session.scalars(
+        select(Installment)
+        .where(Installment.sale_id.in_(ids))
+        .options(selectinload(Installment.payments))
+        .order_by(Installment.installment_index, Installment.sale_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ))
+    balances = {
+        row.id: max(row.amount_paid, sum(payment.amount for payment in row.payments))
+        for row in rows
+    }
+    remaining = sum(max(0, row.amount_due - balances[row.id]) for row in rows)
+    if amount > remaining:
+        raise ValueError(f"Payment exceeds the remaining sale balance of {remaining}")
+
+    batch_id = uuid.uuid4().hex
+    created: list[Payment] = []
+    left = amount
+    with session.begin_nested():
+        for row in rows:
+            if left <= 0:
+                break
+            open_amount = row.amount_due - balances[row.id]
+            if open_amount <= 0:
+                continue
+            part = min(left, open_amount)
+            payment = Payment(
+                installment_id=row.id,
+                amount=part,
+                payment_date=clean_date,
+                method=clean_method,
+                note=clean_note,
+                batch_id=batch_id,
+            )
+            session.add(payment)
+            created.append(payment)
+            row.amount_paid = balances[row.id] + part
+            row.method = clean_method
+            if row.amount_paid >= row.amount_due:
+                row.paid_date = clean_date
+            left -= part
+        session.flush()
+    return created
+
+
+def record_credit_sales_payment_for_user(
+    session: Session,
+    user_id: int,
+    sale_ids: Iterable[int],
+    amount: int,
+    payment_date: date,
+    method: str,
+    note: str | None = None,
+) -> list[Payment]:
+    """Record one payment across matching credit sale lines as one undoable batch."""
+    _require_active_operator(session, user_id)
+    ids = list(dict.fromkeys(int(value) for value in sale_ids))
+    if not ids:
+        raise ValueError("At least one sale is required")
+    _validate_amount(amount)
+    clean_date = _validate_payment_date(payment_date)
+    clean_method = _normalize_method(method)
+    clean_note = _clean_note(note)
+    lock_payment_ledger(session)
+    sales = list(session.scalars(
+        select(Sale)
+        .where(Sale.id.in_(ids))
+        .options(selectinload(Sale.credit_payments))
+        .order_by(Sale.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ))
+    if len(sales) != len(ids) or any(sale.sale_type != "credit" for sale in sales):
+        raise ValueError("Payments can only be recorded against the selected credit sales")
+    if len({sale.customer_id for sale in sales}) != 1:
+        raise ValueError("The selected sales must belong to one customer")
+    balances = {
+        sale.id: max(
+            0,
+            sale.financed - sum(payment.amount for payment in sale.credit_payments),
+        )
+        for sale in sales
+    }
+    remaining = sum(balances.values())
+    if amount > remaining:
+        raise ValueError(f"Payment exceeds the remaining credit balance of {remaining}")
+
+    batch_id = uuid.uuid4().hex
+    created: list[Payment] = []
+    left = amount
+    with session.begin_nested():
+        for sale in sales:
+            if left <= 0:
+                break
+            part = min(left, balances[sale.id])
+            if part <= 0:
+                continue
+            payment = Payment(
+                sale_id=sale.id,
+                amount=part,
+                payment_date=clean_date,
+                method=clean_method,
+                note=clean_note,
+                batch_id=batch_id,
+            )
+            session.add(payment)
+            created.append(payment)
+            left -= part
+        session.flush()
+    return created
 
 
 def record_credit_payment(
