@@ -23,14 +23,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.i18n import ar
+from app.i18n import ar, is_rtl
 from app.services.customers import CustomerHistory, PurchaseRecord, TransactionRecord
 from app.services.status import Status
 from app.i18n.plan_text import plan_summary
 from app.i18n.stock_text import battery_text, ltr_text
 from app.ui.theme import qcolor
 
-_TYPE_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending"}
+_TYPE_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending", "returned": "failed"}
 _STATUS_TONES = {Status.PAID: "paid", Status.PENDING: "pending", Status.FAILED: "failed", Status.NONE: "text-muted"}
 
 
@@ -41,6 +41,7 @@ def type_label(kind: str) -> str:
         "installment": ar.SALE_INSTALLMENT,
         "credit": ar.SALE_CREDIT,
         "mixed": ar.SALE_MIXED,
+        "returned": ar.SALE_RETURNED,
     }.get(kind, kind)
 
 
@@ -67,10 +68,16 @@ def transaction_label(transaction: TransactionRecord) -> str:
         return ar.HIST_TX_FULL
     if transaction.kind == "down_payment":
         return ar.HIST_TX_DOWN_PAYMENT
+    indexes = transaction.installment_indexes or (
+        (transaction.installment_index,) if transaction.installment_index is not None else ()
+    )
+    numbers = ("، " if is_rtl() else ", ").join(str(number) for number in indexes)
     if transaction.kind == "earlier":
-        return ar.HIST_TX_EARLIER.format(n=transaction.installment_index)
-    if transaction.installment_index is not None:
-        return ar.HIST_TX_INSTALLMENT.format(n=transaction.installment_index)
+        return ar.HIST_TX_EARLIER.format(n=numbers)
+    if len(indexes) > 1:
+        return ar.HIST_TX_INSTALLMENTS.format(n=numbers)
+    if indexes:
+        return ar.HIST_TX_INSTALLMENT.format(n=numbers)
     return ar.HIST_TX_PAYMENT
 
 
@@ -219,6 +226,15 @@ class CustomerHistoryPanel(QWidget):
                 parent.addChild(self._transaction_item(purchase, transaction))
             if not purchase.transactions:
                 parent.addChild(self._note_item(purchase.sale_id, ar.HIST_TX_NONE))
+            for brought_back in purchase.returns:
+                text = ar.HIST_RETURNED.format(
+                    date=brought_back.returned_at.strftime("%d/%m/%Y"), refund=money(brought_back.refund)
+                )
+                if len(purchase.products) > 1:
+                    text = f"{ltr_text(brought_back.product)} · {text}"
+                if brought_back.reason:
+                    text = f"{text} · {brought_back.reason}"
+                parent.addChild(self._note_item(purchase.sale_id, text))
         self.purchases_tree.expandAll()
         self.purchases_tree.setVisible(bool(history.purchases))
         self.empty_purchases.setVisible(not history.purchases)
@@ -232,6 +248,7 @@ class CustomerHistoryPanel(QWidget):
             if purchase.sale_type == "installment" and purchase.months
             else ar.HIST_PLAN_CASH if purchase.sale_type == "cash"
             else ar.HIST_PLAN_CREDIT if purchase.sale_type == "credit"
+            else "" if purchase.sale_type == "returned"
             else ar.HIST_PLAN_MIXED
         )
         item = self._item(purchase.sale_id, [
@@ -252,7 +269,9 @@ class CustomerHistoryPanel(QWidget):
 
     def _transaction_item(self, purchase: PurchaseRecord, transaction: TransactionRecord) -> QTreeWidgetItem:
         description = transaction_label(transaction)
-        if len(purchase.products) > 1 and transaction.product:
+        # Name the product only when the amount went to some of the basket's products.
+        paid_for = set(transaction.product.split(" + ")) if transaction.product else set()
+        if len(purchase.products) > 1 and paid_for and paid_for != set(purchase.products):
             description = f"{ltr_text(transaction.product)} · {description}"
         return self._item(purchase.sale_id, [
             (transaction.transaction_date.strftime("%d/%m/%Y"), "text-muted"),

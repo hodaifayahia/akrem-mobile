@@ -38,7 +38,10 @@ _REFERENCE_NUMBER = re.compile(r"^REF-(\d+)$")
 
 
 class StockError(ValueError):
-    """A stock operation was refused; ``code`` says why (``imei_taken``, ``reference_taken``, ``sold``, ``not_enough``)."""
+    """A stock operation was refused; ``code`` says why.
+
+    ``imei_taken``, ``reference_taken``, ``sold``, ``not_enough`` or ``out_of_stock``.
+    """
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -207,14 +210,26 @@ MAX_SALE_QUANTITY = 500
 
 
 def units_to_sell(
-    session: Session, *, product_id: int | None, quantity: int, first: StockItem | None = None
+    session: Session,
+    *,
+    product_id: int | None,
+    quantity: int,
+    first: StockItem | None = None,
+    without_imei: bool = False,
+    require_stock: bool = False,
 ) -> list[StockItem]:
     """The stock units a sale of ``quantity`` takes, so the stock goes down by that many.
 
     ``first`` is the phone the user picked (or matched by IMEI/REF); the rest
-    are the oldest available units of the same product. A product with no
-    phone in stock sells without touching the stock, but asking for several
-    phones when fewer are available is refused (``not_enough``).
+    are the oldest available units of the same product. ``without_imei``
+    (the sale names an IMEI/REF that no phone in stock has) takes the
+    phones whose IMEI was never recorded first (one of them is the phone
+    sold), then the oldest other ones, so the stock always goes down.
+    ``require_stock`` (every sale made in the app) refuses a sale the stock
+    cannot cover: ``out_of_stock`` with no phone left, ``not_enough`` with
+    fewer than ``quantity``. Without it (imports of old sales) a product
+    with no phone in stock sells without touching the stock, but asking for
+    several phones when fewer are available is still refused.
     """
     if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= MAX_SALE_QUANTITY:
         raise ValueError(f"Quantity must be between 1 and {MAX_SALE_QUANTITY}")
@@ -222,8 +237,12 @@ def units_to_sell(
     product_id = first.product_id if first is not None else product_id
     if product_id is not None and len(units) < quantity:
         others = [unit for unit in available_units(session, product_id) if first is None or unit.id != first.id]
+        if without_imei:
+            others.sort(key=lambda unit: unit.imei is not None)  # stable: oldest first in each group
         units.extend(others[: quantity - len(units)])
-    if quantity > 1 and len(units) < quantity:
+    if len(units) < quantity and (require_stock or quantity > 1):
+        if not units:
+            raise StockError("out_of_stock", "No unit of this product is in stock")
         raise StockError("not_enough", f"Only {len(units)} unit(s) of this product are in stock")
     return units
 
@@ -493,6 +512,20 @@ def mark_sold(session: Session, unit: StockItem, sale: Sale, sold_on: date | Non
     sale.imei = sale.imei or unit.imei
     sale.reference = sale.reference or unit.reference
     session.flush()
+
+
+def record_sold_imei(session: Session, unit: StockItem, imei: str | None) -> None:
+    """Write the IMEI typed on the sale onto the phone it took, when that phone had none.
+
+    Stock entered by quantity has no IMEIs; the IMEI typed when selling tells
+    which phone left. An IMEI another phone already carries is left alone.
+    """
+    if not imei or unit.imei:
+        return
+    taken = session.scalar(select(StockItem.id).where(StockItem.imei == imei, StockItem.id != unit.id).limit(1))
+    if taken is None:
+        unit.imei = imei
+        session.flush()
 
 
 def _check_unique(session: Session, details: UnitDetails, *, ignore_id: int | None = None) -> None:

@@ -32,7 +32,7 @@ from app.config import database_url
 from app.db.models import User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import auth, backup, calc, settings
+from app.services import auth, backup, calc, print_templates, settings
 from app.services.schedule import DEFAULT_DUE_MODE
 from app.ui.events import events
 
@@ -463,8 +463,9 @@ class SettingsPage(QWidget):
             due_mode = settings.get_value(session, "due_mode", DEFAULT_DUE_MODE)
             grace_days = settings.get_value(session, "grace_days", 5)
             inactivity_minutes = settings.get_value(session, "inactivity_minutes", 15)
-            business_nis = settings.get_value(session, "business_nis", "")
-            business_nif = settings.get_value(session, "business_nif", "")
+            saved_ids = print_templates.load(session)
+            business_nis = saved_ids.business_nis
+            business_nif = saved_ids.business_nif
             presets = settings.get_rate_presets(session)
             seller_discount = settings.get_seller_max_discount(session)
         lang_idx = self.language_selector.findData(lang)
@@ -491,8 +492,10 @@ class SettingsPage(QWidget):
                 settings.set_value(session, "due_mode", self.due_mode.currentData())
                 settings.set_value(session, "grace_days", self.grace_days.value())
                 settings.set_value(session, "inactivity_minutes", self.inactivity_minutes.value())
-                settings.set_value(session, "business_nis", self.business_nis.text().strip())
-                settings.set_value(session, "business_nif", self.business_nif.text().strip())
+                print_templates.save_business_ids(
+                    session, self.current_user.id,
+                    nis=self.business_nis.text(), nif=self.business_nif.text(),
+                )
                 settings.set_seller_max_discount(session, self.current_user.id, self.seller_discount.value())
                 settings.set_value(
                     session,

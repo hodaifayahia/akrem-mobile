@@ -61,10 +61,17 @@ def _user(user_id: int) -> User:
 
 
 # ------------------------------------------------------------------ basket
+def _stock_iphone(shop: dict) -> None:
+    """One phone of the "13 PRO" in stock: every sale takes one, and the sale forms list only stock."""
+    with session_scope() as session:
+        stock.add_units(session, shop["owner"], product_id=shop["iphone"])
+
+
 def test_installment_basket_saves_each_product_on_one_client_row(shop) -> None:
     from app.ui.pages.customers_page import CustomersPage
     from app.ui.pages.new_sale_page import NewSalePage
 
+    _stock_iphone(shop)
     page = NewSalePage(current_user=_user(shop["owner"]))
     page._customer_id = shop["client"]
     page.sale_type.setCurrentIndex(page.sale_type.findData("installment"))
@@ -113,6 +120,7 @@ def test_cash_basket_goes_to_the_new_client_added_from_the_search(shop, monkeypa
     from app.ui.dialogs.customer_form_dialog import CustomerFormDialog
     from app.ui.pages.new_sale_page import NewSalePage
 
+    _stock_iphone(shop)
     page = NewSalePage(current_user=_user(shop["owner"]))
     assert page.cash_add_customer_button.text().endswith(ar.ADD_CUSTOMER)
 

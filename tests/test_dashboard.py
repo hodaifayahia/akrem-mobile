@@ -5,7 +5,7 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from app.db.models import Category, Customer, Installment, Payment, Sale
+from app.db.models import Category, Customer, Installment, Payment, Product, Sale, StockItem
 from app.db.session import session_scope
 from app.services import repositories
 from app.services.dashboard import get_dashboard_summary
@@ -77,6 +77,14 @@ def test_dashboard_status_counts_and_owner_values(memory_engine: Engine) -> None
             amount_due=100,
         )
         session.add_all((paid_row, failed_row, pending_row))
+        # The wholesale card counts the phones still in stock, not the goods already sold.
+        phone = Product(name="Stock phone", wholesale_price=40, cash_price=55)
+        session.add(phone)
+        session.flush()
+        session.add_all((
+            StockItem(product_id=phone.id, wholesale_price=40, cash_price=55, status="available"),
+            StockItem(product_id=phone.id, wholesale_price=45, cash_price=55, status="sold"),
+        ))
         session.flush()
         session.add(Payment(
             installment_id=paid_row.id,
@@ -94,7 +102,8 @@ def test_dashboard_status_counts_and_owner_values(memory_engine: Engine) -> None
             role="owner",
         )
 
-        assert summary.total_wholesale == 180
+        assert summary.total_wholesale == 40
+        assert summary.stock_units == 1
         assert summary.failed_operations == 1
         assert summary.completed_operations == 1
         assert summary.pending_operations == 1

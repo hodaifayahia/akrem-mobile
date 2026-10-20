@@ -146,3 +146,47 @@ def test_customer_details_dialog_scrolls_and_fits_the_screen(
     assert table.height() >= sum(table.rowHeight(row) for row in range(24))
     assert dialog.sale_scroll.verticalScrollBar().maximum() > 0
     dialog.close()
+
+
+def test_the_schedule_offers_postponing_an_unpaid_installment(
+    memory_engine: Engine,
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The schedule's "postpone" button opens the three choices and applies the chosen one."""
+    from PySide6.QtWidgets import QMessageBox, QPushButton
+
+    from app.db.models import Installment
+    from app.i18n import ar
+    from app.services import auth, postponement
+    from app.ui.dialogs import postpone_dialog
+
+    with session_scope(memory_engine) as session:
+        owner = auth.create_first_owner(
+            session, username="owner", password="Secret123", password_confirmation="Secret123"
+        )
+        category = Category(name="Test")
+        session.add(category)
+        session.flush()
+        customer_id = customers.create_customer(session, full_name="Postpone", category_id=category.id).id
+        sale_id = sales.create_sale(
+            session, customer_id=customer_id, product="A16", sale_type="installment",
+            wholesale_price=20_000, cash_price=30_000, rate=0, months=3, purchase_date=date(2026, 10, 3),
+        ).id
+        session.expunge(owner)
+
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(postpone_dialog.PostponeDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(
+        postpone_dialog.PostponeDialog, "values", lambda self: (postponement.KIND_DAYS, 3, None)
+    )
+    dialog = CustomerDetailsDialog(customer_id, owner, engine=memory_engine)
+    buttons = dialog.schedule_table.cellWidget(0, 5).findChildren(QPushButton)
+    postpone = next(button for button in buttons if button.text() == ar.POSTPONE_ACTION)
+    postpone.click()
+
+    with session_scope(memory_engine) as session:
+        first = session.query(Installment).filter_by(sale_id=sale_id, installment_index=1).one()
+        assert first.due_date == date(2026, 11, 6)
+    assert dialog.schedule_table.item(0, 1).text() == "06/11/2026"
+    dialog.close()

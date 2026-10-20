@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 
 from app.db.models import Category, Customer, Installment, Product, Sale, User
 from app.db.session import session_scope
-from app.services import auth, customers, sales
+from app.services import auth, customers, sales, stock
 from app.ui.dialogs.auth_dialogs import ReauthenticationDialog
 from app.ui.dialogs.command_palette import CommandPaletteDialog
 from app.ui.dialogs.shortcuts_dialog import ShortcutsDialog
@@ -70,6 +70,7 @@ def seeded_db(memory_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> dict[st
         prod = Product(name="Galaxy S24", wholesale_price=80000, cash_price=105000, active=True)
         session.add(prod)
         session.flush()
+        stock.add_units(session, owner_id, product_id=prod.id, quantity=2)  # the sale below takes one
 
         # Customer
         cust = customers.create_customer(

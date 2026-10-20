@@ -9,9 +9,8 @@ marks that phone as sold to the client.
 The quantity says how many phones of the product the client takes; saving
 the sale takes that many units out of the stock (the chosen one first, then
 the oldest ones), so a product with 5 in stock sold 2 at a time has 3 left.
-
-It also tells the user whether the typed product name already exists in the
-catalog (it will be linked) or is new (it will be added).
+Every sale leaves the stock, so a product with no phone left (or a name not
+in the catalog) is shown as not in stock and cannot be sold (``in_stock``).
 
 Phones already in the sale basket (see ``set_reserved``) are not offered
 again, and the quantity cannot exceed what the basket leaves in stock.
@@ -54,14 +53,14 @@ class PhoneDetailsSection(QWidget):
     quantity_changed = Signal(int)
     scanned = Signal(str, int)  # product name, stock unit id
 
-    def __init__(self, *, can_create_products: bool, parent: QWidget | None = None) -> None:
+    def __init__(self, *, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._can_create = can_create_products
         self._units: dict[int, dict[str, Any]] = {}
         self._product_name = ""
         self._catalog_prices: tuple[int, int] | None = None
         self._reserved_ids: set[int] = set()
         self._reserved_counts: dict[str, int] = {}
+        self._filled_from: dict[str, Any] | None = None  # the unit whose details fill the fields
         form = QFormLayout(self)
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
@@ -173,10 +172,10 @@ class PhoneDetailsSection(QWidget):
             self.quantity_changed.emit(self.quantity.value())  # fewer phones left than asked
         if not name:
             self.product_state.setText("")
-        elif product is not None:
+        elif product is not None and self._units:
             self.product_state.setText(ar.SALE_PRODUCT_EXISTS)
         else:
-            self.product_state.setText(ar.SALE_PRODUCT_NEW if self._can_create else "")
+            self.product_state.setText(ar.SALE_PRODUCT_NOT_IN_STOCK)
         self.availability.setText(
             ar.SALE_UNITS_AVAILABLE.format(count=len(self._units)) if self._units
             else (ar.SALE_NO_UNITS if product is not None else "")
@@ -236,6 +235,10 @@ class PhoneDetailsSection(QWidget):
         unit_id = self.unit.currentData()
         return self._units.get(unit_id) if unit_id is not None else None
 
+    def in_stock(self) -> bool:
+        """True when the product shown still has a phone to sell (phones in the basket excluded)."""
+        return bool(self._units)
+
     def unit_prices(self) -> tuple[int, int] | None:
         """``(wholesale, cash)`` price of one phone: the chosen unit's, else the catalog's."""
         unit = self.selected_unit()
@@ -248,6 +251,14 @@ class PhoneDetailsSection(QWidget):
         locked = unit is not None
         for editor in (self.imei, self.reference):
             editor.setReadOnly(locked)
+        if unit is None and self._filled_from is not None:
+            # The phone picked before is no longer chosen (another product, or "none"):
+            # its IMEI/REF would make the sale take that phone, so they go with it.
+            for editor, value in ((self.imei, self._filled_from["imei"]),
+                                  (self.reference, self._filled_from["reference"])):
+                if editor.text() == (value or ""):
+                    editor.clear()
+        self._filled_from = unit
         if unit is not None:
             self.is_new.setChecked(bool(unit["is_new"]))
             self.battery.setValue(-1 if unit["battery_health"] is None else unit["battery_health"])

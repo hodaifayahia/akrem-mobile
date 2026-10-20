@@ -13,8 +13,10 @@ right-to-left documents.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -31,6 +33,7 @@ from PySide6.QtGui import (
     QPageLayout,
     QPageSize,
     QPainter,
+    QPainterPath,
     QPalette,
     QPdfWriter,
     QPen,
@@ -133,13 +136,18 @@ def generate_payment_receipt_pdf(
     templates: PrintTemplates | None = None,
     business_nis: str | None = None,
     business_nif: str | None = None,
+    basket: Sequence[Sale] | None = None,
 ) -> Path:
     """Create an A5 receipt for one payment present in the sale's loaded history.
 
+    The receipt is for the whole amount the client handed over: every part
+    of the payment's batch (the installments it was spread over, and the
+    other products of ``basket``, the loaded sales bought with ``sale``).
     ``business_nis``/``business_nif`` override the saved NIS and NIF.
     """
     templates = templates or default_templates()
     details = _receipt_payment_details(sale, payment)
+    details.update(_batch_receipt_details(tuple(basket) if basket else (sale,), sale, payment))
     body = _receipt_html(
         customer, sale, payment, details, _logo_uri(logo_path), issued_by, templates,
         business_nis=business_nis, business_nif=business_nif,
@@ -310,8 +318,7 @@ def commitment_html(
         for label in signatures
     ))
     header_row = _tr(
-        f"<td width='40%' style='vertical-align: middle;'>{_shop_block(templates)}"
-        f"{_ids_line(templates, business_nis, business_nif)}</td>",
+        f"<td width='40%' style='vertical-align: middle;'>{_shop_block(templates)}</td>",
         "<td width='36%' align='center' style='vertical-align: middle;'>"
         f"<div class='title' align='center'>{_escape(templates.commitment_title)}</div>"
         f"<div class='meta' align='center'>{_escape(ar.PRINT_CONTRACT_NUMBER)} <b>{_ltr(f'{sale.id:06d}' if sale.id else '—')}</b>"
@@ -384,6 +391,7 @@ td {{ vertical-align: middle; }}
 {_gap(4)}
 <table width="100%" cellspacing="6" cellpadding="0">{signature_row}</table>
 {f'<div class="footer" align="center">{footer}</div>' if footer else ''}
+{_ids_footer(templates, business_nis, business_nif)}
 {_contact_line(templates)}
 </body></html>"""
 
@@ -586,6 +594,53 @@ def _receipt_payment_details(sale: Sale, payment: Payment) -> dict[str, object]:
     }
 
 
+def _batch_receipt_details(sales: tuple[Sale, ...], sale: Sale, payment: Payment) -> dict[str, object]:
+    """The total, installments and balance of the payment's whole batch ({} for a payment on its own)."""
+    if sale not in sales:
+        sales = (sale, *sales)
+    parts = [
+        item for one in sales for item in _sale_payments(one)
+        if payment.batch_id and item.batch_id == payment.batch_id
+    ] or [payment]
+    if len(parts) == 1 and len(sales) == 1:
+        return {}
+    part_ids = {item.id for item in parts}
+    paid_sales = [one for one in sales if any(item.id in part_ids for item in _sale_payments(one))] or [sale]
+    last = max(part_ids)
+    numbers = sorted({
+        row.installment_index for one in paid_sales for row in one.installments
+        if any(item.id in part_ids for item in row.payments or [])
+    })
+    details: dict[str, object] = {
+        "amount": sum(item.amount for item in parts),
+        "sale_balance_after": max(0, sum(one.financed - _paid_through(one, last) for one in paid_sales)),
+        "products": tuple(dict.fromkeys(_product_name(one) for one in paid_sales)),
+    }
+    if len(numbers) > 1:
+        details["installment"] = None
+        details["installment_numbers"] = tuple(numbers)
+    return details
+
+
+def _sale_payments(sale: Sale) -> list[Payment]:
+    """Every payment row of a loaded sale (credit payments or installment payments)."""
+    if sale.sale_type == "credit":
+        return list(sale.credit_payments or [])
+    return [item for row in sale.installments for item in row.payments or []]
+
+
+def _paid_through(sale: Sale, last_payment_id: int) -> int:
+    """What was paid on the sale's financed part up to and including payment ``last_payment_id``."""
+    if sale.sale_type == "credit":
+        return sum(item.amount for item in sale.credit_payments or [] if item.id <= last_payment_id)
+    paid = 0
+    for row in sale.installments:
+        recorded = list(row.payments or [])
+        paid += max(0, row.amount_paid - sum(item.amount for item in recorded))
+        paid += sum(item.amount for item in recorded if item.id <= last_payment_id)
+    return paid
+
+
 def _receipt_html(
     customer: Customer,
     sale: Sale,
@@ -601,10 +656,12 @@ def _receipt_html(
     templates = templates or default_templates()
     installment = payment_details["installment"]
     sale_balance = int(payment_details.get("sale_balance_after", payment_details["balance_after"]))
+    amount = int(payment_details.get("amount", payment.amount))
+    products = payment_details.get("products") or (_product_name(sale),)
     fields: list[tuple[str, str]] = [
         (ar.PDF_CUSTOMER_NAME, _escape(customer.full_name)),
         (ar.PDF_PHONE, _ltr_html(customer.phone) or _escape(ar.PDF_VALUE_MISSING)),
-        (ar.PDF_PRODUCT, _ltr_html(_product_name(sale))),
+        (ar.PDF_PRODUCT, " + ".join(_ltr_html(name) for name in products)),
         (ar.PDF_SALE_TYPE, _escape(_sale_type(sale.sale_type))),
         (ar.PDF_PAYMENT_DATE, _escape(_date(payment.payment_date))),
         (ar.PDF_PAYMENT_METHOD, _escape(_payment_method(payment.method))),
@@ -616,6 +673,9 @@ def _receipt_html(
             (ar.PDF_INSTALLMENT_AMOUNT, _escape(_money(installment.amount_due))),
             (ar.PRINT_INSTALLMENT_LEFT, _escape(_money(int(payment_details["balance_after"])))),
         ))
+    elif payment_details.get("installment_numbers"):
+        numbers = ("، " if is_rtl() else ", ").join(str(n) for n in payment_details["installment_numbers"])
+        fields.append((ar.PRINT_INSTALLMENTS_PAID, _escape(numbers)))
     if payment.note:
         fields.append((ar.PDF_PAYMENT_NOTE, _escape(payment.note)))
     if issued_by:
@@ -647,7 +707,7 @@ def _receipt_html(
         f"<td style='background-color:{NAVY}; color:#C7D7F5; padding:8px 12px; font-size:10pt; font-weight:bold;'>"
         f"{_escape(ar.PDF_PAID_AMOUNT)}</td>",
         f"<td align='{end}' style='background-color:{NAVY}; color:#FFFFFF; padding:8px 12px; font-size:17pt;"
-        f" font-weight:bold;'>{_escape(_money(payment.amount))}</td>",
+        f" font-weight:bold;'>{_escape(_money(amount))}</td>",
     )
     balance_row = _tr(
         f"<td style='background-color:{balance_fill}; color:{MUTED}; padding:7px 12px;'>"
@@ -714,11 +774,46 @@ def _business_ids(
     (the sale receipt passes the values a caller already had).
     """
     values = [
-        f"NIS: {(business_nis or '').strip() or templates.business_nis}",
-        f"NIF: {(business_nif or '').strip() or templates.business_nif}",
-        f"RC: {templates.business_rc}",
+        f"{label}: {value}" for label, value in _business_id_values(templates, business_nis, business_nif)
     ]
     return " &nbsp;·&nbsp; ".join(_ltr_html(value) for value in values if value.split(": ", 1)[1])
+
+
+def _business_id_values(
+    templates: PrintTemplates, business_nis: str | None = None, business_nif: str | None = None
+) -> list[tuple[str, str]]:
+    """``(label, value)`` of the shop's NIS, NIF and RC (a value may be blank)."""
+    return [
+        ("NIS", (business_nis or "").strip() or templates.business_nis),
+        ("NIF", (business_nif or "").strip() or templates.business_nif),
+        ("RC", templates.business_rc),
+    ]
+
+
+def _ids_footer(
+    templates: PrintTemplates, business_nis: str | None = None, business_nif: str | None = None
+) -> str:
+    """The commitment's last lines, like an official form: a rule, then RC, NIS and NIF.
+
+    The three always print; a number the owner has not entered is a dotted
+    line to fill in by hand.
+    """
+    values = dict(_business_id_values(templates, business_nis, business_nif))
+    cells = "".join(
+        f"<td width='33%' align='center' style='font-size:8.5pt; color:{INK}; padding:3px 2px'>"
+        f"{_ltr_html(f'{label} : ' + values[label]) if values[label] else _blank_id(label)}</td>"
+        for label in ("RC", "NIS", "NIF")
+    )
+    return (
+        "<table width='100%' cellspacing='0' cellpadding='0' style='margin-top:6px'>"
+        f"<tr><td style='background-color:{LINE}; font-size:0.5pt'>&nbsp;</td></tr></table>"
+        f"<table width='100%' cellspacing='0' cellpadding='0'><tr>{cells}</tr></table>"
+    )
+
+
+def _blank_id(label: str) -> str:
+    """``RC : ......`` in reading order: a number the owner has not entered, to fill in by hand."""
+    return f"‪{_escape(label)} : <span style='color:{LINE}'>{'.' * 22}</span>‬"
 
 
 def _ids_line(
@@ -1045,11 +1140,51 @@ def _render_image(content: str, spec: _PageSpec, width: int, logo_path: str | Pa
 
 
 def _logo_uri(path: str | Path | None) -> str:
-    """Return a local URI for the bundled logo or a caller-provided logo asset."""
+    """Return a local URI of the logo cut to a circle (the bundled logo or a caller-provided one)."""
     logo = Path(path) if path is not None else RESOURCE_DIR / "logo.png"
     if not logo.is_file():
         raise FileNotFoundError(f"AkremMobile logo not found: {logo}")
-    return logo.resolve().as_uri()
+    resolved = logo.resolve()
+    return _round_logo(str(resolved), resolved.stat().st_mtime_ns).as_uri()
+
+
+@lru_cache(maxsize=8)
+def _round_logo(path: str, modified: int) -> Path:
+    """The logo cropped to a circle on a transparent background, saved once per logo version.
+
+    Every printed document shows the logo round instead of as a dark square.
+    If the copy cannot be written, the original logo is used.
+    """
+    digest = hashlib.sha1(f"{path}|{modified}".encode("utf-8")).hexdigest()[:16]
+    target = Path(tempfile.gettempdir()) / "AkremMobile" / f"logo_round_{digest}.png"
+    if target.is_file():
+        return target
+    source = QImage(path)
+    if source.isNull():
+        return Path(path)
+    side = min(source.width(), source.height())
+    square = source.copy((source.width() - side) // 2, (source.height() - side) // 2, side, side)
+    round_logo = QImage(side, side, QImage.Format.Format_ARGB32_Premultiplied)
+    round_logo.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(round_logo)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(0.5, 0.5, side - 1, side - 1))
+        painter.setClipPath(clip)
+        painter.drawImage(0, 0, square)
+    finally:
+        painter.end()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(".tmp.png")
+        if not round_logo.save(str(partial), "PNG"):
+            return Path(path)
+        partial.replace(target)
+    except OSError:
+        return Path(path)
+    return target
 
 
 @lru_cache(maxsize=1)

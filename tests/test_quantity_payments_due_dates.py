@@ -99,13 +99,30 @@ def test_more_phones_than_in_stock_is_refused(session: Session, owner_id: int) -
     assert _available(session, product_id) == 2
 
 
-def test_typed_imei_outside_stock_does_not_take_another_phone(session: Session, owner_id: int) -> None:
-    product_id = _stocked_product(session, owner_id, 2)
-    sales.create_sale(
+def test_typed_imei_outside_stock_still_takes_a_phone_of_the_product(session: Session, owner_id: int) -> None:
+    """Owner's request 2026-10-20: every sale leaves the stock, even with an IMEI typed wrong."""
+    product = products.create_product(session, owner_id, name="SAM A07 4/64", cash_price=30000)
+    recorded = stock.add_units(
+        session, owner_id, product_id=product.id, details=stock.UnitDetails(imei="356789012345600")
+    )[0]
+    sale = sales.create_sale(
         session, customer_id=_customer(session), product="SAM A07 4/64", sale_type="cash",
         wholesale_price=24000, cash_price=30000, imei="356789012345678",
     )
-    assert _available(session, product_id) == 2
+    assert _available(session, product.id) == 0
+    assert recorded.sale_id == sale.id and recorded.imei == "356789012345600"
+    assert sale.imei == "356789012345678"  # what was typed stays on the sale
+
+
+def test_typed_imei_takes_a_phone_entered_without_imei_and_records_it(session: Session, owner_id: int) -> None:
+    product_id = _stocked_product(session, owner_id, 2)  # stock entered by quantity: no IMEIs
+    sale = sales.create_sale(
+        session, customer_id=_customer(session), product="SAM A07 4/64", sale_type="credit",
+        wholesale_price=24000, cash_price=30000, imei="356789012345678",
+    )
+    assert _available(session, product_id) == 1
+    (unit,) = sale.stock_items
+    assert unit.imei == "356789012345678" and sale.imei == "356789012345678"
 
 
 def test_deleting_a_sale_returns_all_its_phones(session: Session, owner_id: int) -> None:

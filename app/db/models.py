@@ -192,6 +192,11 @@ class Sale(Base):
     is_new: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     imei: Mapped[str | None] = mapped_column(String(40))
     reference: Mapped[str | None] = mapped_column(String(40))
+    # A product the client brought back (see sales.return_sales): the day, what
+    # the shop gave back, and why. The sale then only keeps what the shop kept.
+    returned_at: Mapped[date | None] = mapped_column(Date)
+    refund_amount: Mapped[int | None] = mapped_column(Integer)
+    return_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )

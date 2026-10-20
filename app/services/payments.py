@@ -390,9 +390,7 @@ def undo_last_payment(session: Session, user_id: int, reason: str) -> AuditLog:
     remains responsible for committing the enclosing session.
     """
     owner = auth.require_owner(session, user_id)
-    clean_reason = reason.strip() if isinstance(reason, str) else ""
-    if not clean_reason:
-        raise ValueError("A reason is required to undo a payment")
+    clean_reason = _required_reason(reason)
     lock_payment_ledger(session)
     payment = session.scalar(
         select(Payment)
@@ -403,7 +401,40 @@ def undo_last_payment(session: Session, user_id: int, reason: str) -> AuditLog:
     )
     if payment is None:
         raise ValueError("There is no payment to undo")
+    return _remove_payment_batch(session, owner, payment, clean_reason)
 
+
+def reverse_payment(session: Session, user_id: int, payment_id: int, reason: str) -> AuditLog:
+    """Return one amount a client paid (any one, not only the latest); owner only.
+
+    The whole amount received is removed, even when it was spread over
+    several installments or basket products, so the balance it paid is owed
+    again. A reason is required and the reversal is written to the audit log
+    (``undo_payment``), like "undo last payment".
+    """
+    owner = auth.require_owner(session, user_id)
+    clean_reason = _required_reason(reason)
+    lock_payment_ledger(session)
+    payment = session.scalar(
+        select(Payment)
+        .where(Payment.id == payment_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if payment is None:
+        raise ValueError("Payment not found")
+    return _remove_payment_batch(session, owner, payment, clean_reason)
+
+
+def _required_reason(reason: str) -> str:
+    clean_reason = reason.strip() if isinstance(reason, str) else ""
+    if not clean_reason:
+        raise ValueError("A reason is required to undo a payment")
+    return clean_reason
+
+
+def _remove_payment_batch(session: Session, owner: User, payment: Payment, clean_reason: str) -> AuditLog:
+    """Delete a payment with the rest of its batch, rebuild the installments, and audit it."""
     # An amount spread over several installments is undone as a whole.
     group = [payment]
     if payment.batch_id is not None:

@@ -8,12 +8,13 @@ which is why widgets must not call ``setLayoutDirection`` themselves.
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel
 
 from app.i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, get_layout_direction, set_language
 from app.ui import icons
 from app.ui.preferences import app_settings
 from app.ui.theme import apply_theme
+from app.ui.widgets.ltr_combo import ensure_ltr_items, paint_combo
 
 LANGUAGE_SETTING = "language"
 _LOGICAL_ALIGN = "logicalAlignment"
@@ -35,12 +36,20 @@ class LabelDirectionFilter(QObject):
     leading/trailing alignment into an absolute side that matches the
     application's layout direction, and re-applies it when the direction
     changes. Centred and already-absolute labels are left alone.
+
+    Drop-down lists are handled here too: their Latin items (product names,
+    IMEI, REF) keep their reading order in Arabic (``widgets.ltr_combo``).
     """
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt API
         kind = event.type()
         if kind in (QEvent.Type.Polish, QEvent.Type.LayoutDirectionChange) and isinstance(watched, QLabel):
             align_to_direction(watched)
+        elif kind == QEvent.Type.Paint and isinstance(watched, QComboBox):
+            ensure_ltr_items(watched)
+            if not watched.isEditable():
+                paint_combo(watched)
+                return True
         return False
 
 

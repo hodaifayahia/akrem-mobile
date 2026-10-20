@@ -253,20 +253,26 @@ def test_price_list_without_stock_columns_keeps_catalog_behaviour(tmp_path: Path
 
 
 # ------------------------------------------------------- sales and products
-def test_owner_sale_links_or_creates_the_product(session: Session, owner_id: int, customer_id: int) -> None:
-    products.create_product(session, owner_id, name="iPhone 13", cash_price=110000)
+def test_owner_sale_links_the_product_and_refuses_one_not_in_stock(
+    session: Session, owner_id: int, customer_id: int
+) -> None:
+    iphone = products.create_product(session, owner_id, name="iPhone 13", cash_price=110000)
+    stock.add_units(session, owner_id, product_id=iphone.id)
     linked = sales.create_sale_for_user(
         session, owner_id, customer_id=customer_id, product="IPHONE  13", sale_type="cash",
-        wholesale_price=90000, cash_price=110000,
+        wholesale_price=90000, cash_price=110000, color="Blue", battery_health=88, imei="356789012345678",
     )
-    created = sales.create_sale_for_user(
-        session, owner_id, customer_id=customer_id, product="Redmi 15C", sale_type="cash",
-        wholesale_price=30000, cash_price=35000, color="Blue", battery_health=88, imei="356789012345678",
-    )
-    assert linked.product == "iPhone 13" and linked.product_id is not None
-    new_product = products.find_by_name(session, "redmi 15c")
-    assert created.product_id == new_product.id and new_product.cash_price == 35000
-    assert (created.color, created.battery_health, created.imei) == ("Blue", 88, "356789012345678")
+    assert linked.product == "iPhone 13" and linked.product_id == iphone.id
+    assert (linked.color, linked.battery_health, linked.imei) == ("Blue", 88, "356789012345678")
+    assert stock.available_units(session, iphone.id) == []
+    # A name that is not in the catalog has no phone in stock: it is refused, not added (2026-10-20).
+    with pytest.raises(stock.StockError) as refused:
+        sales.create_sale_for_user(
+            session, owner_id, customer_id=customer_id, product="Redmi 15C", sale_type="cash",
+            wholesale_price=30000, cash_price=35000,
+        )
+    assert refused.value.code == "out_of_stock"
+    assert products.find_by_name(session, "redmi 15c") is None
 
 
 def test_selling_a_stock_unit_copies_its_details_and_price(

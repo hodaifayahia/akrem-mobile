@@ -46,6 +46,13 @@ def _product(session: Session, owner_id: int, name: str, units: int, cash: int =
     return product.id
 
 
+def _stock_three(session: Session, owner_id: int) -> None:
+    """One phone each of the three products the client-list tests sell (every sale takes one)."""
+    _product(session, owner_id, "SAM A07", 1)
+    _product(session, owner_id, "Redmi 13C", 1, cash=20000)
+    _product(session, owner_id, "Case", 1, cash=1500)
+
+
 def _line(name: str, sale_type: str = "installment", cash: int = 30000, **extra: object) -> dict:
     values = {
         "product": name, "sale_type": sale_type, "wholesale_price": cash * 4 // 5, "cash_price": cash,
@@ -116,7 +123,7 @@ def test_the_same_phone_cannot_be_in_the_basket_twice(session: Session, owner_id
 
 # ------------------------------------------------------------------ one row per sale
 def test_the_client_list_shows_one_row_per_purchase(session: Session, owner_id: int) -> None:
-    _product(session, owner_id, "SAM A07", 0)
+    _stock_three(session, owner_id)
     buyer = _customer(session, "أحمد")
     _customer(session, "بدون مشتريات")
     sales.create_sales_batch(session, owner_id, customer_id=buyer, lines=[
@@ -140,6 +147,7 @@ def test_the_client_list_shows_one_row_per_purchase(session: Session, owner_id: 
 
 
 def test_a_basket_shares_one_basket_id_and_a_single_sale_has_none(session: Session, owner_id: int) -> None:
+    _stock_three(session, owner_id)
     buyer = _customer(session)
     first, second = sales.create_sales_batch(session, owner_id, customer_id=buyer, lines=[
         _line("SAM A07"), _line("Redmi 13C", "cash", cash=20000),
@@ -151,6 +159,7 @@ def test_a_basket_shares_one_basket_id_and_a_single_sale_has_none(session: Sessi
 
 
 def test_per_sale_filters_and_search_look_at_each_purchase(session: Session, owner_id: int) -> None:
+    _stock_three(session, owner_id)
     buyer = _customer(session, "أحمد")
     sales.create_sales_batch(session, owner_id, customer_id=buyer, lines=[
         _line("SAM A07"), _line("Redmi 13C", "cash", cash=20000),
@@ -222,6 +231,7 @@ def test_only_the_owner_sets_the_quantity(session: Session, owner_id: int) -> No
 # ------------------------------------------------------------------ my net money
 def test_net_money_is_what_people_owe_me_minus_what_i_owe(session: Session, owner_id: int) -> None:
     _product(session, owner_id, "SAM A07", 3)
+    _product(session, owner_id, "Redmi 13C", 1, cash=20000)
     client = _customer(session)
     installment, credit = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
         _line("SAM A07", cash=30000, rate=0, months=3),
@@ -244,8 +254,8 @@ def test_net_money_is_what_people_owe_me_minus_what_i_owe(session: Session, owne
 
 # ------------------------------------------- two products are one purchase
 def test_two_products_share_one_duration_and_one_percentage(session: Session, owner_id: int) -> None:
-    _product(session, owner_id, "13 PRO", 0)
-    _product(session, owner_id, "Redmi 13C", 0)
+    _product(session, owner_id, "13 PRO", 1)
+    _product(session, owner_id, "Redmi 13C", 1)
     client = _customer(session)
 
     phone, case = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
@@ -272,8 +282,8 @@ def test_two_products_share_one_duration_and_one_percentage(session: Session, ow
 
 
 def test_both_products_stay_visible_in_the_client_details(session: Session, owner_id: int) -> None:
-    _product(session, owner_id, "13 PRO", 0)
-    _product(session, owner_id, "Redmi 13C", 0)
+    _product(session, owner_id, "13 PRO", 1)
+    _product(session, owner_id, "Redmi 13C", 1)
     client = _customer(session)
     sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
         _line("13 PRO", cash=90000), _line("Redmi 13C", cash=30000),
@@ -283,8 +293,10 @@ def test_both_products_stay_visible_in_the_client_details(session: Session, owne
     rows = customers.list_customers(session, year=2026, month=10, today=TODAY, per_sale=True)
     buyer_rows = [row for row in rows if row.id == client]
 
-    # Both products are listed, as two purchases (newest first) and as two lines of one row.
-    assert [purchase.product for purchase in history.purchases] == ["Redmi 13C", "13 PRO"]
+    # The basket is ONE purchase in the history that names both products, and one row in the list.
+    assert [purchase.product for purchase in history.purchases] == ["13 PRO + Redmi 13C"]
+    assert history.purchases[0].products == ("13 PRO", "Redmi 13C")
+    assert history.installment_purchases == 1
     assert len(buyer_rows) == 1
     assert buyer_rows[0].products == ("13 PRO", "Redmi 13C")
     assert len(buyer_rows[0].sales) == 2
@@ -294,8 +306,36 @@ def test_both_products_stay_visible_in_the_client_details(session: Session, owne
     assert history.remaining == 162_000
 
 
+def test_a_basket_of_two_phones_is_paid_as_one_monthly_amount(session: Session, owner_id: int) -> None:
+    _product(session, owner_id, "A16", 1)
+    _product(session, owner_id, "A26", 1)
+    client = _customer(session)
+    phones = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[
+        _line("A16", cash=30000, rate=0, months=6), _line("A26", cash=30000, rate=0, months=6),
+    ])
+    assert [phone.monthly_amount for phone in phones] == [5_000, 5_000]
+
+    history = customers.customer_history(session, client, today=TODAY)
+    purchase = history.purchases[0]
+    # 5 000 a month on each phone is one purchase of 10 000 a month.
+    assert len(history.purchases) == 1
+    assert (purchase.monthly_amount, purchase.total, purchase.payment_count) == (10_000, 60_000, 6)
+
+    # One payment of 10 000 pays the first month of both phones, as one undoable batch.
+    paid = payments.record_sales_payment_for_user(
+        session, owner_id, [phone.id for phone in phones], 10_000, TODAY, "cash",
+    )
+    assert len({payment.batch_id for payment in paid}) == 1
+    for phone in phones:
+        session.refresh(phone)
+        assert phone.installments[0].amount_paid == 5_000
+    history = customers.customer_history(session, client, today=TODAY)
+    assert (history.purchases[0].paid, history.purchases[0].remaining) == (10_000, 50_000)
+    assert history.purchases[0].transactions[-1].remaining_after == 50_000
+
+
 def test_a_single_product_sale_is_unchanged(session: Session, owner_id: int) -> None:
-    _product(session, owner_id, "13 PRO", 0)
+    _product(session, owner_id, "13 PRO", 1)
     client = _customer(session)
 
     alone = sales.create_sales_batch(session, owner_id, customer_id=client, lines=[

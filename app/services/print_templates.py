@@ -84,13 +84,27 @@ def default_templates() -> PrintTemplates:
 
 
 def load(session: Session) -> PrintTemplates:
-    """The saved texts merged over the defaults (older NIS/NIF settings are reused)."""
+    """The saved texts merged over the defaults.
+
+    A NIS or NIF left blank here falls back to the one typed in Settings
+    (older versions kept them only there).
+    """
     stored = get_value(session, SETTING_KEY, None)
     templates = normalize(stored if isinstance(stored, Mapping) else {})
-    if not isinstance(stored, Mapping) or "business_nis" not in stored:
+    if not templates.business_nis:
         templates = replace(templates, business_nis=_clean_text(get_value(session, "business_nis", "")))
-    if not isinstance(stored, Mapping) or "business_nif" not in stored:
+    if not templates.business_nif:
         templates = replace(templates, business_nif=_clean_text(get_value(session, "business_nif", "")))
+    return templates
+
+
+def save_business_ids(session: Session, owner_user_id: int, *, nis: str, nif: str) -> PrintTemplates:
+    """Store the NIS and NIF typed in Settings where the printed documents read them (owner only)."""
+    auth.require_owner(session, owner_user_id)
+    templates = replace(load(session), business_nis=_clean_text(nis), business_nif=_clean_text(nif))
+    set_value(session, SETTING_KEY, to_json(templates))
+    set_value(session, "business_nis", templates.business_nis)
+    set_value(session, "business_nif", templates.business_nif)
     return templates
 
 

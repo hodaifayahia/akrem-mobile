@@ -110,7 +110,8 @@ def test_older_nis_and_nif_settings_are_reused(session: Session, owner_id: int) 
     assert print_templates.load(session).business_nis == "123456789"
     print_templates.save(session, owner_id, {"business_nis": "999"})
     loaded = print_templates.load(session)
-    assert (loaded.business_nis, loaded.business_nif) == ("999", "")
+    # A NIF left blank on the print page still prints the one typed in Settings.
+    assert (loaded.business_nis, loaded.business_nif) == ("999", "000198765432")
 
 
 def test_placeholders_are_filled_and_unknown_ones_kept() -> None:
@@ -248,10 +249,11 @@ def test_the_convention_prints_the_business_nis_and_nif(qapp) -> None:
 
     html = pdf_forms.commitment_html(customer, sale, _shop_templates(), "file:///logo.png")
 
-    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
-    assert "RC: 16/00-1234567" in html  # the third identifier of the same line
-    ids = _ids(html)
-    assert f"NIS: {NIS}" in ids and f"NIF: {NIF}" in ids  # the line sits in the document header
+    assert f"NIS : {NIS}" in html and f"NIF : {NIF}" in html
+    assert "RC : 16/00-1234567" in html and "AI : " not in html  # the three identifiers of the footer, no AI
+    # The identifiers sit at the foot of the form, under the signatures (owner's choice 2026-10-06).
+    assert html.index(f"NIS : {NIS}") > html.index("class='signature'")
+    assert _ids(html) == ""
 
 
 def test_the_taahud_and_the_iltizam_print_the_business_nis_and_nif(qapp, tmp_path: Path) -> None:
@@ -262,13 +264,13 @@ def test_the_taahud_and_the_iltizam_print_the_business_nis_and_nif(qapp, tmp_pat
     output = pdf_forms.generate_commitment_pdf(tmp_path / "commitment.pdf", customer, sale, templates=templates)
     html = pdf_forms.commitment_html(customer, sale, templates, "file:///logo.png")
 
-    assert f"NIS: {NIS}" in html and f"NIF: {NIF}" in html
+    assert f"NIS : {NIS}" in html and f"NIF : {NIF}" in html
     assert output.stat().st_size > 1000
     # An explicit value still wins over the saved one (the sale receipt's rule).
     overridden = pdf_forms.commitment_html(
         customer, sale, templates, "file:///logo.png", business_nis="111", business_nif="222",
     )
-    assert "NIS: 111" in overridden and "NIS: 222" not in overridden
+    assert "NIS : 111" in overridden and "NIS : 222" not in overridden
 
 
 def test_the_ticket_prints_the_business_nis_and_nif(qapp, tmp_path: Path) -> None:
@@ -314,5 +316,9 @@ def test_documents_without_identifiers_keep_no_empty_ids_line(qapp) -> None:
     commitment = pdf_forms.commitment_html(customer, sale, templates, "file:///logo.png")
     receipt = pdf_forms._receipt_html(customer, sale, payment, details, "file:///logo.png", None, templates)
 
-    assert "class='ids'" not in commitment and "NIS" not in commitment
+    # The commitment always ends with the three identifiers, blank ones as dotted lines to fill in.
+    assert "class='ids'" not in commitment
+    for label in ("RC", "NIS", "NIF"):
+        assert f"{label} : <span" in commitment
+    assert "AI : " not in commitment
     assert "class='ids'" not in receipt and "NIS" not in receipt

@@ -408,6 +408,7 @@ class DashboardPage(QWidget):
     def _apply_summary(self, summary: DashboardSummary) -> None:
         """Set card values and charts from the service result."""
         self.wholesale_card.set_value(summary.total_wholesale or 0, currency=True)
+        self.wholesale_card.set_subtitle(ar.DASH_CAPTION_WHOLESALE_UNITS.format(units=summary.stock_units))
         self.failed_card.set_value(summary.failed_operations)
         self.completed_card.set_value(summary.completed_operations)
         self.pending_card.set_value(summary.pending_operations)

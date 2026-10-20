@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
@@ -91,6 +92,11 @@ def create_sale_for_user(
     discount raises ``DiscountApprovalRequired`` unless ``approved_by_owner_id``
     names an active owner, and the approval is written to the audit log.
     The wholesale price always comes from the phone or the catalog.
+
+    Every sale made in the app takes its phones from the stock: a product
+    with no phone left (or a name not in the catalog) is refused with
+    ``stock.StockError`` (``out_of_stock``), as is a quantity above what is
+    left (``not_enough``).
     """
     user = session.get(User, user_id)
     if user is None or user.disabled:
@@ -101,8 +107,12 @@ def create_sale_for_user(
         if unit is not None:
             sale_values["product"] = unit.product.name
             sale_values["product_id"] = unit.product_id
-        elif sale_values.get("product_id") is None and str(sale_values.get("product", "")).strip():
-            # "Connect" the product: reuse the catalog entry with this name or add it.
+        elif (
+            sale_values.get("product_id") is None
+            and product_service.find_by_name(session, str(sale_values.get("product", ""))) is not None
+        ):
+            # "Connect" the product: reuse the catalog entry with this name (restoring an archived one).
+            # A name not in the catalog is not added: it has no stock, so create_sale refuses it.
             catalog_product, _created = product_service.find_or_create_product(
                 session, user_id, str(sale_values["product"]),
                 cash_price=max(int(sale_values.get("cash_price") or 0), 1),
@@ -143,7 +153,7 @@ def create_sale_for_user(
             approver = _approving_owner(session, approved_by_owner_id)
             if approver is None:
                 raise DiscountApprovalRequired(percent, limit)
-        sale = create_sale(session, **sale_values)
+        sale = create_sale(session, require_stock=True, **sale_values)
         if approver is not None:
             session.add(AuditLog(
                 user_id=approver.id, action="discount_approved", entity="sale", entity_id=sale.id,
@@ -156,7 +166,7 @@ def create_sale_for_user(
         return sale
     else:
         raise auth.AuthorizationError("Unsupported account role")
-    return create_sale(session, **sale_values)
+    return create_sale(session, require_stock=True, **sale_values)
 
 
 def seller_discount_percent(
@@ -332,6 +342,7 @@ def create_sale(
     reference: str | None = None,
     quantity: int = 1,
     total: int | None = None,
+    require_stock: bool = False,
 ) -> Sale:
     """Calculate and save a sale with its schedule as one session transaction.
 
@@ -349,7 +360,10 @@ def create_sale(
     ``quantity`` units leave the stock: the chosen unit first, then the
     oldest available units of the product (see ``stock.units_to_sell``). The
     prices are for the whole quantity. A typed IMEI/REF that matches no unit
-    in stock describes a phone outside the stock, so no unit is taken then.
+    takes the product's oldest phones with no IMEI recorded (stock entered by
+    quantity) and writes the typed IMEI on the first one, then the oldest
+    other phones. ``require_stock`` (sales made in the app) refuses a sale
+    the stock cannot cover; imports of old sales leave it off.
     ``total`` is the amount this sale carries of a basket total already
     calculated on the products bought together (see ``calc.share_basket_plan``).
     """
@@ -377,14 +391,16 @@ def create_sale(
     if product_id is None:
         linked = product_service.find_by_name(session, values["product"])
         product_id = linked.id if linked is not None else None
+    if product_id is None and stock_item_id is None and require_stock:
+        raise stock.StockError("out_of_stock", "This product is not in the catalog or the stock")
     unit = _requested_unit(session, stock_item_id)
     identified = bool(values["imei"] or values["reference"])
     if unit is None and identified:
         unit = stock.find_available_unit(session, imei=values["imei"], reference=values["reference"])
-    units = (
-        []
-        if unit is None and identified
-        else stock.units_to_sell(session, product_id=product_id, quantity=quantity, first=unit)
+    unmatched = unit is None and identified
+    units = stock.units_to_sell(
+        session, product_id=product_id, quantity=quantity, first=unit, without_imei=unmatched,
+        require_stock=require_stock,
     )
     result = calc.compute_sale(
         cash_price=values["cash_price"],
@@ -424,6 +440,8 @@ def create_sale(
         _insert_schedule(session, sale, resolved_settings)
         for taken in units:
             stock.mark_sold(session, taken, sale)
+        if unmatched and units:
+            stock.record_sold_imei(session, units[0], values["imei"])
         session.flush()
     return sale
 
@@ -451,6 +469,8 @@ def update_sale(
     )
     if sale is None:
         raise ValueError("Sale not found")
+    if sale.returned_at is not None and changes:
+        raise ValueError("A returned product cannot be edited")
     unsupported = sorted(set(changes) - _SALE_FIELDS)
     if unsupported:
         raise ValueError(f"Unsupported sale field: {unsupported[0]}")
@@ -574,6 +594,346 @@ def update_sale(
             session.flush()
         session.expire(sale, ["installments"])
     return sale
+
+
+@dataclass(frozen=True, slots=True)
+class _Received:
+    """One amount a client handed over after the purchase (one payment batch)."""
+
+    payment_date: date
+    amount: int
+    method: str
+    note: str | None
+    order: int
+
+
+def change_sale_type(
+    session: Session,
+    owner_user_id: int,
+    sale_ids: Iterable[int],
+    sale_type: str,
+    *,
+    rate: int = 0,
+    months: int | None = None,
+    payment_interval: int = 1,
+    down_payment: int | None = None,
+    expected_pay_date: date | None = None,
+    settings: Mapping[str, object] | None = None,
+) -> list[Sale]:
+    """Change how one purchase is paid (cash, installment or credit), keeping the money received; owner only.
+
+    ``sale_ids`` are the products of one purchase (a basket changes together).
+    The down payment stays (``down_payment`` replaces it; a cash sale had
+    none) and every amount received since is re-applied with its own date,
+    method and note: on a credit sale it reduces the balance, on an
+    installment sale it pays the new schedule oldest first. Changing to cash
+    means the purchase is paid in full, so the payment rows are removed.
+    The change and the payments it moved are written to the audit log.
+    """
+    owner = auth.require_owner(session, owner_user_id)
+    ids = list(dict.fromkeys(int(sale_id) for sale_id in sale_ids))
+    if not ids:
+        raise ValueError("Choose a purchase")
+    if sale_type not in {"cash", "installment", "credit"}:
+        raise ValueError("Sale type must be cash, installment, or credit")
+    if sale_type == "installment":
+        if months is None:
+            raise ValueError("Installment sales require months")
+        calc.validate_plan(months, payment_interval)
+        _check_whole("Rate", rate)
+        if not 0 <= rate <= 100:
+            raise ValueError("rate must be between 0 and 100")
+    else:
+        rate, months, payment_interval = 0, None, 1
+    if sale_type != "credit":
+        expected_pay_date = None
+    lock_payment_ledger(session)
+    rows = list(session.scalars(
+        select(Sale)
+        .where(Sale.id.in_(ids))
+        .options(
+            selectinload(Sale.installments).selectinload(Installment.payments),
+            selectinload(Sale.credit_payments),
+        )
+        .order_by(Sale.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ))
+    if len(rows) != len(ids):
+        raise ValueError("Sale not found")
+    if len({sale.customer_id for sale in rows}) != 1:
+        raise ValueError("The sales must belong to one customer")
+    if any(sale.returned_at is not None for sale in rows):
+        raise ValueError("A returned product has no payment method to change")
+
+    received = _received_after_purchase(rows)
+    old_down = sum(sale.down_payment for sale in rows if sale.sale_type != "cash")
+    down = 0 if sale_type == "cash" else (old_down if down_payment is None else down_payment)
+    _check_whole("Down payment", down)
+    if down < 0:
+        raise ValueError("Down payment cannot be negative")
+    totals = _new_totals(rows, sale_type, rate)
+    if down > sum(totals):
+        raise ValueError("down_payment cannot exceed total")
+    if sale_type != "cash" and down + sum(item.amount for item in received) > sum(totals):
+        raise ValueError("The money already received is more than the new total")
+    downs = _fill_in_order(down, totals)
+    resolved_settings = _schedule_settings(session, settings)
+
+    with session.begin_nested():
+        session.add(AuditLog(
+            user_id=owner.id, action="sale_type_changed", entity="sale", entity_id=rows[0].id,
+            details=json.dumps({
+                "sale_ids": ids,
+                "from": sorted({sale.sale_type for sale in rows}),
+                "to": sale_type,
+                "down_payment": down,
+                "payments": [
+                    {"date": item.payment_date.isoformat(), "amount": item.amount, "method": item.method}
+                    for item in received
+                ],
+            }, ensure_ascii=False, sort_keys=True),
+        ))
+        for sale in rows:
+            for row in list(sale.installments):
+                session.delete(row)
+            for payment in list(sale.credit_payments):
+                session.delete(payment)
+        session.flush()
+        for sale, total, sale_down in zip(rows, totals, downs, strict=True):
+            result = calc.compute_sale(
+                cash_price=sale.cash_price, rate=rate, down_payment=sale_down, months=months,
+                wholesale=sale.wholesale_price, sale_type=sale_type, purchase_date=sale.purchase_date,
+                interval=payment_interval, total_override=total,
+            )
+            sale.sale_type = sale_type
+            sale.rate = rate
+            sale.months = months
+            sale.payment_interval = payment_interval
+            sale.down_payment = sale_down
+            sale.total = result.total
+            sale.financed = result.financed
+            sale.monthly_amount = result.monthly_list[0] if result.monthly_list else None
+            sale.profit = result.profit
+            sale.end_date = result.end_date
+            sale.expected_pay_date = expected_pay_date
+        session.flush()
+        for sale in rows:
+            session.expire(sale, ["installments", "credit_payments"])
+            _insert_schedule(session, sale, resolved_settings)
+        session.flush()
+        if sale_type == "credit":
+            _reapply_on_credit(session, rows, received)
+        elif sale_type == "installment":
+            _reapply_on_installments(session, rows, received)
+        session.flush()
+        for sale in rows:
+            session.expire(sale, ["installments", "credit_payments"])
+    return rows
+
+
+def return_sales(
+    session: Session,
+    owner_user_id: int,
+    sale_ids: Iterable[int],
+    *,
+    refund: int | None = None,
+    return_date: date | None = None,
+    reason: str | None = None,
+) -> list[Sale]:
+    """Record products a client brought back; owner only.
+
+    Every phone the sales took goes back to stock. ``refund`` is what the shop
+    gives back (default: everything received for these products, down payment
+    included); the rest is what the shop keeps. Each sale is then settled:
+    nothing is owed, so no schedule, status or reminder follows it, and its
+    price, total and profit are the amount kept (the phone is back in stock,
+    so it cost nothing). ``returned_at`` marks it for the screens; the
+    original figures and payments are written to the audit log (``sale_returned``).
+    Some products of a basket can be returned and the others kept.
+    """
+    owner = auth.require_owner(session, owner_user_id)
+    ids = list(dict.fromkeys(int(sale_id) for sale_id in sale_ids))
+    if not ids:
+        raise ValueError("Choose the products brought back")
+    lock_payment_ledger(session)
+    rows = list(session.scalars(
+        select(Sale)
+        .where(Sale.id.in_(ids))
+        .options(
+            selectinload(Sale.installments).selectinload(Installment.payments),
+            selectinload(Sale.credit_payments),
+            selectinload(Sale.stock_items),
+        )
+        .order_by(Sale.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ))
+    if len(rows) != len(ids):
+        raise ValueError("Sale not found")
+    if len({sale.customer_id for sale in rows}) != 1:
+        raise ValueError("The sales must belong to one customer")
+    if any(sale.returned_at is not None for sale in rows):
+        raise ValueError("This product was already returned")
+    received = [customer_service.sale_paid(sale) for sale in rows]
+    refund = sum(received) if refund is None else refund
+    _check_whole("Refund", refund)
+    if not 0 <= refund <= sum(received):
+        raise ValueError("The refund cannot be more than what the client paid")
+    refunds = _fill_in_order(refund, received)
+    returned_on = return_date or date.today()
+    clean_reason = " ".join(str(reason or "").split())[:500] or None
+
+    with session.begin_nested():
+        session.add(AuditLog(
+            user_id=owner.id, action="sale_returned", entity="sale", entity_id=rows[0].id,
+            reason=clean_reason,
+            details=json.dumps({
+                "return_date": returned_on.isoformat(),
+                "refund": refund,
+                "sales": [
+                    {
+                        "sale_id": sale.id, "product": sale.product, "sale_type": sale.sale_type,
+                        "quantity": sale.quantity, "cash_price": sale.cash_price,
+                        "wholesale_price": sale.wholesale_price, "total": sale.total,
+                        "received": got, "refund": back,
+                        "units": [unit.id for unit in sale.stock_items],
+                    }
+                    for sale, got, back in zip(rows, received, refunds, strict=True)
+                ],
+            }, ensure_ascii=False, sort_keys=True),
+        ))
+        for sale in rows:
+            for row in list(sale.installments):
+                session.delete(row)
+            for payment in list(sale.credit_payments):
+                session.delete(payment)
+            for unit in list(sale.stock_items):
+                unit.status = stock.STATUS_AVAILABLE
+                unit.sale = None
+                unit.sold_at = None
+        session.flush()
+        for sale, got, back in zip(rows, received, refunds, strict=True):
+            kept = got - back
+            sale.sale_type = "cash"
+            sale.rate = 0
+            sale.months = None
+            sale.payment_interval = 1
+            sale.down_payment = 0
+            sale.cash_price = kept
+            sale.wholesale_price = 0
+            sale.total = kept
+            sale.financed = kept
+            sale.monthly_amount = None
+            sale.profit = kept
+            sale.end_date = None
+            sale.expected_pay_date = None
+            sale.returned_at = returned_on
+            sale.refund_amount = back
+            sale.return_reason = clean_reason
+        session.flush()
+        for sale in rows:
+            session.expire(sale, ["installments", "credit_payments", "stock_items"])
+    return rows
+
+
+def _check_whole(field: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a whole number")
+
+
+def _received_after_purchase(rows: list[Sale]) -> list[_Received]:
+    """Every amount received after the purchase, oldest first; one per payment batch.
+
+    An installment amount marked paid without payment rows (imported) counts too.
+    """
+    batches: dict[object, list[Payment]] = {}
+    earlier: list[_Received] = []
+    for sale in rows:
+        payments = list(sale.credit_payments)
+        for installment in sale.installments:
+            payments.extend(installment.payments)
+            extra = installment.amount_paid - sum(payment.amount for payment in installment.payments)
+            if extra > 0:
+                earlier.append(_Received(
+                    installment.paid_date or installment.due_date, extra, installment.method or "cash",
+                    installment.note, 0,
+                ))
+        for payment in payments:
+            batches.setdefault(payment.batch_id or ("payment", payment.id), []).append(payment)
+    received = [
+        _Received(
+            parts[0].payment_date, sum(part.amount for part in parts), parts[0].method,
+            next((part.note for part in parts if part.note), None), min(part.id for part in parts),
+        )
+        for parts in batches.values()
+    ]
+    return sorted(earlier + received, key=lambda item: (item.payment_date, item.order))
+
+
+def _new_totals(rows: list[Sale], sale_type: str, rate: int) -> list[int]:
+    """Each product's total under the new type; the percentage applies once to a basket's combined price."""
+    prices = [sale.cash_price for sale in rows]
+    if sale_type != "installment":
+        return prices
+    combined = sum(prices) * (100 + rate) // 100
+    return calc.split_amount(combined, prices) if len(rows) > 1 else [combined]
+
+
+def _fill_in_order(amount: int, capacities: list[int]) -> list[int]:
+    """Spread ``amount`` over the lines in order, each up to its capacity."""
+    parts: list[int] = []
+    left = amount
+    for capacity in capacities:
+        part = min(left, capacity)
+        parts.append(part)
+        left -= part
+    return parts
+
+
+def _reapply_on_credit(session: Session, rows: list[Sale], received: list[_Received]) -> None:
+    """Record the amounts again as credit payments, filling the products in order."""
+    balances = {sale.id: sale.financed for sale in rows}
+    for item in received:
+        batch_id = uuid.uuid4().hex
+        left = item.amount
+        for sale in rows:
+            part = min(left, balances[sale.id])
+            if part <= 0:
+                continue
+            session.add(Payment(
+                sale_id=sale.id, amount=part, payment_date=item.payment_date, method=item.method,
+                note=item.note, batch_id=batch_id,
+            ))
+            balances[sale.id] -= part
+            left -= part
+
+
+def _reapply_on_installments(session: Session, rows: list[Sale], received: list[_Received]) -> None:
+    """Pay the new schedule with the amounts again, oldest installment first (one row per installment)."""
+    installments = list(session.scalars(
+        select(Installment)
+        .where(Installment.sale_id.in_([sale.id for sale in rows]))
+        .order_by(Installment.installment_index, Installment.sale_id)
+    ))
+    for item in received:
+        batch_id = uuid.uuid4().hex
+        left = item.amount
+        for row in installments:
+            if left <= 0:
+                break
+            part = min(left, row.amount_due - row.amount_paid)
+            if part <= 0:
+                continue
+            session.add(Payment(
+                installment_id=row.id, amount=part, payment_date=item.payment_date, method=item.method,
+                note=item.note, batch_id=batch_id,
+            ))
+            row.amount_paid += part
+            row.method = item.method
+            if row.amount_paid >= row.amount_due:
+                row.paid_date = item.payment_date
+            left -= part
 
 
 def delete_sales(session: Session, owner_user_id: int, sale_ids: Iterable[int]) -> int:

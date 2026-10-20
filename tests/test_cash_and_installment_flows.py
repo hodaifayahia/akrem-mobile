@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 
 from app.db.models import Category, Customer, Product, Sale, User
 from app.db.session import session_scope
-from app.services import auth, customers, sales
+from app.services import auth, customers, sales, stock
 from app.services.pdf_forms import generate_cash_sale_receipt_pdf
 from app.services.seed import seed_defaults
 from app.ui.pages.new_sale_page import NewSalePage
@@ -27,8 +27,10 @@ def qapp() -> QApplication:
 
 @pytest.fixture
 def sales_test_db(memory_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """Seed test database with owner, seller, categories, products, and customer."""
+    """Seed test database with owner, seller, categories, a product with one phone in stock, and customer."""
     monkeypatch.setattr("app.db.session._application_engine", lambda url: memory_engine)
+    # A warning nobody expected fails the test instead of waiting for a click.
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text, *a, **k: pytest.fail(text))
     with session_scope(memory_engine) as session:
         seed_defaults(session)
         owner = auth.create_first_owner(
@@ -51,6 +53,7 @@ def sales_test_db(memory_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> dic
         prod = Product(name="Redmi Note 13", wholesale_price=25000, cash_price=32000, active=True)
         session.add(prod)
         session.flush()
+        stock.add_units(session, owner.id, product_id=prod.id)  # every sale takes a phone from stock
 
         cust = customers.create_customer(
             session,
@@ -306,12 +309,10 @@ def test_cash_sale_quantity_multiplies_the_price_and_reduces_stock(
     qapp, memory_engine: Engine, sales_test_db: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ):
     """5 phones in stock, 2 sold in one sale: the price doubles and 3 stay in stock."""
-    from app.services import stock
-
     monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
     monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
     with session_scope(memory_engine) as session:
-        stock.add_units(session, sales_test_db["owner_id"], product_id=sales_test_db["prod_id"], quantity=5)
+        stock.add_units(session, sales_test_db["owner_id"], product_id=sales_test_db["prod_id"], quantity=4)  # + 1
         session.commit()
         owner = session.get(User, sales_test_db["owner_id"])
         page = NewSalePage(current_user=owner)

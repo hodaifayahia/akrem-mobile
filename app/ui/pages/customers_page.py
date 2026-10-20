@@ -48,6 +48,7 @@ from app.ui import icons
 from app.ui.theme import qcolor
 from app.ui.dialogs.client_types_dialog import AssignTypeDialog, error_text
 from app.ui.dialogs.customer_form_dialog import CustomerFormDialog
+from app.ui.dialogs.payment_type_dialog import change_purchase_payment_type
 from app.ui.events import events
 from app.ui.widgets import row_selection
 from app.ui.widgets.client_types import TypeFilterBar, TypeTagDelegate
@@ -162,7 +163,7 @@ class _CustomerTableModel(QAbstractTableModel):
         if column == 6:
             return summary.category_name
         if column == PAYMENT_COLUMN:
-            return " · ".join(_payment_label(kind) for kind in summary.sale_types)
+            return " · ".join(_payment_label(kind) for kind in summary.display_kinds)
         if column == MONTHLY_COLUMN:
             return self._money_text(summary.monthly_amount)
         if column == REMAINING_COLUMN:
@@ -219,11 +220,14 @@ class _CustomerTableModel(QAbstractTableModel):
         return ""
 
 
-_PAYMENT_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending"}
+_PAYMENT_TONES = {"cash": "paid", "installment": "primary-glow", "credit": "pending", "returned": "failed"}
 
 
 def _payment_label(kind: str) -> str:
-    return {"cash": ar.SALE_CASH, "installment": ar.SALE_INSTALLMENT, "credit": ar.SALE_CREDIT}.get(kind, kind)
+    return {
+        "cash": ar.SALE_CASH, "installment": ar.SALE_INSTALLMENT, "credit": ar.SALE_CREDIT,
+        customers.RETURNED: ar.SALE_RETURNED,
+    }.get(kind, kind)
 
 
 class _PaymentKindDelegate(QStyledItemDelegate):
@@ -243,7 +247,7 @@ class _PaymentKindDelegate(QStyledItemDelegate):
         x = option.rect.right() - 6 if rtl else option.rect.left() + 6
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        for kind in summary.sale_types:
+        for kind in summary.display_kinds:
             text = _payment_label(kind)
             width = metrics.horizontalAdvance(text) + 16
             left = x - width if rtl else x
@@ -757,6 +761,12 @@ class CustomersPage(QWidget):
         menu = QMenu(self)
         edit_action = menu.addAction(icons.icon("edit", "text", 16), ar.CUST_EDIT)
         assign_action = menu.addAction(icons.icon("tag", "text", 16), ar.CT_ASSIGN)
+        # The row's purchase (one sale, or a whole basket) can be paid another way.
+        type_action = (
+            menu.addAction(icons.icon("edit", "text", 16), ar.CHANGE_TYPE_ACTION)
+            if self._is_owner and summary.sales and len(targets) == 1
+            and all(sale.returned_at is None for sale in summary.sales) else None
+        )
         menu.addSeparator()
         delete_text = ar.CUST_DELETE if len(targets) == 1 else f"{ar.SEL_DELETE} ({len(targets)})"
         delete_action = menu.addAction(icons.icon("trash", "failed", 16), delete_text)
@@ -765,6 +775,11 @@ class CustomersPage(QWidget):
             self._edit_customer(summary)
         elif chosen == assign_action:
             self._assign_type(targets)
+        elif type_action is not None and chosen == type_action:
+            if change_purchase_payment_type(
+                self, int(self.current_user.id), summary.id, [sale.id for sale in summary.sales]
+            ):
+                self.refresh()
         elif chosen == delete_action:
             self._delete_summaries(targets)
 

@@ -7,6 +7,10 @@ product as its own sale of the same client, in one transaction.
 
 Prices follow the catalog and the phones in stock: when the owner edits a
 product, the forms pick up the new price unless a price was typed by hand.
+
+Every sale (cash, credit or installment, alone or in a basket) takes its
+phones out of the stock, so the product lists only offer products with a
+phone in stock; a product sold out disappears from them after the sale.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ from app.config import data_dir
 from app.db.models import Category, Customer, User
 from app.db.session import session_scope
 from app.i18n import ar
-from app.services import calc, categories, customers, print_templates, sales
+from app.services import calc, categories, customers, print_templates, sales, stock
 from app.services.customers import DuplicateCustomerPhoneError
 from app.services.pdf_forms import ReceiptItem, generate_cash_sale_receipt_pdf
 from app.services import products as product_service
@@ -337,9 +341,7 @@ class NewSalePage(QWidget):
         cash_details_title = QLabel(ar.SALE_DETAILS_SECTION, form_card)
         cash_details_title.setObjectName("sectionTitle")
         form_layout.addWidget(cash_details_title)
-        self.cash_details = PhoneDetailsSection(
-            can_create_products=self.current_user.role == "owner", parent=form_card
-        )
+        self.cash_details = PhoneDetailsSection(parent=form_card)
         self.cash_details.unit_selected.connect(self._on_cash_unit_selected)
         self.cash_details.quantity_changed.connect(self._on_cash_quantity_changed)
         self.cash_details.scanned.connect(
@@ -633,6 +635,9 @@ class NewSalePage(QWidget):
         if not product_name:
             self._show_error("يرجى إدخال أو تحديد اسم المنتج.")
             return None
+        if not self.cash_details.in_stock():
+            self._show_error(ar.SALE_OUT_OF_STOCK)
+            return None
         total = self.cash_total.value()
         if total <= 0:
             self._show_error("يرجى إدخال مبلغ صحيح للبيع.")
@@ -681,9 +686,11 @@ class NewSalePage(QWidget):
     def _clear_cash_product(self, *, keep_product: bool = False) -> None:
         """Empty the product part of the cash form (the client and status stay).
 
-        ``keep_product`` (after a save) leaves the product picked, ready for the next client.
+        ``keep_product`` (after a save) leaves the product picked, ready for the
+        next client, while it still has a phone in stock.
         """
-        if self.cash_product.isEditable() and not keep_product:
+        listed = self.cash_product.findText(self.cash_product.currentText().strip()) >= 0
+        if self.cash_product.isEditable() and not (keep_product and listed):
             self.cash_product.setCurrentText("")
         self.cash_details.clear()
         self.cash_details.set_product(self.cash_product.currentText())
@@ -713,6 +720,9 @@ class NewSalePage(QWidget):
 
         try:
             saved_batch = self._create_batch(customer_for, lines)
+        except stock.StockError as error:
+            self._show_error(self._stock_error_text(error))
+            return
         except Exception as error:
             self._show_error(f"{ar.FORM_SAVE_ERROR}\n{error}")
             return
@@ -753,6 +763,14 @@ class NewSalePage(QWidget):
         self._clear_cash_product(keep_product=True)
         if answer == QMessageBox.StandardButton.Yes:
             self._export_cash_receipt()
+
+    @staticmethod
+    def _stock_error_text(error: stock.StockError) -> str:
+        """The message for a sale the stock refused."""
+        return {
+            "out_of_stock": ar.SALE_OUT_OF_STOCK,
+            "not_enough": ar.SALE_NOT_ENOUGH_STOCK,
+        }.get(error.code, ar.FORM_SAVE_ERROR)
 
     def _create_batch(
         self, customer_for: Callable[[Session], int], lines: list[dict[str, object]]
@@ -1080,9 +1098,7 @@ class NewSalePage(QWidget):
         details_title = QLabel(ar.SALE_DETAILS_SECTION, left_container)
         details_title.setObjectName("sectionTitle")
         left_layout.addWidget(details_title)
-        self.sale_details = PhoneDetailsSection(
-            can_create_products=self.current_user.role == "owner", parent=left_container
-        )
+        self.sale_details = PhoneDetailsSection(parent=left_container)
         self.sale_details.unit_selected.connect(self._on_sale_unit_selected)
         self.sale_details.quantity_changed.connect(self._on_sale_quantity_changed)
         self.sale_details.scanned.connect(
@@ -1240,7 +1256,7 @@ class NewSalePage(QWidget):
         self._refresh_cash_customers()
 
     def _refresh_products(self, *_args: object) -> None:
-        """Load active price-book entries for both Cash and Installment products.
+        """Load the active catalog products with a phone in stock for both Cash and Installment.
 
         Runs when the page opens and after any change elsewhere (a product
         edited on the Products page, a phone added to stock...): both forms
@@ -1263,7 +1279,8 @@ class NewSalePage(QWidget):
             self.cash_product.clear()
 
         with session_scope() as session:
-            catalog = product_service.list_products(session)
+            available = {product_id: counts[0] for product_id, counts in stock.stock_counts(session).items()}
+            catalog = [entry for entry in product_service.list_products(session) if available.get(entry.id, 0) > 0]
 
         for entry in catalog:
             self.product.addItem(entry.name, entry.id)
@@ -1623,6 +1640,9 @@ class NewSalePage(QWidget):
         ):
             self._show_error(ar.SELLER_SELECT_CATALOG_PRODUCT)
             return None
+        if not self.sale_details.in_stock():
+            self._show_error(ar.SALE_OUT_OF_STOCK)
+            return None
         details_error = self.sale_details.error_message()
         if details_error is not None:
             self._show_error(details_error)
@@ -1664,11 +1684,15 @@ class NewSalePage(QWidget):
         self.save_button.setText(ar.BASKET_SAVE_MANY.format(count=count) if count else f"💾  {ar.SAVE_SALE}")
 
     def _clear_sale_product(self) -> None:
-        """Empty the product part of the form; type, plan and dates stay for the next product."""
+        """Empty the product part of the form; type, plan and dates stay for the next product.
+
+        No product stays selected (a seller's list too), so saving the basket
+        does not add the first catalog product as one more line.
+        """
         if self.product.isEditable():
             self.product.setCurrentText("")
-        elif self.product.count():
-            self.product.setCurrentIndex(0)
+        else:
+            self.product.setCurrentIndex(-1)
         self.sale_details.clear()
         self.sale_details.set_product(self.product.currentText())
         self._apply_prices("sale", (0, 0))
@@ -1691,6 +1715,9 @@ class NewSalePage(QWidget):
             return
         try:
             saved_batch = self._create_batch(lambda _session: int(customer_id), lines)
+        except stock.StockError as error:
+            self._show_error(self._stock_error_text(error))
+            return
         except (PermissionError, ValueError, RuntimeError, SQLAlchemyError):
             self._show_error(ar.FORM_SAVE_ERROR)
             return

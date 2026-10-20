@@ -20,7 +20,8 @@ from sqlalchemy import select
 from app.db.models import Customer, Sale, User
 from app.db.session import dispose_database_engines, session_scope
 from app.i18n import ar
-from app.services import auth, backup, categories, customers, importer, payments, reports, sales, settings
+from app.services import auth, backup, categories, customers, importer, payments, products, reports, sales, settings
+from app.services import stock
 from app.services.calc import add_months
 from app.services.status import Status
 
@@ -200,9 +201,13 @@ def test_clicking_a_name_opens_the_installment_and_price_table(shop) -> None:
 def test_dashboard_wholesale_total_and_operation_counts(shop) -> None:
     from app.ui.pages.dashboard_page import DashboardPage
 
+    # The card counts the phones still in stock at wholesale price, not the goods already sold.
+    with session_scope() as session:
+        product = products.create_product(session, shop["owner"], name="Stock 13", wholesale_price=30000,
+                                          cash_price=36000)
+        stock.add_units(session, shop["owner"], product_id=product.id, quantity=2)
     page = DashboardPage(_user(shop["owner"]))
-    wholesale_total = 41500 * 3 + 50000 + 9000
-    assert page.wholesale_card.value_label.text() == f"{wholesale_total:,} دج"
+    assert page.wholesale_card.value_label.text() == "60,000 دج"
     assert page.failed_card.value_label.text() == "1"
     assert page.completed_card.value_label.text() == "1"
     assert page.pending_card.value_label.text() == "1"

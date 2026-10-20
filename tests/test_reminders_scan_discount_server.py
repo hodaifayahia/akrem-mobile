@@ -137,9 +137,12 @@ def test_scanning_imeis_adds_one_phone_each(session: Session, owner_id: int) -> 
 
 # ------------------------------------------------------------------ seller discount
 def _catalog(session: Session, owner_id: int) -> int:
-    return products.create_product(
+    """The catalog product the discount tests sell, with phones in stock (every sale takes one)."""
+    product_id = products.create_product(
         session, owner_id, name="Redmi 13", cash_price=40000, wholesale_price=30000
     ).id
+    stock.add_units(session, owner_id, product_id=product_id, quantity=10)
+    return product_id
 
 
 def _seller_sale(session: Session, seller_id: int, client: int, **values: object) -> Sale:

@@ -41,11 +41,14 @@ from app.db.session import session_scope
 from app.i18n import ar
 from app.i18n.plan_text import amount_label, every_text
 from app.i18n.stock_text import battery_text, ltr_text
-from app.services import auth, customers, payments, sales as sales_service
-from app.services import print_templates, schedule
+from app.services import auth, customers, payments, postponement, sales as sales_service
+from app.services import backup, print_templates, schedule
 from app.services.sales import PaidInstallmentEditError
 from app.services.pdf_forms import generate_commitment_pdf, generate_payment_receipt_pdf
 from app.services.settings import get_value
+from app.ui.dialogs.payment_type_dialog import change_purchase_payment_type
+from app.ui.dialogs.postpone_dialog import PostponeDialog
+from app.ui.dialogs.return_dialog import ReturnDialog
 from app.ui.widgets.customer_history import CustomerHistoryPanel, HistorySummary
 from app.services.status import Status, for_customer, for_month
 from app.ui.events import events
@@ -296,7 +299,7 @@ class CustomerDetailsDialog(QDialog):
             QHeaderView.ResizeMode.Interactive
         )
         self.schedule_table.horizontalHeader().setMinimumSectionSize(52)
-        for column, width in enumerate((65, 130, 140, 120, 80, 140)):
+        for column, width in enumerate((65, 130, 140, 120, 80, 230)):
             self.schedule_table.setColumnWidth(column, width)
         self.schedule_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.Stretch
@@ -350,10 +353,16 @@ class CustomerDetailsDialog(QDialog):
         self.receipt_pdf_button.setProperty("variant", "secondary")
         self.receipt_pdf_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.receipt_pdf_button.clicked.connect(self._print_payment_receipt)
+        self.reverse_payment_button = QPushButton(f"↩️  {ar.PAY_REVERSE_ACTION}", self)
+        self.reverse_payment_button.setProperty("variant", "secondary")
+        self.reverse_payment_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reverse_payment_button.setToolTip(ar.PAY_REVERSE_TOOLTIP)
+        self.reverse_payment_button.clicked.connect(self._reverse_selected_payment)
         pdf_row.addWidget(self.commitment_pdf_button)
         pdf_row.addWidget(self.receipt_history_label)
         pdf_row.addWidget(self.receipt_history, 1)
         pdf_row.addWidget(self.receipt_pdf_button)
+        pdf_row.addWidget(self.reverse_payment_button)
         sale_root.addLayout(pdf_row)
 
         buttons = QHBoxLayout()
@@ -365,6 +374,16 @@ class CustomerDetailsDialog(QDialog):
         self.edit_sale_button.setProperty("variant", "secondary")
         self.edit_sale_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.edit_sale_button.setVisible(self.current_user.role == "owner")
+        self.change_type_button = QPushButton(f"🔁  {ar.CHANGE_TYPE_ACTION}", self)
+        self.change_type_button.setProperty("variant", "secondary")
+        self.change_type_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.change_type_button.setVisible(self.current_user.role == "owner")
+        self.change_type_button.clicked.connect(self._change_payment_type)
+        self.return_button = QPushButton(f"📦  {ar.RETURN_ACTION}", self)
+        self.return_button.setProperty("variant", "secondary")
+        self.return_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.return_button.setVisible(self.current_user.role == "owner")
+        self.return_button.clicked.connect(self._return_products)
         self.close_button = QPushButton(ar.CUST_CLOSE, self)
         self.close_button.setProperty("variant", "primary")
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -373,6 +392,8 @@ class CustomerDetailsDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         buttons.addWidget(self.edit_button)
         buttons.addWidget(self.edit_sale_button)
+        buttons.addWidget(self.change_type_button)
+        buttons.addWidget(self.return_button)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
         root.addLayout(buttons)
@@ -430,7 +451,7 @@ class CustomerDetailsDialog(QDialog):
         self.sale_selector.clear()
         for group in customers.group_basket_sales(self._customer.sales):
             sale = group[0]
-            kinds = tuple(dict.fromkeys(item.sale_type for item in group))
+            kinds = tuple(dict.fromkeys(customers.display_kind(item) for item in group))
             kind = " + ".join(self._sale_type_label(value) for value in kinds)
             product = ltr_text(customers.basket_product_label(group))
             label = f"{product} · {self._format_date(sale.purchase_date)} · {kind}"
@@ -531,7 +552,7 @@ class CustomerDetailsDialog(QDialog):
         sale = sales[0]
         product = ltr_text(customers.basket_product_label(sales))
         installment_sales = [item for item in sales if item.sale_type == "installment"]
-        kinds = tuple(dict.fromkeys(item.sale_type for item in sales))
+        kinds = tuple(dict.fromkeys(customers.display_kind(item) for item in sales))
         kind_label = " + ".join(self._sale_type_label(kind) for kind in kinds)
         rates = {item.rate for item in installment_sales}
         durations = {item.months for item in installment_sales}
@@ -638,7 +659,11 @@ class CustomerDetailsDialog(QDialog):
             status_dot.setToolTip(self._status_label(state))
             self.schedule_table.setCellWidget(row_index, 4, status_dot)
             if bool(values["stored"]) and remaining > 0:
-                action = QPushButton(ar.CUST_RECORD_PAYMENT, self.schedule_table)
+                actions = QWidget(self.schedule_table)
+                actions_layout = QHBoxLayout(actions)
+                actions_layout.setContentsMargins(2, 0, 2, 0)
+                actions_layout.setSpacing(4)
+                action = QPushButton(ar.CUST_RECORD_PAYMENT, actions)
                 action.setProperty("variant", "success")
                 action.setProperty("compact", True)
                 action.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -646,7 +671,18 @@ class CustomerDetailsDialog(QDialog):
                     lambda _checked=False, group=sales, outstanding=remaining:
                         self._open_installment_payment(group, outstanding)
                 )
-                self.schedule_table.setCellWidget(row_index, 5, action)
+                postpone = QPushButton(ar.POSTPONE_ACTION, actions)
+                postpone.setProperty("variant", "secondary")
+                postpone.setProperty("compact", True)
+                postpone.setCursor(Qt.CursorShape.PointingHandCursor)
+                postpone.setToolTip(ar.POSTPONE_TITLE)
+                postpone.clicked.connect(
+                    lambda _checked=False, group=sales, number=index, due=due_date, left=remaining:
+                        self._postpone_installment(group, number, due, left)
+                )
+                actions_layout.addWidget(action)
+                actions_layout.addWidget(postpone)
+                self.schedule_table.setCellWidget(row_index, 5, actions)
             else:
                 self.schedule_table.setItem(row_index, 5, QTableWidgetItem("\u2014"))
         fit_table_to_rows(self.schedule_table, resize_rows=True)
@@ -664,7 +700,13 @@ class CustomerDetailsDialog(QDialog):
     def _refresh_print_actions(self, sales: tuple[Sale, ...]) -> None:
         """Show document actions and load payment receipts across grouped lines."""
         sale = sales[0] if sales else None
-        self.edit_sale_button.setVisible(self.current_user.role == "owner" and sale is not None)
+        is_owner = self.current_user.role == "owner"
+        # A returned product is history: no edit, payment method or second return.
+        open_sales = [item for item in sales if item.returned_at is None]
+        self.edit_sale_button.setVisible(is_owner and bool(open_sales))
+        self.change_type_button.setVisible(is_owner and bool(sales) and len(open_sales) == len(sales))
+        self.return_button.setVisible(is_owner and bool(open_sales))
+        self.reverse_payment_button.setVisible(False)
         self._payments_by_id = {}
         self._payment_sales_by_id = {}
         self.receipt_history.clear()
@@ -686,14 +728,24 @@ class CustomerDetailsDialog(QDialog):
                     for installment in item.installments
                     for payment in installment.payments
                 )
-        history.sort(key=lambda entry: (entry[0].payment_date, entry[0].id), reverse=True)
+        # One entry per amount received: the parts of a payment spread over
+        # several installments or products share a batch id.
+        batches: dict[object, list[tuple[Payment, Sale]]] = {}
         for payment, payment_sale in history:
+            batches.setdefault(payment.batch_id or ("payment", payment.id), []).append((payment, payment_sale))
+        entries = sorted(
+            batches.values(),
+            key=lambda parts: (parts[0][0].payment_date, max(part.id for part, _sale in parts)),
+            reverse=True,
+        )
+        for parts in entries:
+            payment, payment_sale = max(parts, key=lambda part: part[0].id)
             self._payments_by_id[payment.id] = payment
             self._payment_sales_by_id[payment.id] = payment_sale
             method = self._payment_method_label(payment.method)
             label = (
                 f"{self._format_date(payment.payment_date)} \u00b7 "
-                f"{self._money(payment.amount)} \u00b7 {method}"
+                f"{self._money(sum(part.amount for part, _sale in parts))} \u00b7 {method}"
             )
             self.receipt_history.addItem(label, payment.id)
         has_history = bool(history)
@@ -701,6 +753,7 @@ class CustomerDetailsDialog(QDialog):
         self.receipt_history.setVisible(has_history)
         self.receipt_pdf_button.setVisible(has_history)
         self.receipt_pdf_button.setEnabled(has_history)
+        self.reverse_payment_button.setVisible(has_history and self.current_user.role == "owner")
 
     def _print_commitment(self) -> None:
         """Create a commitment form for all installment items in the selected basket."""
@@ -821,6 +874,7 @@ class CustomerDetailsDialog(QDialog):
                 payment,
                 issued_by=self.current_user.username,
                 templates=self._print_templates(),
+                basket=self._selected_sales(),
             )
         except Exception:
             QMessageBox.warning(self, ar.PDF_SAVE_DIALOG_TITLE, ar.PDF_GENERATE_ERROR)
@@ -911,6 +965,44 @@ class CustomerDetailsDialog(QDialog):
             return
         self._notify_payment_changed(payment_ids)
 
+    def _postpone_installment(
+        self, sales: tuple[Sale, ...], installment_index: int, due_date: date, amount_left: int
+    ) -> None:
+        """Ask how to postpone an installment the client cannot pay, then apply it to the whole basket."""
+        group = tuple(sale for sale in sales if sale.sale_type == "installment")
+        if not group:
+            return
+        dialog = PostponeDialog(
+            installment_index, due_date, amount_left,
+            can_move_to_next=postponement.can_move_to_next(group, installment_index), parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind, days, reason = dialog.values()
+        try:
+            with session_scope(self._engine) as session:
+                postponement.postpone_installment(
+                    session, int(self.current_user.id), [sale.id for sale in group], installment_index,
+                    kind, days=days, reason=reason,
+                )
+        except postponement.PostponeError as error:
+            QMessageBox.warning(self, ar.POSTPONE_TITLE, {
+                "last": ar.POSTPONE_ERROR_LAST,
+                "paid": ar.POSTPONE_ERROR_PAID,
+                "too_long": ar.POSTPONE_ERROR_TOO_LONG,
+            }.get(error.code, ar.POSTPONE_ERROR))
+            return
+        except (PermissionError, ValueError, RuntimeError, SQLAlchemyError):
+            QMessageBox.warning(self, ar.POSTPONE_TITLE, ar.POSTPONE_ERROR)
+            return
+        for sale in group:
+            events.sale_changed.emit(sale.id)
+        events.customer_changed.emit(self.customer_id)
+        events.data_changed.emit()
+        events.notify.emit("success", ar.POSTPONE_TITLE, ar.POSTPONE_DONE, 4000)
+        self._reload_customer()
+        self._populate_sales()
+
     def _record_credit_payment(self) -> None:
         """Collect one payment across the basket's credit items."""
         sales = self._selected_sales()
@@ -964,7 +1056,7 @@ class CustomerDetailsDialog(QDialog):
         """Edit the selected sale through the owner-guarded sales service."""
         if self.current_user.role != "owner":
             return
-        selected_sales = self._selected_sales()
+        selected_sales = tuple(item for item in self._selected_sales() if item.returned_at is None)
         if not selected_sales:
             return
         sale = selected_sales[0]
@@ -980,6 +1072,20 @@ class CustomerDetailsDialog(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         changes = dialog.values()
+        if changes["sale_type"] != sale.sale_type:
+            # A new payment method keeps the money already received (see change_sale_type);
+            # the other edits (product, prices, date) follow as usual.
+            try:
+                with session_scope(self._engine) as session:
+                    sales_service.change_sale_type(
+                        session, int(self.current_user.id), [sale.id], str(changes["sale_type"]),
+                        rate=int(changes["rate"]), months=changes["months"],
+                        payment_interval=int(changes["payment_interval"]),
+                        down_payment=int(changes["down_payment"]), expected_pay_date=changes["expected_pay_date"],
+                    )
+            except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
+                QMessageBox.warning(self, ar.CUST_EDIT_SALE, ar.CUST_EDIT_SALE_ERROR)
+                return
         try:
             with session_scope(self._engine) as session:
                 sales_service.update_sale_for_user(
@@ -1019,6 +1125,87 @@ class CustomerDetailsDialog(QDialog):
         self._populate_sales()
         QMessageBox.information(self, ar.CUST_EDIT_SALE, ar.CUST_EDIT_SALE_SAVED)
 
+    def _change_payment_type(self) -> None:
+        """Change the selected purchase to cash, installment or credit, keeping what was received (owner)."""
+        if self.current_user.role != "owner":
+            return
+        selected_sales = self._selected_sales()
+        if not selected_sales:
+            return
+        if change_purchase_payment_type(
+            self, int(self.current_user.id), self.customer_id, [sale.id for sale in selected_sales], self._engine
+        ):
+            self._reload_customer()
+            self._populate_sales()
+
+    def _return_products(self) -> None:
+        """Products the client brought back: phones back to stock, the refund recorded (owner)."""
+        if self.current_user.role != "owner":
+            return
+        selected_sales = self._selected_sales()
+        if not any(sale.returned_at is None for sale in selected_sales):
+            return
+        dialog = ReturnDialog(selected_sales, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        sale_ids, refund, return_date, reason = dialog.values()
+        if not sale_ids:
+            QMessageBox.warning(self, ar.RETURN_TITLE, ar.RETURN_SELECT)
+            return
+        if self._engine is None:
+            backup.create_safety_backup()
+        try:
+            with session_scope(self._engine) as session:
+                sales_service.return_sales(
+                    session, int(self.current_user.id), sale_ids,
+                    refund=refund, return_date=return_date, reason=reason,
+                )
+        except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
+            QMessageBox.warning(self, ar.RETURN_TITLE, ar.RETURN_ERROR)
+            return
+        for sale_id in sale_ids:
+            events.sale_changed.emit(sale_id)
+        events.customer_changed.emit(self.customer_id)
+        events.data_changed.emit()
+        events.notify.emit("success", ar.RETURN_TITLE, ar.RETURN_DONE, 4000)
+        self._reload_customer()
+        self._populate_sales()
+
+    def _reverse_selected_payment(self) -> None:
+        """Return the payment chosen in the receipt list: its amount is owed again (owner, with a reason)."""
+        if self.current_user.role != "owner":
+            return
+        payment_id = self.receipt_history.currentData()
+        if payment_id is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            ar.PAY_REVERSE_ACTION,
+            ar.PAY_REVERSE_CONFIRM.format(payment=self.receipt_history.currentText()),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        reason, accepted = QInputDialog.getMultiLineText(self, ar.PAY_REVERSE_ACTION, ar.PAY_UNDO_REASON)
+        if not accepted or not reason.strip():
+            QMessageBox.warning(self, ar.PAY_REVERSE_ACTION, ar.PAY_UNDO_ERROR)
+            return
+        try:
+            with session_scope(self._engine) as session:
+                payments.reverse_payment(session, int(self.current_user.id), int(payment_id), reason)
+        except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
+            QMessageBox.warning(self, ar.PAY_REVERSE_ACTION, ar.PAY_UNDO_ERROR)
+            return
+        events.payment_changed.emit(int(payment_id))
+        for sale in self._selected_sales():
+            events.sale_changed.emit(sale.id)
+        events.customer_changed.emit(self.customer_id)
+        events.data_changed.emit()
+        events.notify.emit("warning", ar.PAY_REVERSE_ACTION, ar.PAY_REVERSE_DONE, 4000)
+        self._reload_customer()
+        self._populate_sales()
+
     def _selected_sales(self) -> tuple[Sale, ...]:
         """Return all sale rows represented by the selected basket purchase."""
         selected_id = self.sale_selector.currentData()
@@ -1055,6 +1242,7 @@ class CustomerDetailsDialog(QDialog):
             "installment": ar.SALE_INSTALLMENT,
             "credit": ar.SALE_CREDIT,
             "mixed": ar.SALE_MIXED,
+            customers.RETURNED: ar.SALE_RETURNED,
         }.get(sale_type, sale_type)
 
     @staticmethod

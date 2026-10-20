@@ -56,6 +56,13 @@ def _user(user_id: int) -> User:
         return session.get(User, user_id)
 
 
+def _in_stock(session, owner_id: int, name: str, quantity: int = 1) -> None:
+    """Put phones of a catalog product in stock: every sale made in the app takes one."""
+    from app.services import stock
+
+    stock.add_units(session, owner_id, product_id=products.find_by_name(session, name).id, quantity=quantity)
+
+
 # ------------------------------------------------------------- sidebar pages
 def test_products_and_client_types_are_sidebar_pages(shop) -> None:
     from app.ui.main_window import PAGE_CLIENT_TYPES, PAGE_PRODUCTS, MainWindow
@@ -282,6 +289,7 @@ def test_clicking_a_client_shows_their_full_history(shop) -> None:
 
     with session_scope() as session:
         fallback = categories.get_fallback_type(session)
+        _in_stock(session, shop["owner"], "iPhone 13")
         customer, sale = sales.create_customer_with_sale(
             session, shop["owner"],
             customer={"full_name": "زبون قديم", "category_id": fallback.id},
@@ -509,6 +517,7 @@ def test_new_sale_page_applies_the_product_plan_and_saves_the_interval(shop, mon
             session, shop["owner"], product.id, name="iPhone 13", cash_price=110000,
             plan=products.ProductPlan(months=12, interval=6),
         )
+        _in_stock(session, shop["owner"], "iPhone 13")
         customer = customers.create_customer(
             session, full_name="زبون الصفحة", phone="0550000123", category_id=categories.get_fallback_type(session).id,
         )
@@ -633,18 +642,19 @@ def test_new_sale_page_sells_a_phone_from_stock_with_its_details(shop, monkeypat
         sold = session.get(StockItem, unit_id)
         assert sold.status == stock.STATUS_SOLD and sold.sale_id == sale.id
 
-    # The cash module records the same details and links a brand-new product name.
+    # A product with no phone in stock (sold out, or a name typed that is not in stock) is not sold.
+    assert page.product.findText("Redmi 13") < 0 and page.cash_product.findText("Redmi 13") < 0
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text, *a, **k: warnings.append(text))
     page.cash_product.setCurrentText("Tablet Modio")
-    assert page.cash_details.product_state.text() == ar.SALE_PRODUCT_NEW
+    assert page.cash_details.product_state.text() == ar.SALE_PRODUCT_NOT_IN_STOCK
     page.cash_total.setValue(21000)
-    page.cash_details.color.setCurrentText("Grey")
-    page.cash_details.is_new.setChecked(True)
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
     page._save_cash_sale()
+    assert warnings == [ar.SALE_OUT_OF_STOCK]
     with session_scope() as session:
-        cash_sale = session.scalar(select(Sale).where(Sale.product == "Tablet Modio"))
-        assert (cash_sale.color, cash_sale.is_new) == ("Grey", True)
-        assert cash_sale.product_id == products.find_by_name(session, "tablet modio").id
+        assert session.scalar(select(Sale).where(Sale.product == "Tablet Modio")) is None
+        assert products.find_by_name(session, "tablet modio") is None
 
 
 def test_clients_page_has_purchase_and_end_of_deduction_filters(shop) -> None:
@@ -762,6 +772,7 @@ def _overdue_client(owner_id: int, name: str = "زبون الدفعات", phone:
     with session_scope() as session:
         fallback = categories.get_fallback_type(session)
         customer = customers.create_customer(session, full_name=name, phone=phone, category_id=fallback.id)
+        _in_stock(session, owner_id, "iPhone 13")
         sales.create_sale_for_user(
             session, owner_id, customer_id=customer.id, product="iPhone 13", sale_type="installment",
             wholesale_price=90000, cash_price=110000, rate=0, down_payment=20000, months=3,

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Category, Customer, Installment, Sale, User
 from app.db.session import session_scope
-from app.services import auth, customers, payments, products, sales, settings
+from app.services import auth, customers, payments, products, sales, settings, stock
 from app.services.status import Status
 
 TODAY = date(2026, 10, 15)
@@ -280,6 +280,14 @@ def _owner_and_seller(session: Session) -> tuple[User, User]:
     return owner, seller
 
 
+def _in_stock(session: Session, owner_id: int, name: str, cash_price: int, wholesale_price: int = 0) -> None:
+    """A catalog product with one phone in stock: every sale made in the app takes one."""
+    product, _created = products.find_or_create_product(
+        session, owner_id, name, cash_price=cash_price, wholesale_price=wholesale_price
+    )
+    stock.add_units(session, owner_id, product_id=product.id)
+
+
 def _customer_count(session: Session) -> int:
     """Return the number of saved customers."""
     return session.scalar(select(func.count()).select_from(Customer)) or 0
@@ -290,6 +298,7 @@ def test_owner_creates_customer_with_installment_sale(memory_engine: Engine) -> 
     with session_scope(memory_engine) as session:
         owner, _seller = _owner_and_seller(session)
         category = _category(session)
+        _in_stock(session, owner.id, "Redmi 13", 24_000, 20_000)
         customer, sale = sales.create_customer_with_sale(
             session,
             owner.id,
@@ -328,6 +337,7 @@ def test_seller_gets_catalog_prices(memory_engine: Engine) -> None:
         products.create_product(
             session, owner.id, name="Galaxy A15", wholesale_price=20_000, cash_price=25_000
         )
+        _in_stock(session, owner.id, "Galaxy A15", 25_000)
         _customer, sale = sales.create_customer_with_sale(
             session,
             seller.id,
@@ -401,6 +411,7 @@ def test_duplicate_phone_propagates_and_can_be_confirmed(memory_engine: Engine) 
         customers.create_customer(
             session, full_name="الأول", category_id=category.id, phone="0551112233"
         )
+        _in_stock(session, owner.id, "هاتف", 150)
         values = {"full_name": "الثاني", "category_id": category.id, "phone": "0551112233"}
         sale_values = {
             "product": "هاتف", "sale_type": "cash", "wholesale_price": 100, "cash_price": 150,

@@ -21,6 +21,12 @@ from app.services.status import Status, for_customer, for_month
 
 _MOBILE_RE = re.compile(r"^0[567][0-9]{8}$")
 PAYMENT_KINDS = ("cash", "installment", "credit")
+RETURNED = "returned"  # shown instead of the payment method of a product brought back
+
+
+def display_kind(sale: Sale) -> str:
+    """The sale's payment method as shown on screen, or ``"returned"`` (see ``sales.return_sales``)."""
+    return RETURNED if sale.returned_at is not None else sale.sale_type
 PAYMENT_FILTERS = ("cash", "facilities", "installment", "credit")
 BALANCE_FILTERS = ("open", "settled")
 PURCHASE_FILTERS = ("this_month", "last_month", "last_3_months", "this_year")
@@ -78,6 +84,12 @@ class CustomerSummary:
         return tuple(kind for kind in PAYMENT_KINDS if kind in present)
 
     @property
+    def display_kinds(self) -> tuple[str, ...]:
+        """The row's payment methods as shown: ``"returned"`` for a product brought back."""
+        present = {display_kind(sale) for sale in self.sales}
+        return tuple(kind for kind in (*PAYMENT_KINDS, RETURNED) if kind in present)
+
+    @property
     def payment_profile(self) -> str:
         """``"cash"`` when every purchase was paid in full, ``"facilities"`` when any
         purchase is paid over time (installment or credit), ``"none"`` without sales."""
@@ -111,7 +123,7 @@ class CustomerSummary:
 
 def _payment_profile(sale_types: tuple[str, ...] | set[str]) -> str:
     """Classify sale types as ``"none"``, all-``"cash"``, or ``"facilities"``."""
-    kinds = set(sale_types)
+    kinds = {"cash" if kind == RETURNED else kind for kind in sale_types}  # a return is settled
     if not kinds:
         return "none"
     return "cash" if kinds == {"cash"} else "facilities"
@@ -124,6 +136,9 @@ class TransactionRecord:
     ``kind`` is ``"full_payment"`` (a cash sale), ``"down_payment"``,
     ``"payment"`` (a recorded installment or credit payment) or ``"earlier"``
     (an installment amount marked paid without payment rows, e.g. imported).
+    One amount received is one record, even when it was spread over several
+    installments or several products of a basket: ``amount`` is what the
+    client handed over and ``installment_indexes`` lists every installment it paid.
     """
 
     kind: str
@@ -135,6 +150,18 @@ class TransactionRecord:
     note: str | None = None
     payment_id: int | None = None
     product: str | None = None
+    batch_id: str | None = None
+    installment_indexes: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnRecord:
+    """A product the client brought back: when, what the shop gave back, and why."""
+
+    product: str
+    returned_at: date
+    refund: int
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +198,8 @@ class PurchaseRecord:
     products: tuple[str, ...] = ()
     # Every amount received for this sale, oldest first.
     transactions: tuple[TransactionRecord, ...] = ()
+    # Products of this purchase the client brought back.
+    returns: tuple[ReturnRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +304,7 @@ def _installment_paid(installment: Installment) -> int:
     return max(installment.amount_paid, sum(payment.amount for payment in installment.payments))
 
 
-def _sale_paid(sale: Sale) -> int:
+def sale_paid(sale: Sale) -> int:
     """Return everything received for a sale, including any down payment."""
     if sale.sale_type == "cash":
         return sale.total
@@ -325,18 +354,19 @@ def _purchase_record(sales: tuple[Sale, ...], today: date, grace_days: int) -> P
     """Summarize one basket, including every item and transaction in it."""
     sale = sales[0]
     installment_sales = [item for item in sales if item.sale_type == "installment"]
-    sale_types = {item.sale_type for item in sales}
+    sale_types = {display_kind(item) for item in sales}
+    returned = [item for item in sales if item.returned_at is not None]
     months = {item.months for item in installment_sales}
     rates = {item.rate for item in installment_sales}
     intervals = {item.payment_interval or 1 for item in installment_sales}
     total = sum(item.total for item in sales)
-    paid = sum(_sale_paid(item) for item in sales)
+    paid = sum(sale_paid(item) for item in sales)
     transactions = _group_transactions(sales, total)
     return PurchaseRecord(
         sale_id=sale.id,
         purchase_date=sale.purchase_date,
         product=basket_product_label(sales),
-        sale_type=sale.sale_type if len(sale_types) == 1 else "mixed",
+        sale_type=next(iter(sale_types)) if len(sale_types) == 1 else "mixed",
         cash_price=sum(item.cash_price for item in sales),
         wholesale_price=sum(item.wholesale_price for item in sales),
         rate=next(iter(rates)) if len(rates) == 1 else 0,
@@ -362,11 +392,20 @@ def _purchase_record(sales: tuple[Sale, ...], today: date, grace_days: int) -> P
         basket_id=sale.basket_id,
         products=tuple(dict.fromkeys(item.product for item in sales)),
         transactions=transactions,
+        returns=tuple(
+            ReturnRecord(item.product, item.returned_at, item.refund_amount or 0, item.return_reason)
+            for item in returned
+        ),
     )
 
 
 def _group_transactions(sales: tuple[Sale, ...], total: int) -> tuple[TransactionRecord, ...]:
-    """Merge same-product transaction lines into one running purchase balance."""
+    """One purchase's transactions with one running balance: one row per amount received.
+
+    A payment spread over several installments (or over the products of a
+    basket) shares a ``batch_id`` and becomes one row of the amount the client
+    paid. The down payments and cash payments taken at the purchase are one row too.
+    """
     records = [
         (sale.id, index, transaction)
         for sale in sales
@@ -375,59 +414,84 @@ def _group_transactions(sales: tuple[Sale, ...], total: int) -> tuple[Transactio
     records.sort(key=lambda item: (
         item[2].transaction_date, item[2].payment_id or 0, item[0], item[1],
     ))
+    merged: dict[tuple[object, ...], list[TransactionRecord]] = {}
+    for sale_id, index, transaction in records:
+        merged.setdefault(_merge_key(sale_id, index, transaction), []).append(transaction)
     remaining = total
     result: list[TransactionRecord] = []
-    for _sale_id, _index, transaction in records:
-        remaining = max(0, remaining - transaction.amount)
-        result.append(TransactionRecord(
-            kind=transaction.kind,
-            transaction_date=transaction.transaction_date,
-            amount=transaction.amount,
-            remaining_after=remaining,
-            method=transaction.method,
-            installment_index=transaction.installment_index,
-            note=transaction.note,
-            payment_id=transaction.payment_id,
-            product=transaction.product,
-        ))
+    for parts in merged.values():
+        amount = sum(part.amount for part in parts)
+        remaining = max(0, remaining - amount)
+        result.append(_merged_transaction(parts, amount, remaining))
     return tuple(result)
+
+
+def _merge_key(sale_id: int, index: int, transaction: TransactionRecord) -> tuple[object, ...]:
+    """Rows with the same key are one amount received."""
+    if transaction.batch_id:
+        return ("batch", transaction.batch_id)
+    if transaction.kind in ("down_payment", "full_payment"):
+        return ("purchase", transaction.kind, transaction.transaction_date)
+    return ("row", sale_id, index)
+
+
+def _merged_transaction(parts: list[TransactionRecord], amount: int, remaining: int) -> TransactionRecord:
+    """One record for the parts of one amount received (the first part gives date and method)."""
+    first = parts[0]
+    indexes = tuple(sorted({number for part in parts for number in part.installment_indexes}))
+    products = tuple(dict.fromkeys(part.product for part in parts if part.product))
+    return TransactionRecord(
+        kind=first.kind,
+        transaction_date=first.transaction_date,
+        amount=amount,
+        remaining_after=remaining,
+        method=first.method,
+        installment_index=indexes[0] if len(indexes) == 1 else None,
+        note=next((part.note for part in parts if part.note), None),
+        payment_id=max((part.payment_id for part in parts if part.payment_id is not None), default=None),
+        product=" + ".join(products) if products else None,
+        batch_id=first.batch_id,
+        installment_indexes=indexes,
+    )
 
 
 def _transactions(sale: Sale) -> tuple[TransactionRecord, ...]:
     """Every amount received for an eagerly loaded sale, oldest first, with a running balance.
 
-    The amounts add up to the ledger's paid amount (see ``_sale_paid``).
+    The amounts add up to the ledger's paid amount (see ``sale_paid``).
     """
-    # (date, order within the sale, kind, amount, method, installment index, note, payment id)
-    rows: list[tuple[date, int, str, int, str | None, int | None, str | None, int | None]] = []
+    # (date, order within the sale, kind, amount, method, installment index, note, payment id, batch id)
+    rows: list[tuple[date, int, str, int, str | None, int | None, str | None, int | None, str | None]] = []
     if sale.sale_type == "cash":
-        rows.append((sale.purchase_date, 0, "full_payment", sale.total, None, None, None, None))
+        if sale.total or sale.returned_at is None:  # a return fully refunded kept nothing
+            rows.append((sale.purchase_date, 0, "full_payment", sale.total, None, None, None, None, None))
     elif sale.down_payment:
-        rows.append((sale.purchase_date, 0, "down_payment", sale.down_payment, None, None, None, None))
+        rows.append((sale.purchase_date, 0, "down_payment", sale.down_payment, None, None, None, None, None))
     if sale.sale_type == "credit":
         for payment in sale.credit_payments:
             rows.append((payment.payment_date, payment.id, "payment", payment.amount,
-                         payment.method, None, payment.note, payment.id))
+                         payment.method, None, payment.note, payment.id, payment.batch_id))
     elif sale.sale_type == "installment":
         for installment in sale.installments:
             recorded = 0
             for payment in installment.payments:
                 recorded += payment.amount
                 rows.append((payment.payment_date, payment.id, "payment", payment.amount, payment.method,
-                             installment.installment_index, payment.note, payment.id))
+                             installment.installment_index, payment.note, payment.id, payment.batch_id))
             earlier = installment.amount_paid - recorded
             if earlier > 0:
                 rows.append((installment.paid_date or installment.due_date, 0, "earlier", earlier,
-                             installment.method, installment.installment_index, installment.note, None))
+                             installment.method, installment.installment_index, installment.note, None, None))
     rows.sort(key=lambda row: (row[0], row[1], row[5] or 0))
     remaining = sale.total
     result: list[TransactionRecord] = []
-    for when, _order, kind, amount, method, index, note, payment_id in rows:
+    for when, _order, kind, amount, method, index, note, payment_id, batch_id in rows:
         remaining = max(0, remaining - amount)
         result.append(TransactionRecord(
             kind=kind, transaction_date=when, amount=amount, remaining_after=remaining, method=method,
             installment_index=index, note=note, payment_id=payment_id,
-            product=sale.product,
+            product=sale.product, batch_id=batch_id,
+            installment_indexes=(index,) if index is not None else (),
         ))
     return tuple(result)
 

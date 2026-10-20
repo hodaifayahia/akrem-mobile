@@ -6,16 +6,20 @@ import json
 from dataclasses import dataclass
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.db.models import Installment, Sale, Setting
+from app.db.models import Installment, Sale, Setting, StockItem
 from app.services.status import Status, for_month
 
 
 @dataclass(frozen=True, slots=True)
 class DashboardSummary:
-    """Values displayed on the dashboard for a selected month."""
+    """Values displayed on the dashboard for a selected month.
+
+    ``total_wholesale`` is the goods still in stock at their wholesale price
+    (owner's choice 2026-10-06): a phone leaves it when it is sold.
+    """
 
     total_wholesale: int | None
     failed_operations: int
@@ -37,6 +41,7 @@ class DashboardSummary:
     month_credit_sales: int = 0
     cash_customers: int = 0
     facility_customers: int = 0
+    stock_units: int = 0
 
 
 _ARABIC_MONTHS = (
@@ -188,8 +193,13 @@ def get_dashboard_summary(
         rate_val = 0
 
     owner = role == "owner"
+    stock_units, stock_wholesale = session.execute(
+        select(func.count(StockItem.id), func.coalesce(func.sum(StockItem.wholesale_price), 0))
+        .where(StockItem.status == "available")
+    ).one()
     return DashboardSummary(
-        total_wholesale=sum(sale.wholesale_price for sale in sales) if owner else None,
+        total_wholesale=int(stock_wholesale) if owner else None,
+        stock_units=int(stock_units) if owner else 0,
         failed_operations=counts[Status.FAILED],
         completed_operations=counts[Status.PAID],
         pending_operations=counts[Status.PENDING],
