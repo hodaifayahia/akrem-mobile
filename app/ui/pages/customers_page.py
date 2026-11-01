@@ -2,8 +2,9 @@
 
 Every sale is its own row, except products bought together in one basket,
 which share a row (a client who bought three phones on three visits shows
-three rows); a client without sales shows one row. Ticking a row selects the
-client, so delete and "assign type" act on clients.
+three rows); a client without sales shows one row. Ticking a row selects that
+row only (one purchase), so a client's other purchases stay unticked: delete
+offers to remove just the ticked purchases, and "assign type" acts on their clients.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from app.db.session import session_scope
 from app.i18n import ar
 from app.i18n.stock_text import ltr_text
 from app.services import auth, backup, categories, customers
+from app.services import sales as sale_service
 from app.services.categories import ClientType, ClientTypeError
 from app.services.customers import CustomerSummary, DuplicateCustomerPhoneError
 from app.services.status import Status
@@ -661,7 +663,7 @@ class CustomersPage(QWidget):
         if self.selection is None:
             return []
         wanted = set(self.selection.checked_keys())
-        return _one_per_client(summary for summary in self.visible_summaries() if summary.id in wanted)
+        return [summary for summary in self.visible_summaries() if row_key(summary) in wanted]
 
     def edit_customer_by_id(self, customer_id: int) -> None:
         """Open the owner edit form for a customer from another screen."""
@@ -692,21 +694,21 @@ class CustomersPage(QWidget):
         self._search_timer.start()
 
     # --------------------------------------------------------------- selection
-    def _key_at(self, proxy_row: int) -> int | None:
-        """The customer id shown on a table row (the row's checkbox key)."""
+    def _key_at(self, proxy_row: int) -> tuple[str, int] | None:
+        """The row's checkbox key: its purchase, or the client for a client without sales."""
         summary = self._summary_from_proxy_row(proxy_row)
-        return summary.id if summary is not None else None
+        return row_key(summary) if summary is not None else None
 
     def _selected_summaries(self) -> list[CustomerSummary]:
-        """The ticked customers, or else the highlighted rows."""
+        """The ticked rows, or else the highlighted ones (one entry per row, not per client)."""
         if self.selection is not None:
             wanted = set(self.selection.target_keys())
-            return _one_per_client(summary for summary in self.visible_summaries() if summary.id in wanted)
+            return [summary for summary in self.visible_summaries() if row_key(summary) in wanted]
         rows = {index.row() for index in self.table.selectionModel().selectedRows()}
-        return _one_per_client(summary for row in sorted(rows) if (summary := self._summary_from_proxy_row(row)))
+        return [summary for row in sorted(rows) if (summary := self._summary_from_proxy_row(row))]
 
     def _selection_changed(self, *_args: object) -> None:
-        count = len(self._selected_summaries())
+        count = len(_one_per_client(self._selected_summaries()))
         self.assign_type_button.setEnabled(count > 0)
         self.assign_type_button.setText(f"{ar.CT_ASSIGN} ({count})" if count > 1 else ar.CT_ASSIGN)
 
@@ -756,7 +758,7 @@ class CustomersPage(QWidget):
             return
         # The ticked/highlighted rows when the clicked row is one of them, else just this row.
         targets = self._selected_summaries()
-        if summary.id not in {item.id for item in targets}:
+        if row_key(summary) not in {row_key(item) for item in targets}:
             targets = [summary]
         menu = QMenu(self)
         edit_action = menu.addAction(icons.icon("edit", "text", 16), ar.CUST_EDIT)
@@ -800,6 +802,7 @@ class CustomersPage(QWidget):
     def _assign_type(self, selection: list[CustomerSummary]) -> None:
         if not self._is_owner:
             return
+        selection = _one_per_client(selection)  # a client type belongs to the client, not to a purchase
         if not selection:
             self._show_error(ar.CT_SELECT_CUSTOMERS)
             return
@@ -912,26 +915,64 @@ class CustomersPage(QWidget):
         self._delete_summaries(self._selected_summaries())
 
     def _delete_summaries(self, chosen: list[CustomerSummary]) -> None:
-        """Confirm, then delete; customers with sales need an explicit "with sales" choice."""
+        """Confirm, then delete the chosen rows.
+
+        A purchase row offers "only the ticked purchases" (the client and their
+        other purchases stay) or "the client with all their sales".
+        """
         if not chosen or not self._is_owner:
             return
-        message = ar.CUST_DELETE_MANY_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
-            [summary.full_name for summary in chosen]
+        purchases = [summary for summary in chosen if summary.sales]
+        if not purchases:
+            message = ar.CUST_DELETE_MANY_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+                [summary.full_name for summary in chosen]
+            )
+            if row_selection.ask_delete(self, ar.CUST_DELETE, message) is not None:
+                self.delete_customers([summary.id for summary in chosen])
+            return
+        message = ar.CUST_DELETE_ROWS_CONFIRM.format(count=len(chosen)) + "\n\n" + row_selection.names_preview(
+            [_row_label(summary) for summary in chosen]
         )
-        with_sales = [summary for summary in chosen if summary.sales]
-        if with_sales:
-            choices = [("with_sales", ar.CUST_DELETE_WITH_SALES)]
-            if len(with_sales) < len(chosen):
-                choices.append(("without_sales", ar.CUST_DELETE_WITHOUT_SALES.format(
-                    count=len(chosen) - len(with_sales)
-                )))
-            details = ar.CUST_DELETE_HAS_SALES.format(count=len(with_sales)) + "\n" + ar.SEL_BACKUP_NOTE
-            answer = row_selection.ask_delete(self, ar.CUST_DELETE, message, choices, details=details)
-        else:
-            answer = row_selection.ask_delete(self, ar.CUST_DELETE, message)
+        choices = [("purchases", ar.CUST_DELETE_PURCHASES_ONLY), ("with_sales", ar.CUST_DELETE_WITH_SALES)]
+        if len(purchases) < len(chosen):
+            choices.append(("without_sales", ar.CUST_DELETE_WITHOUT_SALES.format(
+                count=len(chosen) - len(purchases)
+            )))
+        details = ar.CUST_DELETE_PURCHASES_EXPLAIN.format(count=len(purchases)) + "\n" + ar.SEL_BACKUP_NOTE
+        answer = row_selection.ask_delete(self, ar.CUST_DELETE, message, choices, details=details)
         if answer is None:
             return
-        self.delete_customers([summary.id for summary in chosen], with_sales=answer == "with_sales")
+        if answer == "purchases":
+            self.delete_purchases(chosen)
+            return
+        client_ids = [summary.id for summary in _one_per_client(chosen)]
+        self.delete_customers(client_ids, with_sales=answer == "with_sales")
+
+    def delete_purchases(self, chosen: list[CustomerSummary]) -> bool:
+        """Delete the sales shown on the chosen rows (the clients stay); a ticked
+        client without sales is deleted as a client. Makes a safety backup first."""
+        sale_ids = [sale.id for summary in chosen for sale in summary.sales]
+        client_ids = [summary.id for summary in chosen if not summary.sales]
+        backup.create_safety_backup()
+        try:
+            with session_scope() as session:
+                self._require_owner(session)
+                removed = sale_service.delete_sales(session, self.current_user.id, sale_ids)
+                clients = customers.delete_customers(session, self.current_user.id, client_ids).deleted
+        except (auth.AuthorizationError, ValueError, RuntimeError, SQLAlchemyError):
+            _LOG.exception("Purchase delete failed")
+            self._show_error(ar.CUST_DELETE_FAILED)
+            return False
+        if self.selection is not None:
+            self.selection.clear()
+        events.data_changed.emit()
+        for customer_id in dict.fromkeys(summary.id for summary in chosen if summary.sales):
+            events.customer_changed.emit(customer_id)
+        message = ar.CUST_PURCHASES_DELETED_TOAST.format(count=len(chosen) - len(client_ids))
+        if clients:
+            message += " " + ar.CUST_DELETED_TOAST.format(count=clients)
+        events.notify.emit("success", ar.CUST_PAGE_TITLE, message, 4000)
+        return True
 
     def delete_customers(self, customer_ids: list[int], *, with_sales: bool = False) -> bool:
         """Delete customers; with ``with_sales`` their sales go too (after a safety backup)."""
@@ -981,8 +1022,23 @@ class CustomersPage(QWidget):
         QMessageBox.warning(self, ar.ERROR_TITLE, message)
 
 
+def row_key(summary: CustomerSummary) -> tuple[str, int]:
+    """A list row's checkbox key: its (first) sale, so each purchase is ticked on its own;
+    a client without sales is keyed by the client."""
+    if summary.sale_id is not None:
+        return ("sale", summary.sale_id)
+    return ("customer", summary.id)
+
+
+def _row_label(summary: CustomerSummary) -> str:
+    """The client's name and, for a purchase row, its products (for the delete confirmation)."""
+    if not summary.sales:
+        return summary.full_name
+    return f"{summary.full_name} — {ltr_text(customers.basket_product_label(summary.sales))}"
+
+
 def _one_per_client(rows) -> list[CustomerSummary]:
-    """The first row of each client: actions such as delete act on clients, not on sale rows."""
+    """The first row of each client, for actions that belong to the client (client type, delete client)."""
     seen: set[int] = set()
     result = []
     for summary in rows:

@@ -104,8 +104,12 @@ def test_customers_tick_select_all_and_delete(shop, answers) -> None:
     assert bar is not None and page.table.verticalHeader() is bar.header
     assert bar.header.isVisibleTo(page) and bar.header.sizeHint().width() == row_selection.HEADER_WIDTH
 
+    with session_scope() as session:
+        buyer_sale = session.scalar(select(Sale.id).where(Sale.customer_id == buyer))
+    plain_key, buyer_key = ("customer", plain), ("sale", buyer_sale)
+
     bar.select_all_box.click()
-    assert set(bar.checked_keys()) == {plain, buyer}
+    assert set(bar.checked_keys()) == {plain_key, buyer_key}
     assert bar.select_all_box.checkState() == Qt.CheckState.Checked
     assert bar.count_label.text() == ar.SEL_COUNT.format(count=2)
     assert bar.delete_button.text() == f"{ar.SEL_DELETE} (2)"
@@ -114,16 +118,16 @@ def test_customers_tick_select_all_and_delete(shop, answers) -> None:
     page.resize(1200, 700)
     page.show()
     QApplication.processEvents()
-    plain_row = next(row for row in range(page.table.model().rowCount()) if page._key_at(row) == plain)
+    plain_row = next(row for row in range(page.table.model().rowCount()) if page._key_at(row) == plain_key)
     QTest.mouseClick(bar.header.viewport(), Qt.MouseButton.LeftButton, pos=bar.header.row_rect(plain_row).center())
-    assert bar.checked_keys() == [buyer]
+    assert bar.checked_keys() == [buyer_key]
     assert bar.select_all_box.checkState() == Qt.CheckState.PartiallyChecked
 
     # Deleting both: the client with sales needs the "with sales" choice.
     bar.select_all(True)
     script.append("without_sales")
     page._delete_selected()
-    assert asked[-1] == ["with_sales", "without_sales"]
+    assert asked[-1] == ["purchases", "with_sales", "without_sales"]
     with session_scope() as session:
         assert session.get(Customer, plain) is None and session.get(Customer, buyer) is not None
     assert bar.checked_keys() == []
@@ -134,6 +138,41 @@ def test_customers_tick_select_all_and_delete(shop, answers) -> None:
     assert _count(Customer) == 0 and _count(Sale) == 0 and _count(Installment) == 0
     backups = backup.list_backups()
     assert any(info.backup_type == backup.SAFETY_LABEL for info in backups)
+    page.close()
+
+
+def test_ticking_one_purchase_of_a_client_ticks_only_that_row(shop, answers) -> None:
+    """A client with two products has two rows; ticking one must not tick the other,
+    and deleting it removes only that purchase (the client and the other product stay)."""
+    from app.ui.pages.customers_page import CustomersPage
+
+    script, asked = answers
+    client = _customer("حمادة عبديه", with_sale=True)
+    with session_scope() as session:
+        second = sales.create_sale(
+            session, customer_id=client, product="Spark 2", sale_type="cash",
+            wholesale_price=20000, cash_price=26000, purchase_date=date.today(),
+        ).id
+        first = session.scalar(select(Sale.id).where(Sale.customer_id == client, Sale.id != second))
+    page = CustomersPage(_user(shop["owner"]))
+    bar = page.selection
+    rows = {page._key_at(row): row for row in range(page.table.model().rowCount())}
+    assert set(rows) == {("sale", first), ("sale", second)}
+
+    bar.toggle_row(rows[("sale", second)])
+    assert bar.checked_keys() == [("sale", second)]
+    assert not bar.header._is_checked(rows[("sale", first)])
+    assert bar.delete_button.text() == ar.SEL_DELETE
+    assert [summary.sale_id for summary in page.checked_summaries()] == [second]
+
+    script.append("purchases")
+    page._delete_selected()
+    assert asked[-1] == ["purchases", "with_sales"]
+    with session_scope() as session:
+        assert session.get(Sale, second) is None
+        assert session.get(Sale, first) is not None
+        assert session.get(Customer, client) is not None
+    assert bar.checked_keys() == []
     page.close()
 
 
@@ -158,10 +197,10 @@ def test_ticks_on_rows_that_leave_the_list_are_dropped(shop) -> None:
     page.selection.select_all(True)
     page.search.setText("أحمد")
     page.refresh()
-    assert page.selection.checked_keys() == [first]
+    assert page.selection.checked_keys() == [("customer", first)]
     page.search.clear()
     page.refresh()
-    assert page.selection.checked_keys() == [first]  # the other row was unticked when it left
+    assert page.selection.checked_keys() == [("customer", first)]  # the other row was unticked when it left
 
 
 def test_without_ticks_the_highlighted_row_is_the_target(shop) -> None:
@@ -170,9 +209,9 @@ def test_without_ticks_the_highlighted_row_is_the_target(shop) -> None:
     _customer("أحمد")
     second = _customer("سمير")
     page = CustomersPage(_user(shop["owner"]))
-    row = next(row for row in range(page.table.model().rowCount()) if page._key_at(row) == second)
+    row = next(row for row in range(page.table.model().rowCount()) if page._key_at(row) == ("customer", second))
     page.table.selectRow(row)
-    assert page.selection.target_keys() == [second]
+    assert page.selection.target_keys() == [("customer", second)]
     assert page.selection.delete_button.isEnabled()
     assert page.selection.delete_button.text() == ar.SEL_DELETE
 
